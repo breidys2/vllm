@@ -6,8 +6,14 @@
 Produces JSONL output readable without Nsight Systems.  Each record is one
 decoder layer from one forward pass:
 
-    {"iteration": 0, "seq_len": 4096, "layer_idx": 3,
+    {"iteration": 0, "seq_len": 4096, "num_computed_tokens": 4096,
+     "num_cached_tokens": 0, "kv_cache_bytes": 0, "layer_idx": 3,
      "layer_name": "model.layers.3", "elapsed_ms": 4.23, "rank": 0}
+
+seq_len is the full context length (computed + cached).  When prefix
+caching is active, num_computed_tokens < seq_len.  kv_cache_bytes is the
+byte size of the KV cache fetched from the prefix cache for this layer
+(num_cached_tokens * kv_bytes_per_token_per_layer).
 
 Usage in gpu_model_runner.py:
 
@@ -17,7 +23,8 @@ Usage in gpu_model_runner.py:
     self.cuda_event_hooks.register_hooks(self.model)
 
     # Flush (after every model forward)
-    self.cuda_event_hooks.flush(num_tokens=input_ids.shape[0])
+    self.cuda_event_hooks.flush(num_tokens=input_ids.shape[0],
+                                num_cached_tokens=num_cached)
 """
 
 import json
@@ -79,15 +86,23 @@ class LayerwiseCUDAEventHooks:
         # Map from nn.Module → total parameter bytes (computed once at registration).
         self._module_param_bytes: dict[nn.Module, int] = {}
 
-        # LIFO stack of (layer_name, layer_idx, start_event, param_bytes, input_bytes)
+        # Map from nn.Module → KV cache bytes per token for this layer.
+        # Computed once at registration from the Attention sub-module.
+        self._module_kv_bytes_per_token: dict[nn.Module, int] = {}
+
+        # LIFO stack of (layer_name, layer_idx, start_event, param_bytes,
+        #                 input_bytes, kv_bytes_per_token)
         # accumulated during the current forward pass.  A stack rather than a flat list
         # handles re-entrant / nested calls safely.
-        self._start_stack: list[tuple[str, int, torch.cuda.Event, int, int]] = []
+        self._start_stack: list[
+            tuple[str, int, torch.cuda.Event, int, int, int]
+        ] = []
 
         # Completed (layer_name, layer_idx, start_event, end_event,
-        #             param_bytes, input_bytes, output_bytes) tuples waiting to be flushed.
+        #             param_bytes, input_bytes, output_bytes, kv_bytes_per_token)
+        # tuples waiting to be flushed.
         self._pending: list[
-            tuple[str, int, torch.cuda.Event, torch.cuda.Event, int, int, int]
+            tuple[str, int, torch.cuda.Event, torch.cuda.Event, int, int, int, int]
         ] = []
 
         self._iteration: int = 0
@@ -107,7 +122,9 @@ class LayerwiseCUDAEventHooks:
         start.record()
         param_bytes = self._module_param_bytes[module]
         input_bytes = _count_tensor_bytes(args) + _count_tensor_bytes(kwargs)
-        self._start_stack.append((layer_name, layer_idx, start, param_bytes, input_bytes))
+        kv_bpt = self._module_kv_bytes_per_token[module]
+        self._start_stack.append(
+            (layer_name, layer_idx, start, param_bytes, input_bytes, kv_bpt))
 
     def _post_hook(
         self,
@@ -118,13 +135,34 @@ class LayerwiseCUDAEventHooks:
         end = torch.cuda.Event(enable_timing=True)
         end.record()
         if self._start_stack:
-            layer_name, layer_idx, start, param_bytes, input_bytes = self._start_stack.pop()
+            layer_name, layer_idx, start, param_bytes, input_bytes, kv_bpt = (
+                self._start_stack.pop())
             output_bytes = _count_tensor_bytes(output)
-            self._pending.append((layer_name, layer_idx, start, end, param_bytes, input_bytes, output_bytes))
+            self._pending.append(
+                (layer_name, layer_idx, start, end,
+                 param_bytes, input_bytes, output_bytes, kv_bpt))
 
     # ------------------------------------------------------------------
     # Registration
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _kv_bytes_per_token(decoder_layer: nn.Module) -> int:
+        """Extract KV cache bytes-per-token from a decoder layer.
+
+        Searches the layer's sub-modules for a vLLM ``Attention`` instance
+        which exposes ``num_kv_heads``, ``head_size``, and
+        ``kv_cache_torch_dtype``.  Returns
+        ``num_kv_heads * head_size * 2 (K+V) * element_size``, or 0 if
+        the attention module cannot be found.
+        """
+        for sub in decoder_layer.modules():
+            if (hasattr(sub, "num_kv_heads")
+                    and hasattr(sub, "head_size")
+                    and hasattr(sub, "kv_cache_torch_dtype")):
+                elem = torch.tensor([], dtype=sub.kv_cache_torch_dtype).element_size()
+                return sub.num_kv_heads * sub.head_size * 2 * elem
+        return 0
 
     def register_hooks(self, model: nn.Module) -> None:
         """Traverse the model and register hooks on decoder layer modules.
@@ -142,6 +180,7 @@ class LayerwiseCUDAEventHooks:
             self._module_param_bytes[module] = sum(
                 p.numel() * p.element_size() for p in module.parameters()
             )
+            self._module_kv_bytes_per_token[module] = self._kv_bytes_per_token(module)
             module.register_forward_pre_hook(self._pre_hook, with_kwargs=True)
             module.register_forward_hook(self._post_hook)
 
@@ -149,7 +188,11 @@ class LayerwiseCUDAEventHooks:
     # Flush
     # ------------------------------------------------------------------
 
-    def flush(self, num_tokens: int | None = None) -> list[dict]:
+    def flush(
+        self,
+        num_tokens: int | None = None,
+        num_cached_tokens: int | None = None,
+    ) -> list[dict]:
         """Synchronise pending events and write timing records to JSONL.
 
         Call this once after every model forward pass.  A single
@@ -157,9 +200,10 @@ class LayerwiseCUDAEventHooks:
         GPU runs unimpeded during the forward pass.
 
         Args:
-            num_tokens: Total token count for this forward pass (i.e. the
-                batch dimension of ``input_ids``).  Written into every record
-                as ``seq_len`` for easy downstream filtering.
+            num_tokens: Number of tokens actually computed in this forward
+                pass (i.e. ``input_ids.shape[0]``).
+            num_cached_tokens: Number of tokens whose KV was served from the
+                prefix cache (0 when prefix caching is off).
 
         Returns:
             The list of dicts written during this call, in layer order.
@@ -170,8 +214,10 @@ class LayerwiseCUDAEventHooks:
         # Single synchronisation point — wait only until the last end marker.
         self._pending[-1][3].synchronize()
 
+        cached = num_cached_tokens or 0
         records: list[dict] = []
-        for layer_name, layer_idx, start, end, param_bytes, input_bytes, output_bytes in self._pending:
+        for (layer_name, layer_idx, start, end,
+             param_bytes, input_bytes, output_bytes, kv_bpt) in self._pending:
             record: dict = {
                 "iteration": self._iteration,
                 "rank": self._rank,
@@ -183,7 +229,10 @@ class LayerwiseCUDAEventHooks:
                 "output_bytes": output_bytes,
             }
             if num_tokens is not None:
-                record["seq_len"] = num_tokens
+                record["seq_len"] = num_tokens + cached
+                record["num_computed_tokens"] = num_tokens
+                record["num_cached_tokens"] = cached
+                record["kv_cache_bytes"] = cached * kv_bpt
             records.append(record)
 
         # Sort by layer index so records are in forward-pass order even if

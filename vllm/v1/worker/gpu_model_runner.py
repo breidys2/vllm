@@ -3062,7 +3062,18 @@ class GPUModelRunner(
                 else inputs_embeds.shape[0] if inputs_embeds is not None
                 else None
             )
-            self.cuda_event_hooks.flush(num_tokens=num_tokens)
+            # Sum of previously-cached tokens across all requests in this
+            # batch.  _update_states() runs before _model_forward(), so
+            # num_computed_tokens_cpu already reflects the pre-forward state.
+            num_reqs = self.input_batch.num_reqs
+            num_cached = (
+                int(self.input_batch.num_computed_tokens_cpu[:num_reqs].sum())
+                if num_reqs > 0 else 0
+            )
+            self.cuda_event_hooks.flush(
+                num_tokens=num_tokens,
+                num_cached_tokens=num_cached,
+            )
         return output
 
     @staticmethod
