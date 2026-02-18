@@ -62,6 +62,13 @@ class ObservabilityConfig:
     module in the model and attach informations such as input/output shapes to
     nvtx range markers. Noted that this doesn't work with CUDA graphs enabled."""
 
+    cuda_event_trace_output: str | None = None
+    """Path prefix for per-layer CUDA event timing output (JSONL format).
+    When set, records GPU-side elapsed time for each decoder layer using CUDA
+    events, which can be parsed without Nsight Systems. One file per TP rank is
+    written to {path}_rank{rank}.jsonl. Requires enforce_eager=True (no CUDA
+    graphs). If None, CUDA event timing is disabled."""
+
     enable_mfu_metrics: bool = False
     """Enable Model FLOPs Utilization (MFU) metrics."""
 

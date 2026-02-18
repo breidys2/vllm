@@ -532,6 +532,7 @@ class EngineArgs:
     enable_layerwise_nvtx_tracing: bool = (
         ObservabilityConfig.enable_layerwise_nvtx_tracing
     )
+    cuda_event_trace_output: str | None = ObservabilityConfig.cuda_event_trace_output
     enable_mfu_metrics: bool = ObservabilityConfig.enable_mfu_metrics
     enable_logging_iteration_details: bool = (
         ObservabilityConfig.enable_logging_iteration_details
@@ -1097,6 +1098,10 @@ class EngineArgs:
         observability_group.add_argument(
             "--enable-layerwise-nvtx-tracing",
             **observability_kwargs["enable_layerwise_nvtx_tracing"],
+        )
+        observability_group.add_argument(
+            "--cuda-event-trace-output",
+            **observability_kwargs["cuda_event_trace_output"],
         )
         observability_group.add_argument(
             "--enable-mfu-metrics",
@@ -1802,6 +1807,7 @@ class EngineArgs:
             kv_cache_metrics_sample=self.kv_cache_metrics_sample,
             cudagraph_metrics=self.cudagraph_metrics,
             enable_layerwise_nvtx_tracing=self.enable_layerwise_nvtx_tracing,
+            cuda_event_trace_output=self.cuda_event_trace_output,
             enable_mfu_metrics=self.enable_mfu_metrics,
             enable_mm_processor_stats=self.enable_mm_processor_stats,
             enable_logging_iteration_details=self.enable_logging_iteration_details,

@@ -713,6 +713,7 @@ class GPUModelRunner(
         self.kv_connector_output: KVConnectorOutput | None = None
         self.mamba_state_idx: dict[str, int] = {}
         self.layerwise_nvtx_hooks_registered = False
+        self.cuda_event_hooks = None  # set in _register_layerwise_cuda_event_hooks
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -3048,13 +3049,21 @@ class GPUModelRunner(
         Returns:
             Model output tensor
         """
-        return self.model(
+        output = self.model(
             input_ids=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
             **model_kwargs,
         )
+        if self.cuda_event_hooks is not None:
+            num_tokens = (
+                input_ids.shape[0] if input_ids is not None
+                else inputs_embeds.shape[0] if inputs_embeds is not None
+                else None
+            )
+            self.cuda_event_hooks.flush(num_tokens=num_tokens)
+        return output
 
     @staticmethod
     def _is_uniform_decode(
@@ -3237,6 +3246,23 @@ class GPUModelRunner(
                 pyt_hooks = PytHooks()
                 pyt_hooks.register_hooks(self.model, self.model.__class__.__name__)
                 self.layerwise_nvtx_hooks_registered = True
+
+    def _register_layerwise_cuda_event_hooks(self) -> None:
+        """Register per-decoder-layer CUDA event timing hooks.
+
+        Enabled when observability_config.cuda_event_trace_output is set.
+        Writes one JSONL file per TP rank to
+        {cuda_event_trace_output}_rank{rank}.jsonl.
+        """
+        output_prefix = self.vllm_config.observability_config.cuda_event_trace_output
+        if output_prefix is None or self.cuda_event_hooks is not None:
+            return
+
+        from vllm.utils.cuda_event_hooks import LayerwiseCUDAEventHooks
+
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        self.cuda_event_hooks = LayerwiseCUDAEventHooks(output_prefix, rank=rank)
+        self.cuda_event_hooks.register_hooks(self.model)
 
     def _get_slot_mappings(
         self,
@@ -4928,6 +4954,7 @@ class GPUModelRunner(
         # both compiled and uncompiled models but they will never
         # be called on the compiled model execution path.
         self._register_layerwise_nvtx_hooks()
+        self._register_layerwise_cuda_event_hooks()
 
         # This is necessary to avoid blocking DP.
         # For dummy runs, we typically skip EPLB since we don't have any real
