@@ -3049,6 +3049,9 @@ class GPUModelRunner(
         Returns:
             Model output tensor
         """
+        if self.cuda_event_hooks is not None:
+            self.cuda_event_hooks.mark_forward_start()
+
         output = self.model(
             input_ids=input_ids,
             positions=positions,
@@ -3057,6 +3060,7 @@ class GPUModelRunner(
             **model_kwargs,
         )
         if self.cuda_event_hooks is not None:
+            self.cuda_event_hooks.mark_forward_end()
             num_tokens = (
                 input_ids.shape[0] if input_ids is not None
                 else inputs_embeds.shape[0] if inputs_embeds is not None
@@ -3583,6 +3587,18 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+
+        # Log KV transfer stats (offload load/store bandwidth) if available.
+        if (self.cuda_event_hooks is not None
+                and kv_connector_output is not None
+                and hasattr(kv_connector_output, "kv_connector_stats")):
+            # Temporary debug
+            import os as _os
+            with open("/tmp/offload_debug.log", "a") as _df:
+                _df.write(f"[pid={_os.getpid()}] execute_model: calling log_kv_transfers, "
+                          f"stats={kv_connector_output.kv_connector_stats}\n")
+            self.cuda_event_hooks.log_kv_transfers(
+                kv_connector_output.kv_connector_stats)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
