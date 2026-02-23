@@ -47,18 +47,6 @@ ReqId = str
 logger = init_logger(__name__)
 
 
-def _dbg_log(msg: str) -> None:
-    """Temporary debug logging to file (worker stdout is redirected)."""
-    import os
-    pid = os.getpid()
-    with open("/tmp/offload_debug.log", "a") as f:
-        f.write(f"[pid={pid}] {msg}\n")
-
-
-# Module-level marker to verify this file is loaded
-_dbg_log("offloading_connector module loaded")
-
-
 @dataclass
 class OffloadingOperationMetrics:
     op_size: int
@@ -117,7 +105,6 @@ class OffloadingConnectorStats(KVConnectorStats):
             self.data[transfer_type_key].append(op)
         else:
             self.data[transfer_type_key] = [op]
-        _dbg_log(f"record_transfer: {transfer_type_key}, data keys now: {list(self.data.keys())}, id(self)={id(self)}")
 
 
 @dataclass
@@ -638,19 +625,14 @@ class OffloadingConnectorWorker:
         for job_id, transfer_spec in self._unsubmitted_store_jobs:
             success = self.worker.transfer_async(job_id, transfer_spec)
             assert success
-        if self._unsubmitted_store_jobs:
-            _dbg_log(f"start_kv_transfers: submitted {len(self._unsubmitted_store_jobs)} deferred stores")
         self._unsubmitted_store_jobs.clear()
 
-        if metadata.reqs_to_load:
-            _dbg_log(f"start_kv_transfers: submitting {len(metadata.reqs_to_load)} load jobs")
         for req_id, transfer_spec in metadata.reqs_to_load.items():
             job_id = self._generate_job_id()
             self._jobs[job_id] = (req_id, False)
             assert req_id not in self._load_job
             self._load_job[req_id] = job_id
             success = self.worker.transfer_async(job_id, transfer_spec)
-            _dbg_log(f"start_kv_transfers: load job {job_id} for req {req_id}, success={success}")
             assert success
 
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
@@ -693,16 +675,11 @@ class OffloadingConnectorWorker:
         # still in-flight when get_finished() is called would be missed
         # (their end_event.query() returns False), and with max_tokens=1
         # there is no subsequent engine step to pick them up.
-        if self._load_job:
-            _dbg_log(f"get_finished: {len(self._load_job)} pending load jobs: {list(self._load_job.values())}")
         self.wait_for_pending_loads()
 
         finished_sending = set()
         finished_recving = set()
         transfer_results = self.worker.get_finished()
-        if transfer_results:
-            _dbg_log(f"get_finished: {len(transfer_results)} transfer results: "
-                     f"{[(r.job_id, r.transfer_type, r.transfer_time, r.transfer_size) for r in transfer_results]}")
         for transfer_result in transfer_results:
             # we currently do not support job failures
             job_id = transfer_result.job_id
@@ -748,9 +725,6 @@ class OffloadingConnectorWorker:
         """
         Get the KV transfer stats for the connector.
         """
-        _dbg_log(f"get_kv_connector_stats: id(stats)={id(self.kv_connector_stats)}, "
-                 f"data={self.kv_connector_stats.data}, empty={self.kv_connector_stats.is_empty()}")
-
         if self.kv_connector_stats.is_empty():
             return None
         # Clear stats for next iteration

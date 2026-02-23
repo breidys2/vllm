@@ -3409,7 +3409,16 @@ class GPUModelRunner(
                 if not has_kv_transfer_group():
                     # Return empty ModelRunnerOutput if no work to do.
                     return EMPTY_MODEL_RUNNER_OUTPUT
-                return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+                result = self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+                # Log KV transfer stats from no-forward steps (e.g.
+                # CPU→GPU loads that complete without a forward pass).
+                if (self.cuda_event_hooks is not None
+                        and result.kv_connector_output is not None
+                        and hasattr(result.kv_connector_output,
+                                    "kv_connector_stats")):
+                    self.cuda_event_hooks.log_kv_transfers(
+                        result.kv_connector_output.kv_connector_stats)
+                return result
 
             if self.cache_config.kv_sharing_fast_prefill:
                 assert not self.num_prompt_logprobs, (
@@ -3592,11 +3601,6 @@ class GPUModelRunner(
         if (self.cuda_event_hooks is not None
                 and kv_connector_output is not None
                 and hasattr(kv_connector_output, "kv_connector_stats")):
-            # Temporary debug
-            import os as _os
-            with open("/tmp/offload_debug.log", "a") as _df:
-                _df.write(f"[pid={_os.getpid()}] execute_model: calling log_kv_transfers, "
-                          f"stats={kv_connector_output.kv_connector_stats}\n")
             self.cuda_event_hooks.log_kv_transfers(
                 kv_connector_output.kv_connector_stats)
 

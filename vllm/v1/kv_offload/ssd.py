@@ -165,14 +165,16 @@ class SsdStoreHandler(OffloadingHandler):
         self,
         gpu_tensors: list[torch.Tensor],
         cpu_tensors: list[torch.Tensor],
-        ssd_fds: list[int],
+        ssd_fds: list[list[int]],
         gpu_block_size_factor: int,
         ssd_block_size_factor: int,
         block_sizes_bytes: list[int],
+        num_io_threads: int = 4,
     ):
         self.gpu_tensors = gpu_tensors
         self.cpu_tensors = cpu_tensors
         self.ssd_fds = ssd_fds
+        self.num_ssds = len(ssd_fds[0]) if ssd_fds else 1
         self.gpu_bsf = gpu_block_size_factor
         self.ssd_bsf = ssd_block_size_factor
         self.block_sizes = block_sizes_bytes
@@ -181,6 +183,8 @@ class SsdStoreHandler(OffloadingHandler):
         self._transfer_events: dict[int, torch.Event] = {}
         self._stream_pool: list[torch.cuda.Stream] = []
         self._event_pool: list[torch.Event] = []
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=num_io_threads)
 
     def _get_stream(self) -> torch.cuda.Stream:
         return self._stream_pool.pop() if self._stream_pool else torch.cuda.Stream()
@@ -224,16 +228,21 @@ class SsdStoreHandler(OffloadingHandler):
         # Wait for GPU->CPU DMA to complete.
         stream.synchronize()
 
-        # Step 2: CPU bounce -> SSD (O_DIRECT pwrite, one I/O per block).
+        # Step 2: CPU bounce -> SSD (O_DIRECT pwrite, parallel via thread pool).
         total_bytes = 0
-        for cpu_t, fd, bsz in zip(
+        futures: list[concurrent.futures.Future] = []
+        for cpu_t, fds, bsz in zip(
                 self.cpu_tensors, self.ssd_fds, self.block_sizes):
             for ssd_blk in ssd_blocks:
+                fd = fds[int(ssd_blk) % self.num_ssds]
                 start_sub = int(ssd_blk) * self.ssd_bsf
                 nbytes = self.ssd_bsf * bsz
                 buf = _tensor_block_buf(cpu_t, start_sub, bsz, nbytes)
-                os.pwrite(fd, buf, start_sub * bsz)
+                futures.append(
+                    self._executor.submit(os.pwrite, fd, buf, start_sub * bsz))
                 total_bytes += nbytes
+        for f in futures:
+            f.result()
 
         wall_elapsed = time.perf_counter() - wall_start
 
@@ -278,14 +287,16 @@ class SsdLoadHandler(OffloadingHandler):
         self,
         gpu_tensors: list[torch.Tensor],
         cpu_tensors: list[torch.Tensor],
-        ssd_fds: list[int],
+        ssd_fds: list[list[int]],
         gpu_block_size_factor: int,
         ssd_block_size_factor: int,
         block_sizes_bytes: list[int],
+        num_io_threads: int = 4,
     ):
         self.gpu_tensors = gpu_tensors
         self.cpu_tensors = cpu_tensors
         self.ssd_fds = ssd_fds
+        self.num_ssds = len(ssd_fds[0]) if ssd_fds else 1
         self.gpu_bsf = gpu_block_size_factor
         self.ssd_bsf = ssd_block_size_factor
         self.block_sizes = block_sizes_bytes
@@ -294,6 +305,8 @@ class SsdLoadHandler(OffloadingHandler):
         self._transfer_events: dict[int, torch.Event] = {}
         self._stream_pool: list[torch.cuda.Stream] = []
         self._event_pool: list[torch.Event] = []
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=num_io_threads)
 
     def _get_stream(self) -> torch.cuda.Stream:
         return self._stream_pool.pop() if self._stream_pool else torch.cuda.Stream()
@@ -317,20 +330,25 @@ class SsdLoadHandler(OffloadingHandler):
         with torch.cuda.stream(stream):
             start_event.record(stream)
 
-        # Step 1: SSD -> CPU bounce (blocking pread into pinned tensor).
+        # Step 1: SSD -> CPU bounce (parallel preadv via thread pool).
         # Read directly into the page-aligned pinned CPU tensor so that
         # O_DIRECT alignment requirements are satisfied (os.pread returns
         # a heap-allocated bytes object that is NOT page-aligned).
         total_bytes = 0
-        for cpu_t, fd, bsz in zip(
+        futures: list[concurrent.futures.Future] = []
+        for cpu_t, fds, bsz in zip(
                 self.cpu_tensors, self.ssd_fds, self.block_sizes):
             for ssd_blk in ssd_blocks:
+                fd = fds[int(ssd_blk) % self.num_ssds]
                 start_sub = int(ssd_blk) * self.ssd_bsf
                 nbytes = self.ssd_bsf * bsz
                 file_offset = start_sub * bsz
                 buf = _tensor_block_buf(cpu_t, start_sub, bsz, nbytes)
-                os.preadv(fd, [buf], file_offset)
+                futures.append(
+                    self._executor.submit(os.preadv, fd, [buf], file_offset))
                 total_bytes += nbytes
+        for f in futures:
+            f.result()
 
         # Step 2: CPU bounce -> GPU (async on CUDA stream).
         ssd_sub_count = ssd_blocks.size * self.ssd_bsf
@@ -376,6 +394,370 @@ class SsdLoadHandler(OffloadingHandler):
             ev = self._transfer_events.get(jid)
             if ev is not None:
                 ev.synchronize()
+
+
+class IoUringSsdLoadHandler(OffloadingHandler):
+    """SSD file -> CPU bounce -> GPU, with pipelined SSD/DMA overlap.
+
+    Uses io_uring for the SSD read step. Instead of waiting for ALL SSD
+    reads to finish before starting CPU->GPU DMA, completed reads are
+    DMA'd to GPU immediately while remaining reads are still in flight.
+
+    This overlaps NVMe read latency with PCIe DMA bandwidth, reducing
+    end-to-end transfer time from ``SSD_time + DMA_time`` toward
+    ``max(SSD_time, DMA_time)``.
+    """
+
+    # Minimum number of SSD blocks to enable pipelining.  Below this
+    # threshold the sequential path is used (avoids overhead for tiny
+    # transfers).
+    _MIN_BLOCKS_FOR_PIPELINE: int = 4
+
+    def __init__(
+        self,
+        gpu_tensors: list[torch.Tensor],
+        cpu_tensors: list[torch.Tensor],
+        ssd_fds: list[list[int]],
+        gpu_block_size_factor: int,
+        ssd_block_size_factor: int,
+        block_sizes_bytes: list[int],
+        ring_entries: int = 256,
+        pipeline_stages: int = 4,
+    ):
+        from vllm.v1.kv_offload.io_uring import IoUring
+
+        self.gpu_tensors = gpu_tensors
+        self.cpu_tensors = cpu_tensors
+        self.ssd_fds = ssd_fds
+        self.num_ssds = len(ssd_fds[0]) if ssd_fds else 1
+        self.gpu_bsf = gpu_block_size_factor
+        self.ssd_bsf = ssd_block_size_factor
+        self.block_sizes = block_sizes_bytes
+        self.total_block_size = sum(block_sizes_bytes)
+        self._transfers: deque[_SsdTransfer] = deque()
+        self._transfer_events: dict[int, torch.Event] = {}
+        self._stream_pool: list[torch.cuda.Stream] = []
+        self._event_pool: list[torch.Event] = []
+        self._ring = IoUring(entries=ring_entries)
+        self._pipeline_stages = pipeline_stages
+
+    def _get_stream(self) -> torch.cuda.Stream:
+        return self._stream_pool.pop() if self._stream_pool else torch.cuda.Stream()
+
+    def _get_event(self) -> torch.Event:
+        return (self._event_pool.pop() if self._event_pool
+                else torch.Event(enable_timing=True))
+
+    # ------------------------------------------------------------------
+    # Per-block mapping precomputation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _precompute_block_mappings(
+        ssd_blocks: np.ndarray,
+        gpu_blocks: np.ndarray,
+        ssd_bsf: int,
+        gpu_bsf: int,
+        skip: int,
+    ) -> list[torch.Tensor]:
+        """Build a per-SSD-block (src_sub, dst_sub) mapping tensor.
+
+        Returns a list of length ``len(ssd_blocks)``.  Each element is an
+        ``(M, 2)`` int64 tensor where column 0 is source (SSD/CPU) sub-block
+        indices and column 1 is destination (GPU) sub-block indices.
+
+        ssd_blocks and gpu_blocks may have different lengths (e.g. 10 SSD
+        blocks vs 30 GPU blocks when ssd_bsf=3, gpu_bsf=1).  The full
+        mapping is built with expand_block_ids and then sliced per SSD
+        block.
+        """
+        # Build the full mapping exactly as the original non-pipelined code.
+        gpu_sub_count = gpu_blocks.size * gpu_bsf
+        src_to_dst = np.empty((gpu_sub_count, 2), dtype=np.int64)
+        expand_block_ids(ssd_blocks, ssd_bsf, src_to_dst[:, 0],
+                         skip_count=skip)
+        expand_block_ids(gpu_blocks, gpu_bsf, src_to_dst[:, 1])
+
+        # Slice per SSD block.  Each SSD block contributes ssd_bsf rows
+        # (the first block contributes ssd_bsf - skip rows).
+        mappings: list[torch.Tensor] = []
+        row = 0
+        for j in range(len(ssd_blocks)):
+            n_subs = ssd_bsf - (skip if j == 0 else 0)
+            mappings.append(
+                torch.from_numpy(src_to_dst[row:row + n_subs].copy()))
+            row += n_subs
+        return mappings
+
+    # ------------------------------------------------------------------
+    # Consecutive block merging
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _merge_consecutive_blocks(
+        ssd_blocks: np.ndarray,
+        num_ssds: int = 1,
+    ) -> list[tuple[int, int, list[int]]]:
+        """Find runs of consecutive SSD block IDs for I/O coalescing.
+
+        The CPU bounce buffer mirrors the SSD file layout, so consecutive
+        block IDs are contiguous in both file and memory.  Merging them
+        into a single I/O reduces NVMe command count and enables
+        sequential read speeds (~5.7 GB/s) instead of random (~3.5 GB/s).
+
+        When ``num_ssds > 1``, runs are broken at SSD boundaries because
+        consecutive block IDs map to different drives (block-level
+        striping: ``block_id % num_ssds``).
+
+        Returns a list of ``(first_block_id, run_length, orig_indices)``
+        where *orig_indices* are positions in the input *ssd_blocks*.
+        """
+        n = len(ssd_blocks)
+        if n == 0:
+            return []
+
+        order = np.argsort(ssd_blocks, kind="mergesort")  # stable
+        sorted_ids = ssd_blocks[order]
+
+        runs: list[tuple[int, int, list[int]]] = []
+        run_start = 0
+        for i in range(1, n):
+            # Break if non-consecutive or if the block crosses an SSD
+            # boundary (with block-level striping, consecutive IDs map
+            # to different drives when num_ssds > 1).
+            if (sorted_ids[i] != sorted_ids[i - 1] + 1
+                    or (num_ssds > 1
+                        and sorted_ids[i] % num_ssds
+                        != sorted_ids[i - 1] % num_ssds)):
+                runs.append((
+                    int(sorted_ids[run_start]),
+                    i - run_start,
+                    order[run_start:i].tolist(),
+                ))
+                run_start = i
+        runs.append((
+            int(sorted_ids[run_start]),
+            n - run_start,
+            order[run_start:].tolist(),
+        ))
+        return runs
+
+    # ------------------------------------------------------------------
+    # Read preparation
+    # ------------------------------------------------------------------
+
+    def _build_reads(
+        self,
+        runs: list[tuple[int, int, list[int]]],
+    ) -> tuple[int, list[tuple[int, int, int, int, int]]]:
+        """Build io_uring read descriptors with consecutive-block merging.
+
+        Returns ``(total_bytes, reads)`` where each read is
+        ``(fd, buf_addr, nbytes, file_offset, user_data)``.
+
+        Each *run* of consecutive SSD block IDs becomes a single I/O.
+        ``user_data`` encodes ``tensor_idx * num_runs + run_idx`` so
+        CQE completions can be mapped back to the originating run.
+
+        With multi-SSD striping, each run is on a single drive (the
+        merge step breaks at SSD boundaries), so we pick the fd for
+        the run's first block.
+        """
+        num_runs = len(runs)
+        total_bytes = 0
+        reads: list[tuple[int, int, int, int, int]] = []
+        for t_idx, (cpu_t, fds, bsz) in enumerate(
+                zip(self.cpu_tensors, self.ssd_fds, self.block_sizes)):
+            for run_idx, (first_blk, run_len, _orig) in enumerate(runs):
+                fd = fds[first_blk % self.num_ssds]
+                start_sub = first_blk * self.ssd_bsf
+                nbytes = run_len * self.ssd_bsf * bsz
+                file_offset = start_sub * bsz
+                buf_addr = cpu_t.data_ptr() + start_sub * bsz
+                ud = t_idx * num_runs + run_idx
+                reads.append((fd, buf_addr, nbytes, file_offset, ud))
+                total_bytes += nbytes
+        return total_bytes, reads
+
+    # ------------------------------------------------------------------
+    # CQE processing -> partial DMA
+    # ------------------------------------------------------------------
+
+    def _process_cqes(
+        self,
+        cqes: list[tuple[int, int]],
+        per_block_mappings: list[torch.Tensor],
+        runs: list[tuple[int, int, list[int]]],
+        num_runs: int,
+        stream: torch.cuda.Stream,
+    ) -> None:
+        """Group completed CQEs by tensor index and issue swap_blocks."""
+        # Group by tensor index so we make one swap_blocks call per tensor.
+        # Each CQE may cover multiple original blocks (merged run).
+        tensor_completions: dict[int, list[int]] = {}
+        for ud, res in cqes:
+            if res < 0:
+                raise OSError(-res, os.strerror(-res))
+            t_idx = ud // num_runs
+            run_idx = ud % num_runs
+            blk_list = tensor_completions.setdefault(t_idx, [])
+            blk_list.extend(runs[run_idx][2])  # original block indices
+
+        with torch.cuda.stream(stream):
+            for t_idx, blk_indices in tensor_completions.items():
+                if len(blk_indices) == 1:
+                    mapping = per_block_mappings[blk_indices[0]]
+                else:
+                    mapping = torch.cat(
+                        [per_block_mappings[bi] for bi in blk_indices],
+                        dim=0)
+                ops.swap_blocks(
+                    self.cpu_tensors[t_idx],
+                    self.gpu_tensors[t_idx],
+                    self.block_sizes[t_idx],
+                    mapping)
+
+    # ------------------------------------------------------------------
+    # Pipelined transfer
+    # ------------------------------------------------------------------
+
+    def _do_pipelined(
+        self,
+        reads: list[tuple[int, int, int, int, int]],
+        per_block_mappings: list[torch.Tensor],
+        runs: list[tuple[int, int, list[int]]],
+        num_runs: int,
+        stream: torch.cuda.Stream,
+    ) -> None:
+        """Submit all reads, pipeline: harvest CQEs -> DMA -> repeat."""
+        total_reads = len(reads)
+        sq_cap = self._ring.sq_entries
+        chunk_size = max(1, total_reads // self._pipeline_stages)
+        completed = 0
+
+        # Submit all reads (in SQ-capacity batches if needed).
+        for batch_start in range(0, total_reads, sq_cap):
+            batch = reads[batch_start:batch_start + sq_cap]
+            for fd, addr, nb, off, ud in batch:
+                self._ring.prep_read(fd, addr, nb, off, user_data=ud)
+            nr = len(batch)
+
+            # First batch: submit and wait for first pipeline chunk.
+            # Later batches: submit new SQEs and harvest whatever is ready.
+            min_c = min(chunk_size, nr) if batch_start == 0 else 1
+            cqes = self._ring.submit_and_wait_partial(nr, min_c)
+            self._process_cqes(
+                cqes, per_block_mappings, runs, num_runs, stream)
+            completed += len(cqes)
+
+        # Drain remaining CQEs in pipeline chunks.
+        while completed < total_reads:
+            remaining = total_reads - completed
+            min_c = min(chunk_size, remaining)
+            cqes = self._ring.submit_and_wait_partial(0, min_c)
+            self._process_cqes(
+                cqes, per_block_mappings, runs, num_runs, stream)
+            completed += len(cqes)
+
+    # ------------------------------------------------------------------
+    # Sequential fallback (small transfers)
+    # ------------------------------------------------------------------
+
+    def _do_sequential(
+        self,
+        reads: list[tuple[int, int, int, int, int]],
+        per_block_mappings: list[torch.Tensor],
+        stream: torch.cuda.Stream,
+    ) -> None:
+        """Non-pipelined: all SSD reads, then all DMA."""
+        sq_cap = self._ring.sq_entries
+        for batch_start in range(0, len(reads), sq_cap):
+            batch = reads[batch_start:batch_start + sq_cap]
+            for fd, addr, nb, off, ud in batch:
+                self._ring.prep_read(fd, addr, nb, off, user_data=ud)
+            results = self._ring.submit_and_wait(len(batch))
+            for _ud, res in results:
+                if res < 0:
+                    raise OSError(-res, os.strerror(-res))
+
+        # Full DMA pass.
+        full_mapping = torch.cat(per_block_mappings, dim=0)
+        with torch.cuda.stream(stream):
+            for cpu_t, gpu_t, bsz in zip(
+                    self.cpu_tensors, self.gpu_tensors, self.block_sizes):
+                ops.swap_blocks(cpu_t, gpu_t, bsz, full_mapping)
+
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
+
+    def transfer_async(self, job_id: int, spec: TransferSpec) -> bool:
+        ssd_spec, gpu_spec = spec
+        ssd_blocks = ssd_spec.block_ids
+        gpu_blocks = gpu_spec.block_ids
+        num_blks = len(ssd_blocks)
+
+        stream = self._get_stream()
+        start_event = self._get_event()
+        end_event = self._get_event()
+
+        with torch.cuda.stream(stream):
+            start_event.record(stream)
+
+        # Precompute per-block sub-block mappings.
+        skip = -gpu_blocks.size % self.ssd_bsf
+        per_block_mappings = self._precompute_block_mappings(
+            ssd_blocks, gpu_blocks, self.ssd_bsf, self.gpu_bsf, skip)
+
+        # Merge consecutive SSD block IDs into larger I/O operations.
+        # With multi-SSD, merging is limited to blocks on the same drive.
+        runs = self._merge_consecutive_blocks(ssd_blocks, self.num_ssds)
+        num_runs = len(runs)
+
+        # Build io_uring read descriptors (one per merged run per tensor).
+        total_bytes, reads = self._build_reads(runs)
+
+        logger.debug(
+            "io_uring load job %d: %d blocks -> %d runs -> %d I/Os",
+            job_id, num_blks, num_runs, len(reads))
+
+        if num_blks < self._MIN_BLOCKS_FOR_PIPELINE:
+            self._do_sequential(reads, per_block_mappings, stream)
+        else:
+            self._do_pipelined(
+                reads, per_block_mappings, runs, num_runs, stream)
+
+        with torch.cuda.stream(stream):
+            end_event.record(stream)
+
+        self._transfer_events[job_id] = end_event
+        self._transfers.append(
+            _SsdTransfer(job_id, stream, start_event, end_event, total_bytes))
+        return True
+
+    def get_finished(self) -> list[TransferResult]:
+        results: list[TransferResult] = []
+        while self._transfers and self._transfers[0].end_event.query():
+            t = self._transfers.popleft()
+            elapsed = t.start_event.elapsed_time(t.end_event) * 1e-3
+            results.append(TransferResult(
+                job_id=t.job_id, success=True,
+                transfer_size=t.num_bytes, transfer_time=elapsed,
+                transfer_type=("SSD", "GPU")))
+            self._stream_pool.append(t.stream)
+            self._event_pool.extend([t.start_event, t.end_event])
+            del self._transfer_events[t.job_id]
+        return results
+
+    def wait(self, job_ids: set[int]) -> None:
+        for jid in job_ids:
+            ev = self._transfer_events.get(jid)
+            if ev is not None:
+                ev.synchronize()
+
+    def __del__(self):
+        if hasattr(self, '_ring'):
+            self._ring.close()
 
 
 # ---------------------------------------------------------------------------
@@ -579,7 +961,7 @@ class SsdGpuOffloadingHandlers:
         num_ssd_blocks: int,
         gpu_caches: dict[str, torch.Tensor],
         attn_backends: dict[str, type[AttentionBackend]],
-        ssd_path: str,
+        ssd_path: str | list[str],
         use_o_direct: bool = True,
         use_gds: bool = False,
         gds_num_threads: int = 4,
@@ -591,6 +973,21 @@ class SsdGpuOffloadingHandlers:
             raise ImportError(
                 "use_gds=True requires kvikio. "
                 "Install with: pip install kvikio-cu12")
+
+        # Normalise ssd_path(s) to a list of directories.
+        if isinstance(ssd_path, str):
+            ssd_path = [ssd_path]
+        ssd_dirs = [pathlib.Path(p) for p in ssd_path]
+        for d in ssd_dirs:
+            d.mkdir(parents=True, exist_ok=True)
+
+        # Determine TP rank for unique filenames (avoids collisions when
+        # multiple workers share the same filesystem).
+        try:
+            tp_rank = torch.distributed.get_rank() \
+                if torch.distributed.is_initialized() else 0
+        except Exception:
+            tp_rank = 0
 
         # --- Parse GPU tensors (mirrors CpuGpuOffloadingHandlers) ---
         kernel_block_size: int | None = None
@@ -650,24 +1047,25 @@ class SsdGpuOffloadingHandlers:
         norm_gpu_bsf = gpu_block_size_factor // min_bsf
         norm_ssd_bsf = ssd_block_size_factor // min_bsf
 
-        ssd_dir = pathlib.Path(ssd_path)
-        ssd_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("SSD offload: %d paths, %d tensors, tp_rank=%d",
+                     len(ssd_dirs), len(gpu_tensors), tp_rank)
 
         if use_gds:
             self._init_gds(
-                gpu_tensors, ssd_dir, num_ssd_kernel_blocks,
+                gpu_tensors, ssd_dirs, tp_rank, num_ssd_kernel_blocks,
                 block_sizes_bytes, norm_gpu_bsf, norm_ssd_bsf,
                 gds_num_threads)
         else:
             self._init_bounce(
-                gpu_tensors, parsed_gpu_tensors, ssd_dir,
+                gpu_tensors, parsed_gpu_tensors, ssd_dirs, tp_rank,
                 num_ssd_kernel_blocks, block_sizes_bytes,
                 norm_gpu_bsf, norm_ssd_bsf, use_o_direct)
 
     def _init_gds(
         self,
         gpu_tensors: list[torch.Tensor],
-        ssd_dir: pathlib.Path,
+        ssd_dirs: list[pathlib.Path],
+        tp_rank: int,
         num_ssd_kernel_blocks: int,
         block_sizes_bytes: list[int],
         norm_gpu_bsf: int,
@@ -682,7 +1080,8 @@ class SsdGpuOffloadingHandlers:
         self._gds_files: list[kvikio.CuFile] = []
 
         for i, bsz in enumerate(block_sizes_bytes):
-            filepath = ssd_dir / f"kv_offload_{i}.bin"
+            ssd_dir = ssd_dirs[i % len(ssd_dirs)]
+            filepath = ssd_dir / f"kv_offload_tp{tp_rank}_{i}.bin"
             file_size = num_ssd_kernel_blocks * bsz
             # Pre-allocate the file (kvikio needs an existing file for r+).
             fd = os.open(str(filepath), os.O_RDWR | os.O_CREAT, 0o644)
@@ -708,7 +1107,8 @@ class SsdGpuOffloadingHandlers:
         self,
         gpu_tensors: list[torch.Tensor],
         parsed_gpu_tensors: list[tuple[torch.Tensor, bool]],
-        ssd_dir: pathlib.Path,
+        ssd_dirs: list[pathlib.Path],
+        tp_rank: int,
         num_ssd_kernel_blocks: int,
         block_sizes_bytes: list[int],
         norm_gpu_bsf: int,
@@ -739,29 +1139,58 @@ class SsdGpuOffloadingHandlers:
                                "SSD I/O will go through page cache")
 
         self._gds_files = []  # not used in bounce mode
-        self._ssd_fds: list[int] = []
+        num_ssds = len(ssd_dirs)
+        self._ssd_fds: list[list[int]] = []
         for i, bsz in enumerate(block_sizes_bytes):
-            filepath = str(ssd_dir / f"kv_offload_{i}.bin")
-            fd = os.open(filepath, flags, 0o644)
+            fds_for_tensor: list[int] = []
             file_size = num_ssd_kernel_blocks * bsz
-            os.ftruncate(fd, file_size)
-            self._ssd_fds.append(fd)
-            logger.info("  SSD file %s: %d blocks, %.1f MB",
-                        filepath, num_ssd_kernel_blocks, file_size / 1e6)
+            for ssd_dir in ssd_dirs:
+                filepath = str(ssd_dir / f"kv_offload_tp{tp_rank}_{i}.bin")
+                fd = os.open(filepath, flags, 0o644)
+                os.ftruncate(fd, file_size)
+                fds_for_tensor.append(fd)
+                logger.info("  SSD file %s: %d blocks, %.1f MB",
+                            filepath, num_ssd_kernel_blocks, file_size / 1e6)
+            self._ssd_fds.append(fds_for_tensor)
+        logger.info("SSD offload: %d SSDs, block-level striping "
+                     "(block %% %d)", num_ssds, num_ssds)
 
         self.gpu_to_ssd_handler = SsdStoreHandler(
             gpu_tensors, cpu_tensors, self._ssd_fds,
             norm_gpu_bsf, norm_ssd_bsf, block_sizes_bytes)
-        self.ssd_to_gpu_handler = SsdLoadHandler(
-            gpu_tensors, cpu_tensors, self._ssd_fds,
-            norm_gpu_bsf, norm_ssd_bsf, block_sizes_bytes)
+
+        # Load handler: try io_uring for pipelined batch reads,
+        # fall back to thread pool preadv.
+        load_handler: OffloadingHandler | None = None
+        try:
+            from vllm.v1.kv_offload.io_uring import IoUring
+            if IoUring.available():
+                load_handler = IoUringSsdLoadHandler(
+                    gpu_tensors, cpu_tensors, self._ssd_fds,
+                    norm_gpu_bsf, norm_ssd_bsf, block_sizes_bytes)
+                logger.info("SSD offload: using io_uring for read path "
+                            "(pipelined)")
+            else:
+                logger.info("SSD offload: io_uring not supported by kernel")
+        except Exception as e:
+            logger.warning("SSD offload: io_uring init failed: %s", e,
+                           exc_info=True)
+
+        if load_handler is None:
+            load_handler = SsdLoadHandler(
+                gpu_tensors, cpu_tensors, self._ssd_fds,
+                norm_gpu_bsf, norm_ssd_bsf, block_sizes_bytes)
+            logger.info("SSD offload: using thread pool for read path")
+
+        self.ssd_to_gpu_handler = load_handler
 
     def __del__(self):
-        for fd in getattr(self, "_ssd_fds", []):
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+        for fds in getattr(self, "_ssd_fds", []):
+            for fd in (fds if isinstance(fds, list) else [fds]):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
         for gf in getattr(self, "_gds_files", []):
             try:
                 gf.close()
@@ -777,10 +1206,18 @@ class SSDOffloadingSpec(OffloadingSpec):
     def __init__(self, vllm_config, kv_cache_config):
         super().__init__(vllm_config, kv_cache_config)
 
+        # Accept "ssd_path" (str) or "ssd_paths" (list[str]).
+        ssd_paths = self.extra_config.get("ssd_paths")
         ssd_path = self.extra_config.get("ssd_path")
-        if not ssd_path:
+        if ssd_paths:
+            if isinstance(ssd_paths, str):
+                ssd_paths = [ssd_paths]
+        elif ssd_path:
+            ssd_paths = [ssd_path] if isinstance(ssd_path, str) else ssd_path
+        else:
             raise ValueError(
-                "ssd_path must be specified in kv_connector_extra_config")
+                "ssd_path or ssd_paths must be specified in "
+                "kv_connector_extra_config")
 
         ssd_bytes = self.extra_config.get("ssd_bytes_to_use")
         if not ssd_bytes:
@@ -808,7 +1245,7 @@ class SSDOffloadingSpec(OffloadingSpec):
             if kv_bytes_per_offloaded_block > 0 else 0
         )
 
-        self._ssd_path = ssd_path
+        self._ssd_paths: list[str] = ssd_paths
         self._use_o_direct = self.extra_config.get("use_o_direct", True)
         self._use_gds = self.extra_config.get("use_gds", False)
         self._gds_num_threads = self.extra_config.get("gds_num_threads", 4)
@@ -852,7 +1289,7 @@ class SSDOffloadingSpec(OffloadingSpec):
                 num_ssd_blocks=self.num_blocks,
                 gpu_caches=kv_caches,
                 attn_backends=attn_backends,
-                ssd_path=self._ssd_path,
+                ssd_path=self._ssd_paths,
                 use_o_direct=self._use_o_direct,
                 use_gds=self._use_gds,
                 gds_num_threads=self._gds_num_threads,

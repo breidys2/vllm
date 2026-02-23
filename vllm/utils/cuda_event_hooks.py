@@ -383,27 +383,15 @@ class LayerwiseCUDAEventHooks:
         Returns:
             The list of dicts written during this call.
         """
-        # Temporary debug logging
-        import os
-        def _dbg(msg):
-            with open("/tmp/offload_debug.log", "a") as _f:
-                _f.write(f"[pid={os.getpid()}] log_kv_transfers: {msg}\n")
-
-        _dbg(f"called, stats={kv_connector_stats}, type={type(kv_connector_stats)}")
-
         if kv_connector_stats is None:
-            _dbg("stats is None, returning early")
             return []
 
         data = getattr(kv_connector_stats, "data", None)
-        _dbg(f"data={data}, type={type(data)}, bool={bool(data) if data is not None else 'N/A'}")
         if not data:
-            _dbg("data is falsy, returning early")
             return []
 
         records: list[dict] = []
         for direction, ops_list in data.items():
-            _dbg(f"  direction={direction}, num_ops={len(ops_list)}")
             for op in ops_list:
                 # OffloadingOperationMetrics is a dataclass but serialised
                 # as a dict when it crosses process boundaries.
@@ -425,7 +413,6 @@ class LayerwiseCUDAEventHooks:
                     "bandwidth_gb_s": round(bw, 3),
                 })
 
-        _dbg(f"total records to write: {len(records)}, directions: {[r['direction'] for r in records]}")
         if records:
             with open(self._output_path, "a") as f:
                 for record in records:
