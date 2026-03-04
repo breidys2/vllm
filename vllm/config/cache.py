@@ -28,6 +28,8 @@ CacheDType = Literal[
     "fp8_e5m2",
     "fp8_inc",
     "fp8_ds_mla",
+    "kivi_4bit",
+    "kivi_2bit",
 ]
 MambaDType = Literal["auto", "float32", "float16"]
 MambaCacheMode = Literal["all", "align", "none"]
@@ -179,6 +181,55 @@ class CacheConfig:
     'native' (vLLM native CPU offloading), 'lmcache'.
     KV offloading is only activated when kv_offloading_size is set."""
 
+    kv_quant_group_size: int = 0
+    """Group size for sub-byte KV cache quantization (kivi_4bit, kivi_2bit).
+    Each group of elements shares a single fp16 scale factor.
+    0 (default) means use head_size as the group size, giving one scale per
+    head per token. Smaller values (e.g. 32, 64) give finer granularity at the
+    cost of slightly more scale storage overhead."""
+
+    kv_quant_residual_length: int = 0
+    """Number of most-recent tokens per layer to keep in bf16 (residual
+    buffer) when using sub-byte KV cache quantization.  0 (default) disables
+    the residual buffer — all tokens are quantized immediately.  When > 0,
+    the last R tokens are stored in a bf16 side-buffer and spliced back into
+    the dequantized cache during attention, avoiding the quantize→dequantize
+    round-trip for the most recently generated tokens."""
+
+    # -- InfiniGen (OSDI '24) configuration ----------------------------------
+
+    infinigen_enabled: bool = False
+    """Enable InfiniGen-style token-selective KV cache loading.  When True,
+    the KV cache is stored in CPU memory and only essential entries are
+    prefetched to GPU per-layer during decode, guided by a lightweight
+    rehearsal mechanism."""
+
+    infinigen_budget: float = 0.2
+    """Base token selection budget as a fraction of total cached tokens.
+    E.g. 0.2 means prefetch the top 20% of tokens per layer."""
+
+    infinigen_alpha: float = 5.0
+    """Threshold scaling factor for dynamic budget computation.  Higher
+    values make the selection more aggressive (fewer tokens selected)."""
+
+    infinigen_dynamic_budget: bool = True
+    """Enable per-layer dynamic budgets.  When True, the budget for each
+    layer adapts to the attention sparsity of that layer.  When False,
+    ``infinigen_budget`` is used uniformly across all layers."""
+
+    infinigen_capacity: float = 1.0
+    """CPU cache capacity as a fraction of total KV cache size.  1.0 means
+    the full KV cache is retained in CPU memory."""
+
+    infinigen_svd_path: str | None = None
+    """Path to pre-computed SVD skewing matrices (produced by
+    scripts/infinigen_svd_setup.py).  When None, rehearsal uses raw
+    (un-skewed) partial weight columns."""
+
+    infinigen_partial_weight_ratio: float = 0.1
+    """Fraction of Q/K weight columns used for rehearsal speculation.
+    Lower values = faster rehearsal but less accurate token selection."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -206,6 +257,14 @@ class CacheConfig:
             "num_cpu_blocks",
             # WIP feature toggle not impacting compiled graph shape
             "kv_sharing_fast_prefill",
+            # InfiniGen runtime knobs — don't affect compiled graph shape
+            "infinigen_enabled",
+            "infinigen_budget",
+            "infinigen_alpha",
+            "infinigen_dynamic_budget",
+            "infinigen_capacity",
+            "infinigen_svd_path",
+            "infinigen_partial_weight_ratio",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors
@@ -227,6 +286,14 @@ class CacheConfig:
                 "memory footprint and boosts the performance. "
                 "Meanwhile, it may cause accuracy drop without a proper "
                 "scaling factor."
+            )
+        elif cache_dtype.startswith("kivi_"):
+            bits = "2-bit" if "2bit" in cache_dtype else "4-bit"
+            logger.info(
+                "Using KIVI %s quantization for KV cache. This significantly "
+                "reduces GPU memory footprint but may cause accuracy "
+                "degradation, especially for long multi-turn conversations.",
+                bits,
             )
         return cache_dtype
 

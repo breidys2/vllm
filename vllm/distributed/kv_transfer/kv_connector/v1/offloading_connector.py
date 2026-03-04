@@ -155,7 +155,18 @@ class OffloadingConnector(KVConnectorBase_V1):
         self.connector_worker.start_kv_transfers(self._connector_metadata)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        pass
+        """Wait for InfiniGen per-layer prefetch to complete.
+
+        When using InfiniGen, per-layer KV prefetches are issued
+        asynchronously on a dedicated CUDA stream.  This method
+        synchronises the compute stream with the prefetch stream so
+        that the prefetched KV data is ready for attention.
+
+        For non-InfiniGen specs this is a no-op (preserving existing
+        behaviour).
+        """
+        if self.connector_worker is not None:
+            self.connector_worker.wait_for_infinigen_layer(layer_name)
 
     def save_kv_layer(
         self,
@@ -164,7 +175,23 @@ class OffloadingConnector(KVConnectorBase_V1):
         attn_metadata: "AttentionMetadata",
         **kwargs,
     ) -> None:
-        pass
+        """Trigger InfiniGen rehearsal + prefetch for the next layer.
+
+        After layer L's attention completes, this hook is called with
+        the hidden states (passed via ``kwargs["hidden_states"]``).
+        The InfiniGen rehearsal engine uses these hidden states to
+        predict which tokens layer L+1 will need, and initiates an
+        async prefetch from CPU to GPU.
+
+        For non-InfiniGen specs this is a no-op.
+        """
+        if self.connector_worker is not None:
+            self.connector_worker.trigger_infinigen_prefetch(
+                layer_name=layer_name,
+                kv_layer=kv_layer,
+                attn_metadata=attn_metadata,
+                **kwargs,
+            )
 
     def wait_for_save(self):
         assert self.connector_worker is not None
@@ -720,6 +747,76 @@ class OffloadingConnectorWorker:
                 del self._store_jobs[req_id]
 
         return finished_sending, finished_recving
+
+    # -- InfiniGen layer-level prefetch support --------------------------------
+
+    def wait_for_infinigen_layer(self, layer_name: str) -> None:
+        """Wait for InfiniGen per-layer prefetch to complete.
+
+        Synchronises the compute CUDA stream with the dedicated prefetch
+        stream so that the prefetched KV data is visible to the attention
+        kernel.  No-op if InfiniGen is not active or no prefetch is in
+        flight for this layer.
+        """
+        event = self._infinigen_layer_events.get(layer_name)
+        if event is not None:
+            # Make the current (compute) stream wait for the prefetch event
+            torch.cuda.current_stream().wait_event(event)
+            del self._infinigen_layer_events[layer_name]
+
+    def trigger_infinigen_prefetch(
+        self,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        attn_metadata: "AttentionMetadata",
+        **kwargs,
+    ) -> None:
+        """Trigger asynchronous prefetch for the next layer.
+
+        This is called after layer L's attention completes.  In a full
+        implementation, the rehearsal engine would run here to determine
+        which tokens to prefetch for layer L+1, then initiate an async
+        CPU→GPU transfer on a dedicated CUDA stream.
+
+        Currently this provides the scaffolding — the actual rehearsal
+        invocation and selective transfer will be connected when the
+        forward hook (Phase C.3) is integrated.
+        """
+        # The hidden_states for rehearsal can be passed via kwargs
+        hidden_states = kwargs.get("hidden_states")
+        if hidden_states is None:
+            return
+
+        # Placeholder: record a CUDA event so that wait_for_infinigen_layer
+        # has something to synchronise on.  In the full implementation this
+        # event is recorded after the async prefetch transfer completes.
+        if not hasattr(self, "_infinigen_prefetch_stream"):
+            return
+
+        stream = self._infinigen_prefetch_stream
+        event = self._infinigen_event_pool_pop()
+        with torch.cuda.stream(stream):
+            # Full implementation: run rehearsal, select tokens, copy from CPU
+            event.record(stream)
+        self._infinigen_layer_events[layer_name] = event
+
+    def _init_infinigen_state(self) -> None:
+        """Initialise InfiniGen-specific CUDA resources.
+
+        Called lazily on first InfiniGen prefetch request.
+        """
+        if not hasattr(self, "_infinigen_prefetch_stream"):
+            self._infinigen_prefetch_stream = torch.cuda.Stream()
+            self._infinigen_layer_events: dict[str, torch.Event] = {}
+            self._infinigen_event_pool: list[torch.Event] = []
+
+    def _infinigen_event_pool_pop(self) -> torch.Event:
+        self._init_infinigen_state()
+        if self._infinigen_event_pool:
+            return self._infinigen_event_pool.pop()
+        return torch.Event(enable_timing=False)
+
+    # -----------------------------------------------------------------------
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         """

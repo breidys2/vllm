@@ -127,9 +127,19 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbeddingBase):
             query_pass = query[..., self.rotary_dim :]
             key_pass = key[..., self.rotary_dim :]
 
-        cos_sin = cos_sin_cache[
+        effective_positions = (
             torch.add(positions, offsets) if offsets is not None else positions
-        ]
+        )
+        max_pos = effective_positions.max().item()
+        if max_pos >= cos_sin_cache.shape[0]:
+            raise RuntimeError(
+                f"DeepseekScalingRotaryEmbedding: position {max_pos} >= "
+                f"cos_sin_cache size {cos_sin_cache.shape[0]} "
+                f"(max_position_embeddings={self.max_position_embeddings}, "
+                f"scaling_factor={self.scaling_factor}, "
+                f"expected_cache={self.max_position_embeddings * self.scaling_factor})"
+            )
+        cos_sin = cos_sin_cache[effective_positions]
         cos, sin = cos_sin.chunk(2, dim=-1)
         if self.is_neox_style:
             # NOTE(woosuk): Here we assume that the positions tensor has the
@@ -169,8 +179,23 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbeddingBase):
         offsets: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if self.use_flashinfer:
+            effective_positions = (
+                torch.add(positions, offsets)
+                if offsets is not None
+                else positions
+            )
+            max_pos = effective_positions.max().item()
+            if max_pos >= self.cos_sin_cache.shape[0]:
+                raise RuntimeError(
+                    f"DeepseekScalingRotaryEmbedding (flashinfer): position "
+                    f"{max_pos} >= cos_sin_cache size "
+                    f"{self.cos_sin_cache.shape[0]} "
+                    f"(max_position_embeddings="
+                    f"{self.max_position_embeddings}, "
+                    f"scaling_factor={self.scaling_factor})"
+                )
             torch.ops.vllm.flashinfer_rotary_embedding(
-                torch.add(positions, offsets) if offsets is not None else positions,
+                effective_positions,
                 query,
                 key,
                 self.head_size,

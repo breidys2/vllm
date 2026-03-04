@@ -592,6 +592,8 @@ class EngineArgs:
 
     kv_offloading_size: float | None = CacheConfig.kv_offloading_size
     kv_offloading_backend: KVOffloadingBackend = CacheConfig.kv_offloading_backend
+    kv_quant_group_size: int = CacheConfig.kv_quant_group_size
+    kv_quant_residual_length: int = CacheConfig.kv_quant_residual_length
     tokens_only: bool = False
 
     weight_transfer_config: WeightTransferConfig | None = get_field(
@@ -976,6 +978,13 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--kv-offloading-backend", **cache_kwargs["kv_offloading_backend"]
+        )
+        cache_group.add_argument(
+            "--kv-quant-group-size", **cache_kwargs["kv_quant_group_size"]
+        )
+        cache_group.add_argument(
+            "--kv-quant-residual-length",
+            **cache_kwargs["kv_quant_residual_length"]
         )
 
         # Multimodal related configs
@@ -1481,6 +1490,8 @@ class EngineArgs:
             mamba_cache_mode=self.mamba_cache_mode,
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
+            kv_quant_group_size=self.kv_quant_group_size,
+            kv_quant_residual_length=self.kv_quant_residual_length,
         )
 
         ray_runtime_env = None

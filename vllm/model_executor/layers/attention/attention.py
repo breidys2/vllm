@@ -525,12 +525,21 @@ class Attention(nn.Module, AttentionLayerBase):
                 sliding_window=self.sliding_window,
             )
         else:
+            # Pass cache_dtype_str for sub-byte quantization methods
+            # so page_size_bytes is computed correctly.
+            cache_dtype_str = vllm_config.cache_config.cache_dtype
+            from vllm.v1.attention.ops.kv_quant import is_kv_quant_dtype
             return FullAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_size,
                 head_size_v=self.head_size_v,
                 dtype=self.kv_cache_torch_dtype,
+                cache_dtype_str=(
+                    cache_dtype_str
+                    if is_kv_quant_dtype(cache_dtype_str)
+                    else None
+                ),
             )
 
 

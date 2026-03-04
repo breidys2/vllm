@@ -113,6 +113,14 @@ class FlashAttentionBackend(AttentionBackend):
     ) -> tuple[int, ...]:
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
+        if cache_dtype_str.startswith("kivi_"):
+            from vllm.v1.attention.ops.kv_quant import get_kv_quant_method
+            vllm_config = get_current_vllm_config()
+            group_size = vllm_config.cache_config.kv_quant_group_size
+            qm = get_kv_quant_method(cache_dtype_str, group_size=group_size)
+            assert qm is not None
+            qhb = qm.quant_head_bytes(head_size)
+            return (2, num_blocks, block_size, num_kv_heads, qhb)
         return (2, num_blocks, block_size, num_kv_heads, head_size)
 
     @staticmethod
@@ -153,6 +161,9 @@ class FlashAttentionBackend(AttentionBackend):
             return True
         if kv_cache_dtype.startswith("fp8"):
             return flash_attn_supports_fp8()
+        if kv_cache_dtype.startswith("kivi_"):
+            # KIVI dequantizes to bf16 before FlashAttention, always supported
+            return True
         return kv_cache_dtype in ["auto", "bfloat16"]
 
     @classmethod
@@ -217,6 +228,11 @@ class FlashAttentionMetadata:
     max_num_splits: int = 0
 
     causal: bool = True
+
+    # For KIVI sub-byte quantization: precomputed block table remapping.
+    # Computed once in the metadata builder and reused by all layers.
+    kivi_unique_blocks: torch.Tensor | None = None
+    kivi_block_table: torch.Tensor | None = None
 
 
 def _get_sliding_window_configs(
@@ -397,6 +413,10 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                 qkv_dtype = FlashAttentionBackend.get_fp8_dtype_for_flashattn(
                     cache_dtype
                 )
+            elif cache_dtype.startswith("kivi_"):
+                # KIVI dequantizes to bf16 before FlashAttention, so the
+                # AOT scheduler should treat Q/K/V as bf16.
+                qkv_dtype = torch.bfloat16
             else:
                 qkv_dtype = self.kv_cache_dtype
             if aot_schedule:
@@ -518,6 +538,17 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             max_num_splits=max_num_splits,
             causal=causal,
         )
+
+        # Pre-compute KIVI block table remapping once for all layers.
+        if self.cache_config.cache_dtype.startswith("kivi_"):
+            unique_blocks, inverse = block_table_tensor.reshape(-1).unique(
+                return_inverse=True
+            )
+            attn_metadata.kivi_unique_blocks = unique_blocks
+            attn_metadata.kivi_block_table = inverse.reshape(
+                block_table_tensor.shape
+            ).to(block_table_tensor.dtype)
+
         return attn_metadata
 
     def update_block_table(
@@ -529,6 +560,15 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         new_metadata = copy.copy(metadata)
         new_metadata.block_table = blk_table
         new_metadata.slot_mapping = slot_mapping
+        # Recompute KIVI remapping if block table changed.
+        if new_metadata.kivi_unique_blocks is not None:
+            unique_blocks, inverse = blk_table.reshape(-1).unique(
+                return_inverse=True
+            )
+            new_metadata.kivi_unique_blocks = unique_blocks
+            new_metadata.kivi_block_table = inverse.reshape(
+                blk_table.shape
+            ).to(blk_table.dtype)
         return new_metadata
 
     def use_cascade_attention(self, *args, **kwargs) -> bool:
@@ -579,7 +619,41 @@ class FlashAttentionImpl(AttentionImpl):
         # Cache the batch invariant result for use in forward passes
         self.batch_invariant_enabled = vllm_is_batch_invariant()
 
-        if is_quantized_kv_cache(self.kv_cache_dtype) and not flash_attn_supports_fp8():
+        # Initialize InfiniGen context if enabled
+        self._infinigen_enabled = False
+        try:
+            from vllm.config import get_current_vllm_config
+            _vllm_cfg = get_current_vllm_config()
+            self._infinigen_enabled = getattr(
+                _vllm_cfg.cache_config, "infinigen_enabled", False
+            )
+        except Exception:
+            pass
+
+        # Initialize sub-byte KV quantization if applicable
+        self._kv_quant_method = None
+        if self.kv_cache_dtype.startswith("kivi_"):
+            from vllm.v1.attention.ops.kv_quant import get_kv_quant_method
+            vllm_config = get_current_vllm_config()
+            group_size = vllm_config.cache_config.kv_quant_group_size
+            self._kv_quant_method = get_kv_quant_method(
+                self.kv_cache_dtype, group_size=group_size
+            )
+            self._residual_length = (
+                vllm_config.cache_config.kv_quant_residual_length
+            )
+            # Lazily initialised on first do_kv_cache_update call
+            self._residual_k: torch.Tensor | None = None
+            self._residual_v: torch.Tensor | None = None
+            self._residual_slots: torch.Tensor | None = None
+            self._residual_count: int = 0
+            # Per-channel key buffers for KIVI asymmetric quantization.
+            # All shapes: [num_kv_heads, head_size] fp16, lazily initialized.
+            self._key_channel_scales: torch.Tensor | None = None
+            self._key_channel_zero_points: torch.Tensor | None = None
+            self._key_channel_mins: torch.Tensor | None = None
+            self._key_channel_maxs: torch.Tensor | None = None
+        elif is_quantized_kv_cache(self.kv_cache_dtype) and not flash_attn_supports_fp8():
             raise NotImplementedError(
                 "FlashAttention does not support fp8 kv-cache on this device."
             )
@@ -669,7 +743,58 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         # For decoder and cross-attention, use KV cache as before
-        key_cache, value_cache = kv_cache.unbind(0)
+        kivi_block_table = None
+        if self._kv_quant_method is not None:
+            # Sub-byte quantized cache: use pre-computed block remapping
+            # from the metadata builder (computed once, shared by all layers).
+            used_qcache = kv_cache[:, attn_metadata.kivi_unique_blocks]
+            key_cache, value_cache = self._kv_quant_method.dequantize(
+                used_qcache,
+                head_size=self.head_size,
+                output_dtype=query.dtype,
+                key_channel_scales=self._key_channel_scales,
+                key_channel_zero_points=self._key_channel_zero_points,
+            )
+            # Splice bf16 residual originals over the dequantized values
+            # for the most recent tokens (avoids quant round-trip error).
+            if self._residual_length > 0 and self._residual_count > 0:
+                self._apply_residual_buffer(
+                    key_cache,
+                    value_cache,
+                    attn_metadata.kivi_unique_blocks,
+                    kv_cache.shape[2],  # block_size
+                    query.dtype,
+                )
+            kivi_block_table = attn_metadata.kivi_block_table
+        else:
+            key_cache, value_cache = kv_cache.unbind(0)
+
+        # InfiniGen sparse KV path: when InfiniGen prefetch has loaded
+        # only a subset of token positions, the key/value caches contain
+        # valid data only at those positions.  The block_table is already
+        # set up to reference the prefetched blocks, so no additional
+        # remapping is needed here — the standard FlashAttention path
+        # handles the paged layout correctly.  This comment marks the
+        # integration point where future optimisations (e.g., gathering
+        # into a dense buffer for better memory locality) can be added.
+        #
+        # When InfiniGen is active with budget < 1.0, the attention
+        # over the selected subset approximates full attention.  At
+        # budget = 1.0, all tokens are loaded and results are exact.
+        infinigen_active = (
+            self._infinigen_enabled
+            and hasattr(attn_metadata, "infinigen_token_mask")
+            and attn_metadata.infinigen_token_mask is not None
+        )
+        if infinigen_active:
+            # The token mask is available for tracing / profiling.
+            # In the dense-gather optimisation path, we would:
+            #   1. Gather selected K/V into a contiguous buffer
+            #   2. Build a compact block table
+            #   3. Adjust seq_lens to reflect the reduced token count
+            # For now, the standard paged path handles the prefetched
+            # subset correctly since only prefetched blocks are mapped.
+            pass
 
         if self.kv_cache_dtype.startswith("fp8"):
             # queries are quantized in the attention layer
@@ -684,7 +809,8 @@ class FlashAttentionImpl(AttentionImpl):
             seqused_k = attn_metadata.seq_lens
             max_seqlen_q = attn_metadata.max_query_len
             max_seqlen_k = attn_metadata.max_seq_len
-            block_table = attn_metadata.block_table
+            block_table = (kivi_block_table if kivi_block_table is not None
+                           else attn_metadata.block_table)
             scheduler_metadata = attn_metadata.scheduler_metadata
 
             descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
@@ -754,7 +880,8 @@ class FlashAttentionImpl(AttentionImpl):
             alibi_slopes=self.alibi_slopes,
             sliding_window=self.sliding_window,
             logits_soft_cap=self.logits_soft_cap,
-            block_table=attn_metadata.block_table,
+            block_table=(kivi_block_table if kivi_block_table is not None
+                         else attn_metadata.block_table),
             common_prefix_len=attn_metadata.common_prefix_len,
             max_num_splits=attn_metadata.max_num_splits,
             fa_version=self.vllm_flash_attn_version,
@@ -780,25 +907,183 @@ class FlashAttentionImpl(AttentionImpl):
             # we use direct Q, K, V tensors without caching
             return
 
-        key_cache, value_cache = kv_cache.unbind(0)
+        if self._kv_quant_method is not None:
+            # Lazy init per-channel key buffers
+            if self._key_channel_mins is None:
+                num_kv_heads, head_size = key.shape[1], key.shape[2]
+                device = key.device
+                self._key_channel_scales = torch.zeros(
+                    num_kv_heads, head_size,
+                    dtype=torch.float16, device=device,
+                )
+                self._key_channel_zero_points = torch.zeros(
+                    num_kv_heads, head_size,
+                    dtype=torch.float16, device=device,
+                )
+                # Init mins to +inf, maxs to -inf for correct accumulation
+                self._key_channel_mins = torch.full(
+                    (num_kv_heads, head_size),
+                    float('inf'),
+                    dtype=torch.float16, device=device,
+                )
+                self._key_channel_maxs = torch.full(
+                    (num_kv_heads, head_size),
+                    float('-inf'),
+                    dtype=torch.float16, device=device,
+                )
+            # Sub-byte quantized cache: quantize and store directly
+            self._kv_quant_method.quantize_and_store(
+                key,
+                value,
+                kv_cache,
+                slot_mapping,
+                layer._k_scale,
+                layer._v_scale,
+                key_channel_scales=self._key_channel_scales,
+                key_channel_mins=self._key_channel_mins,
+                key_channel_maxs=self._key_channel_maxs,
+            )
+            # Derive zero_points from current mins/maxs for dequantize
+            max_uint = (1 << self._kv_quant_method.bits) - 1
+            scale = (
+                (self._key_channel_maxs - self._key_channel_mins) / max_uint
+            )
+            scale = scale.clamp(min=1e-10)
+            self._key_channel_zero_points = (
+                (-self._key_channel_mins / scale).round().clamp(0, max_uint)
+            )
+            # Keep bf16 originals in the residual buffer so we can
+            # splice them back during attention (avoids quant round-trip
+            # for the most recently written tokens).
+            if self._residual_length > 0:
+                self._update_residual_buffer(key, value, slot_mapping)
+        else:
+            key_cache, value_cache = kv_cache.unbind(0)
 
-        # Reshape the input keys and values and store them in the cache.
-        # Skip this if sharing KV cache with an earlier attention layer.
-        # NOTE(woosuk): Here, key and value are padded while slot_mapping is
-        # not padded. However, we don't need to do key[:num_actual_tokens]
-        # and value[:num_actual_tokens] because the reshape_and_cache_flash
-        # op uses the slot_mapping's shape to determine the number of
-        # actual tokens.
-        reshape_and_cache_flash(
-            key,
-            value,
-            key_cache,
-            value_cache,
-            slot_mapping,
-            self.kv_cache_dtype,
-            layer._k_scale,
-            layer._v_scale,
-        )
+            # Reshape the input keys and values and store them in the cache.
+            # Skip this if sharing KV cache with an earlier attention layer.
+            # NOTE(woosuk): Here, key and value are padded while slot_mapping
+            # is not padded. However, we don't need to do
+            # key[:num_actual_tokens] and value[:num_actual_tokens] because
+            # reshape_and_cache_flash uses slot_mapping's shape to determine
+            # the number of actual tokens.
+            reshape_and_cache_flash(
+                key,
+                value,
+                key_cache,
+                value_cache,
+                slot_mapping,
+                self.kv_cache_dtype,
+                layer._k_scale,
+                layer._v_scale,
+            )
+
+    # ── KIVI residual buffer helpers ──────────────────────────────────
+
+    def _update_residual_buffer(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Append bf16 K/V to the per-layer residual ring buffer.
+
+        Keeps the *R* most-recently-written tokens.  Older entries are
+        evicted (they are already in the quantized cache).
+        """
+        R = self._residual_length
+        valid_mask = slot_mapping >= 0
+        n_valid = valid_mask.sum().item()
+        if n_valid == 0:
+            return
+
+        valid_key = key[valid_mask].to(torch.bfloat16)
+        valid_value = value[valid_mask].to(torch.bfloat16)
+        valid_slots = slot_mapping[valid_mask]
+        device = key.device
+
+        # Lazy initialisation (first call per layer).
+        if self._residual_k is None:
+            self._residual_k = torch.empty(
+                R, key.shape[1], key.shape[2],
+                dtype=torch.bfloat16, device=device,
+            )
+            self._residual_v = torch.empty(
+                R, value.shape[1], value.shape[2],
+                dtype=torch.bfloat16, device=device,
+            )
+            self._residual_slots = torch.full(
+                (R,), -1, dtype=torch.int64, device=device,
+            )
+            self._residual_count = 0
+
+        old = self._residual_count
+
+        if n_valid >= R:
+            # New tokens alone fill the buffer — keep the last R.
+            self._residual_k.copy_(valid_key[-R:])
+            self._residual_v.copy_(valid_value[-R:])
+            self._residual_slots.copy_(valid_slots[-R:])
+            self._residual_count = R
+        elif old + n_valid <= R:
+            # Everything fits — just append.
+            self._residual_k[old:old + n_valid] = valid_key
+            self._residual_v[old:old + n_valid] = valid_value
+            self._residual_slots[old:old + n_valid] = valid_slots
+            self._residual_count = old + n_valid
+        else:
+            # Evict oldest entries to make room.
+            keep = R - n_valid
+            src_start = old - keep
+            self._residual_k[:keep] = self._residual_k[src_start:old].clone()
+            self._residual_v[:keep] = self._residual_v[src_start:old].clone()
+            self._residual_slots[:keep] = (
+                self._residual_slots[src_start:old].clone()
+            )
+            self._residual_k[keep:R] = valid_key
+            self._residual_v[keep:R] = valid_value
+            self._residual_slots[keep:R] = valid_slots
+            self._residual_count = R
+
+    def _apply_residual_buffer(
+        self,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        kivi_unique_blocks: torch.Tensor,
+        block_size: int,
+        output_dtype: torch.dtype,
+    ) -> None:
+        """Overwrite dequantized cache positions with bf16 residual originals.
+
+        Maps residual slot indices → (block, offset) → remapped position in
+        the compacted dequantized cache, then scatters the bf16 values.
+        """
+        count = self._residual_count
+        if count == 0:
+            return
+
+        slots = self._residual_slots[:count]
+        orig_block_idx = slots // block_size
+        block_offset = slots % block_size
+
+        # kivi_unique_blocks is sorted (from torch.unique) so searchsorted
+        # gives us the position of each original block in the compact cache.
+        remapped = torch.searchsorted(kivi_unique_blocks, orig_block_idx)
+
+        # Guard: only apply entries whose block is actually present.
+        n_unique = kivi_unique_blocks.numel()
+        safe_remapped = remapped.clamp(max=n_unique - 1)
+        valid = kivi_unique_blocks[safe_remapped] == orig_block_idx
+
+        if valid.any():
+            idx = remapped[valid]
+            off = block_offset[valid]
+            key_cache[idx, off] = self._residual_k[:count][valid].to(
+                output_dtype
+            )
+            value_cache[idx, off] = self._residual_v[:count][valid].to(
+                output_dtype
+            )
 
     def _forward_with_dcp(
         self,

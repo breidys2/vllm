@@ -59,3 +59,8 @@ OffloadingSpecFactory.register_spec(
 OffloadingSpecFactory.register_spec(
     "SSDOffloadingSpec", "vllm.v1.kv_offload.ssd", "SSDOffloadingSpec"
 )
+OffloadingSpecFactory.register_spec(
+    "InfiniGenOffloadingSpec",
+    "vllm.v1.kv_offload.infinigen",
+    "InfiniGenOffloadingSpec",
+)
