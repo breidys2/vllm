@@ -230,6 +230,34 @@ class CacheConfig:
     """Fraction of Q/K weight columns used for rehearsal speculation.
     Lower values = faster rehearsal but less accurate token selection."""
 
+    infinigen_stats_enabled: bool = False
+    """Enable per-layer runtime statistics collection for InfiniGen.
+    Records rehearsal latency, fetch latency, forward pass latency,
+    tokens selected, and bytes fetched per layer per step."""
+
+    # -- Quest (ICML '24) configuration --------------------------------------
+
+    quest_enabled: bool = False
+    """Enable Quest-style page-level KV cache loading.  When True,
+    per-page min/max key metadata stays GPU-resident and only the most
+    important pages are prefetched from CPU to GPU per layer."""
+
+    quest_page_size: int = 16
+    """Number of tokens per page for Quest metadata (S in the paper).
+    Metadata overhead is 2/S of the key cache size (12.5% for S=16)."""
+
+    quest_budget: float = 0.2
+    """Base fraction of pages to select per layer."""
+
+    quest_alpha: float = 5.0
+    """Threshold scaling factor for dynamic budget computation."""
+
+    quest_dynamic_budget: bool = True
+    """Enable per-layer dynamic budget based on score distribution."""
+
+    quest_stats_enabled: bool = False
+    """Enable per-layer runtime statistics collection for Quest."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -265,6 +293,14 @@ class CacheConfig:
             "infinigen_capacity",
             "infinigen_svd_path",
             "infinigen_partial_weight_ratio",
+            "infinigen_stats_enabled",
+            # Quest runtime knobs — don't affect compiled graph shape
+            "quest_enabled",
+            "quest_page_size",
+            "quest_budget",
+            "quest_alpha",
+            "quest_dynamic_budget",
+            "quest_stats_enabled",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors

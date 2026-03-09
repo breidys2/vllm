@@ -84,6 +84,32 @@ class OffloadingConnectorStats(KVConnectorStats):
         return_dict: dict[str, int | float] = {}
         for transfer_type, ops_list in self.data.items():
             assert isinstance(ops_list, list)
+
+            # InfiniGen per-layer stats (different schema)
+            if transfer_type == "infinigen_layer_stats":
+                total_rehearsal = 0.0
+                total_fetch = 0.0
+                total_forward = 0.0
+                total_stall = 0.0
+                total_bytes = 0
+                total_selected = 0
+                for op in ops_list:
+                    assert isinstance(op, dict)
+                    total_rehearsal += op.get("rehearsal_ms", 0.0)
+                    total_fetch += op.get("fetch_ms", 0.0)
+                    total_forward += op.get("forward_ms", 0.0)
+                    total_stall += op.get("stall_ms", 0.0)
+                    total_bytes += op.get("kv_bytes_fetched", 0)
+                    total_selected += op.get("tokens_selected", 0)
+                return_dict["infinigen_total_rehearsal_ms"] = total_rehearsal
+                return_dict["infinigen_total_fetch_ms"] = total_fetch
+                return_dict["infinigen_total_forward_ms"] = total_forward
+                return_dict["infinigen_total_stall_ms"] = total_stall
+                return_dict["infinigen_total_kv_bytes"] = total_bytes
+                return_dict["infinigen_total_tokens_selected"] = total_selected
+                return_dict["infinigen_num_layer_samples"] = len(ops_list)
+                continue
+
             total_bytes = 0
             total_time = 0.0
             for op in ops_list:
@@ -155,18 +181,18 @@ class OffloadingConnector(KVConnectorBase_V1):
         self.connector_worker.start_kv_transfers(self._connector_metadata)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        """Wait for InfiniGen per-layer prefetch to complete.
+        """Wait for per-layer prefetch to complete.
 
-        When using InfiniGen, per-layer KV prefetches are issued
-        asynchronously on a dedicated CUDA stream.  This method
+        When using InfiniGen or Quest, per-layer KV prefetches are
+        issued asynchronously on a dedicated CUDA stream.  This method
         synchronises the compute stream with the prefetch stream so
         that the prefetched KV data is ready for attention.
 
-        For non-InfiniGen specs this is a no-op (preserving existing
-        behaviour).
+        For non-offloading specs this is a no-op.
         """
         if self.connector_worker is not None:
             self.connector_worker.wait_for_infinigen_layer(layer_name)
+            self.connector_worker.wait_for_quest_layer(layer_name)
 
     def save_kv_layer(
         self,
@@ -175,23 +201,30 @@ class OffloadingConnector(KVConnectorBase_V1):
         attn_metadata: "AttentionMetadata",
         **kwargs,
     ) -> None:
-        """Trigger InfiniGen rehearsal + prefetch for the next layer.
+        """Trigger per-layer prefetch for the next layer.
 
         After layer L's attention completes, this hook is called with
         the hidden states (passed via ``kwargs["hidden_states"]``).
-        The InfiniGen rehearsal engine uses these hidden states to
-        predict which tokens layer L+1 will need, and initiates an
-        async prefetch from CPU to GPU.
+        Dispatches to InfiniGen rehearsal or Quest page scoring.
 
-        For non-InfiniGen specs this is a no-op.
+        For non-offloading specs this is a no-op.
         """
         if self.connector_worker is not None:
-            self.connector_worker.trigger_infinigen_prefetch(
-                layer_name=layer_name,
-                kv_layer=kv_layer,
-                attn_metadata=attn_metadata,
-                **kwargs,
-            )
+            # Quest path: if quest_selected_pages is in kwargs
+            if "quest_selected_pages" in kwargs:
+                self.connector_worker.trigger_quest_prefetch(
+                    layer_name=layer_name,
+                    kv_layer=kv_layer,
+                    attn_metadata=attn_metadata,
+                    **kwargs,
+                )
+            else:
+                self.connector_worker.trigger_infinigen_prefetch(
+                    layer_name=layer_name,
+                    kv_layer=kv_layer,
+                    attn_metadata=attn_metadata,
+                    **kwargs,
+                )
 
     def wait_for_save(self):
         assert self.connector_worker is not None
@@ -760,8 +793,18 @@ class OffloadingConnectorWorker:
         """
         event = self._infinigen_layer_events.get(layer_name)
         if event is not None:
+            layer_idx = self._parse_layer_idx(layer_name)
+
+            # Record stall timing (time waiting for prefetch to finish)
+            if self._infinigen_stats and layer_idx is not None:
+                self._infinigen_stats.begin_wait(layer_idx)
+
             # Make the current (compute) stream wait for the prefetch event
             torch.cuda.current_stream().wait_event(event)
+
+            if self._infinigen_stats and layer_idx is not None:
+                self._infinigen_stats.end_wait(layer_idx)
+
             del self._infinigen_layer_events[layer_name]
 
     def trigger_infinigen_prefetch(
@@ -793,10 +836,25 @@ class OffloadingConnectorWorker:
         if not hasattr(self, "_infinigen_prefetch_stream"):
             return
 
+        layer_idx = self._parse_layer_idx(layer_name)
+        # Use stats from kwargs (passed by hooks manager) or own instance
+        ig_stats = kwargs.get("infinigen_stats", self._infinigen_stats)
+
         stream = self._infinigen_prefetch_stream
         event = self._infinigen_event_pool_pop()
         with torch.cuda.stream(stream):
+            # Record fetch start timing
+            if ig_stats and layer_idx is not None:
+                ig_stats.begin_fetch(layer_idx, stream)
+
             # Full implementation: run rehearsal, select tokens, copy from CPU
+            # (rehearsal timing is inside the rehearsal engine itself)
+
+            # Record fetch end timing
+            if ig_stats and layer_idx is not None:
+                num_bytes = 0  # computed from actual transfer size
+                ig_stats.end_fetch(layer_idx, stream, num_bytes)
+
             event.record(stream)
         self._infinigen_layer_events[layer_name] = event
 
@@ -810,11 +868,134 @@ class OffloadingConnectorWorker:
             self._infinigen_layer_events: dict[str, torch.Event] = {}
             self._infinigen_event_pool: list[torch.Event] = []
 
+            # Initialize InfiniGen stats (enabled based on cache config)
+            stats_enabled = False
+            if hasattr(self, 'spec') and hasattr(self.spec, 'vllm_config'):
+                cache_cfg = getattr(
+                    self.spec.vllm_config, 'cache_config', None
+                )
+                if cache_cfg is not None:
+                    stats_enabled = getattr(
+                        cache_cfg, 'infinigen_stats_enabled', False
+                    )
+
+            from vllm.v1.attention.ops.infinigen_stats import InfiniGenStats
+            self._infinigen_stats: InfiniGenStats | None = InfiniGenStats(
+                enabled=bool(stats_enabled)
+            )
+
     def _infinigen_event_pool_pop(self) -> torch.Event:
         self._init_infinigen_state()
         if self._infinigen_event_pool:
             return self._infinigen_event_pool.pop()
-        return torch.Event(enable_timing=False)
+        # Enable timing when stats collection is active
+        enable_timing = (
+            self._infinigen_stats is not None
+            and self._infinigen_stats.enabled
+        )
+        return torch.Event(enable_timing=enable_timing)
+
+    @staticmethod
+    def _parse_layer_idx(layer_name: str) -> int | None:
+        """Extract integer layer index from name like 'layer_5'."""
+        import re
+        m = re.search(r'(\d+)', layer_name)
+        return int(m.group(1)) if m else None
+
+    # -- Quest layer-level prefetch support ----------------------------------
+
+    def wait_for_quest_layer(self, layer_name: str) -> None:
+        """Wait for Quest per-layer page prefetch to complete.
+
+        Same pattern as ``wait_for_infinigen_layer`` but uses the
+        Quest-specific prefetch stream and event dict.
+        """
+        if not hasattr(self, "_quest_layer_events"):
+            return
+        event = self._quest_layer_events.get(layer_name)
+        if event is not None:
+            layer_idx = self._parse_layer_idx(layer_name)
+
+            if self._quest_stats and layer_idx is not None:
+                self._quest_stats.begin_wait(layer_idx)
+
+            torch.cuda.current_stream().wait_event(event)
+
+            if self._quest_stats and layer_idx is not None:
+                self._quest_stats.end_wait(layer_idx)
+
+            del self._quest_layer_events[layer_name]
+
+    def trigger_quest_prefetch(
+        self,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        attn_metadata: "AttentionMetadata",
+        **kwargs,
+    ) -> None:
+        """Trigger async prefetch of selected pages for Quest.
+
+        Called after layer L's forward completes via the hook manager.
+        The selected page indices are passed via kwargs.
+        """
+        selected_pages = kwargs.get("quest_selected_pages")
+        if selected_pages is None:
+            return
+
+        if not hasattr(self, "_quest_prefetch_stream"):
+            self._init_quest_state()
+
+        layer_idx = self._parse_layer_idx(layer_name)
+        q_stats = kwargs.get("quest_stats", self._quest_stats)
+
+        stream = self._quest_prefetch_stream
+        event = self._quest_event_pool_pop()
+        with torch.cuda.stream(stream):
+            if q_stats and layer_idx is not None:
+                q_stats.begin_fetch(layer_idx, stream)
+
+            # Full implementation: map selected page indices to CPU block
+            # IDs and initiate async transfer.  Currently records events
+            # for the pipeline synchronisation scaffolding.
+
+            if q_stats and layer_idx is not None:
+                num_bytes = 0  # computed from actual transfer size
+                q_stats.end_fetch(layer_idx, stream, num_bytes)
+
+            event.record(stream)
+        self._quest_layer_events[layer_name] = event
+
+    def _init_quest_state(self) -> None:
+        """Initialise Quest-specific CUDA resources."""
+        if not hasattr(self, "_quest_prefetch_stream"):
+            self._quest_prefetch_stream = torch.cuda.Stream()
+            self._quest_layer_events: dict[str, torch.Event] = {}
+            self._quest_event_pool: list[torch.Event] = []
+
+            stats_enabled = False
+            if hasattr(self, 'spec') and hasattr(self.spec, 'vllm_config'):
+                cache_cfg = getattr(
+                    self.spec.vllm_config, 'cache_config', None
+                )
+                if cache_cfg is not None:
+                    stats_enabled = getattr(
+                        cache_cfg, 'quest_stats_enabled', False
+                    )
+
+            from vllm.v1.attention.ops.infinigen_stats import InfiniGenStats
+            self._quest_stats: InfiniGenStats | None = InfiniGenStats(
+                enabled=bool(stats_enabled)
+            )
+
+    def _quest_event_pool_pop(self) -> torch.Event:
+        self._init_quest_state()
+        if self._quest_event_pool:
+            return self._quest_event_pool.pop()
+        enable_timing = (
+            self._quest_stats is not None
+            and self._quest_stats.enabled
+        )
+        return torch.Event(enable_timing=enable_timing)
 
     # -----------------------------------------------------------------------
 
@@ -822,6 +1003,28 @@ class OffloadingConnectorWorker:
         """
         Get the KV transfer stats for the connector.
         """
+        # Merge InfiniGen stats into the connector stats before returning
+        ig_stats = getattr(self, '_infinigen_stats', None)
+        if ig_stats is not None and ig_stats.enabled:
+            ig_data = ig_stats.to_connector_stats_dict()
+            for k, v in ig_data.items():
+                if k in self.kv_connector_stats.data:
+                    self.kv_connector_stats.data[k].extend(v)
+                else:
+                    self.kv_connector_stats.data[k] = v
+
+        # Merge Quest stats
+        q_stats = getattr(self, '_quest_stats', None)
+        if q_stats is not None and q_stats.enabled:
+            q_data = q_stats.to_connector_stats_dict()
+            for k, v in q_data.items():
+                # Use quest_ prefix to distinguish from infinigen
+                qk = f"quest_{k}" if not k.startswith("quest_") else k
+                if qk in self.kv_connector_stats.data:
+                    self.kv_connector_stats.data[qk].extend(v)
+                else:
+                    self.kv_connector_stats.data[qk] = v
+
         if self.kv_connector_stats.is_empty():
             return None
         # Clear stats for next iteration

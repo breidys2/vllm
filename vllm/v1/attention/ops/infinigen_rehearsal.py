@@ -187,6 +187,7 @@ class RehearsalEngine:
         next_layer_idx: int,
         budget: float | None = None,
         alpha: float | None = None,
+        stats: "InfiniGenStats | None" = None,
     ) -> torch.Tensor:
         """Predict which cached tokens are important for the next layer.
 
@@ -209,8 +210,13 @@ class RehearsalEngine:
         budget = budget if budget is not None else self.config.budget
         alpha = alpha if alpha is not None else self.config.alpha
 
+        if stats is not None:
+            stats.begin_rehearsal(next_layer_idx)
+
         num_cached = cached_keys.shape[0]
         if num_cached == 0:
+            if stats is not None:
+                stats.end_rehearsal(next_layer_idx, 0, 0)
             return torch.zeros(0, dtype=torch.bool)
 
         # Number of tokens to select
@@ -220,10 +226,14 @@ class RehearsalEngine:
         partial_qkv = self.partial_q_weights.get(next_layer_idx)
         if partial_qkv is None:
             # No partial weights — select all tokens (full load)
+            if stats is not None:
+                stats.end_rehearsal(next_layer_idx, num_cached, num_cached)
             return torch.ones(num_cached, dtype=torch.bool)
 
         col_indices = self.partial_column_indices.get(next_layer_idx)
         if col_indices is None:
+            if stats is not None:
+                stats.end_rehearsal(next_layer_idx, num_cached, num_cached)
             return torch.ones(num_cached, dtype=torch.bool)
 
         # Project hidden states through partial columns
@@ -278,11 +288,17 @@ class RehearsalEngine:
 
         # Select top-k tokens
         if k >= num_cached:
+            if stats is not None:
+                stats.end_rehearsal(next_layer_idx, num_cached, num_cached)
             return torch.ones(num_cached, dtype=torch.bool)
 
         _, top_indices = approx_importance.topk(k)
         mask = torch.zeros(num_cached, dtype=torch.bool)
         mask[top_indices] = True
+
+        if stats is not None:
+            num_selected = mask.sum().item()
+            stats.end_rehearsal(next_layer_idx, num_cached, num_selected)
 
         return mask
 
@@ -294,6 +310,7 @@ class RehearsalEngine:
         num_cached_tokens: int,
         next_layer_idx: int,
         budget: float | None = None,
+        stats: "InfiniGenStats | None" = None,
     ) -> torch.Tensor:
         """Rehearse using pre-extracted partial key columns.
 
@@ -314,13 +331,24 @@ class RehearsalEngine:
         budget = budget if budget is not None else self.config.budget
         k = max(1, int(num_cached_tokens * budget))
 
+        if stats is not None:
+            stats.begin_rehearsal(next_layer_idx)
+
         if k >= num_cached_tokens:
+            if stats is not None:
+                stats.end_rehearsal(
+                    next_layer_idx, num_cached_tokens, num_cached_tokens
+                )
             return torch.ones(num_cached_tokens, dtype=torch.bool)
 
         partial_qkv = self.partial_q_weights.get(next_layer_idx)
         col_indices = self.partial_column_indices.get(next_layer_idx)
 
         if partial_qkv is None or col_indices is None:
+            if stats is not None:
+                stats.end_rehearsal(
+                    next_layer_idx, num_cached_tokens, num_cached_tokens
+                )
             return torch.ones(num_cached_tokens, dtype=torch.bool)
 
         device = hidden_states.device
@@ -341,5 +369,11 @@ class RehearsalEngine:
         _, top_indices = importance.topk(k)
         mask = torch.zeros(num_cached_tokens, dtype=torch.bool, device=device)
         mask[top_indices] = True
+
+        if stats is not None:
+            num_selected = mask.sum().item()
+            stats.end_rehearsal(
+                next_layer_idx, num_cached_tokens, num_selected
+            )
 
         return mask.cpu()

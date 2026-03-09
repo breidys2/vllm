@@ -64,3 +64,8 @@ OffloadingSpecFactory.register_spec(
     "vllm.v1.kv_offload.infinigen",
     "InfiniGenOffloadingSpec",
 )
+OffloadingSpecFactory.register_spec(
+    "QuestOffloadingSpec",
+    "vllm.v1.kv_offload.quest",
+    "QuestOffloadingSpec",
+)

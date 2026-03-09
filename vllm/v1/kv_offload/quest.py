@@ -1,16 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-InfiniGen Offloading Spec and Manager.
+Quest Offloading Spec and Manager.
 
-InfiniGen (OSDI '24) stores the full KV cache in CPU memory and selectively
-prefetches only essential entries to GPU per-layer during decode, using a
-lightweight rehearsal mechanism to predict which tokens each layer will attend
-to.
+Quest (ICML '24) stores the full KV cache in CPU memory and selectively
+loads only the top-K most important pages to GPU per-layer during decode,
+using per-page min/max key metadata to compute upper-bound attention scores.
 
-Unlike the standard CPUOffloadingSpec which loads entire blocks before the
-forward pass, InfiniGen operates at token granularity, guided by per-layer
-importance masks produced by the rehearsal engine.
+Unlike InfiniGen which operates at token granularity with approximate
+rehearsal, Quest operates at page granularity (S=16 tokens per page) with
+exact query projection for scoring.
 """
 
 from collections import OrderedDict
@@ -43,31 +42,29 @@ logger = init_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# InfiniGen-specific LoadStoreSpec that carries per-layer token masks
+# Quest-specific LoadStoreSpec that carries per-layer page selections
 # ---------------------------------------------------------------------------
 
 @dataclass
-class InfiniGenLoadSpec(LoadStoreSpec):
-    """Extends block-level load spec with per-layer token selection masks.
+class QuestLoadSpec(LoadStoreSpec):
+    """Extends block-level load spec with per-layer page selection info.
 
     Attributes:
-        block_ids: The CPU-side block IDs to load from (same as
-            CPULoadStoreSpec).
-        token_masks: Optional dict mapping ``layer_idx`` to a 1-D boolean
-            ``np.ndarray`` of length ``num_tokens_in_blocks``.  When ``None``,
-            all tokens in the blocks are loaded (equivalent to full-block
-            transfer).
+        block_ids: The CPU-side block IDs to load from.
+        selected_pages: Optional dict mapping ``layer_idx`` to a 1-D
+            ``np.ndarray`` of selected page indices.  When ``None``,
+            all pages (blocks) are loaded.
     """
     block_ids: np.ndarray
-    token_masks: dict[int, np.ndarray] | None = None
+    selected_pages: dict[int, np.ndarray] | None = None
 
     def __init__(
         self,
         block_ids: list[int],
-        token_masks: dict[int, np.ndarray] | None = None,
+        selected_pages: dict[int, np.ndarray] | None = None,
     ):
         self.block_ids = np.array(block_ids, dtype=np.int64)
-        self.token_masks = token_masks
+        self.selected_pages = selected_pages
 
     @staticmethod
     def medium() -> str:
@@ -75,66 +72,67 @@ class InfiniGenLoadSpec(LoadStoreSpec):
 
 
 # ---------------------------------------------------------------------------
-# InfiniGen Offloading Manager (scheduler-side)
+# Quest Offloading Manager (scheduler-side)
 # ---------------------------------------------------------------------------
 
-class InfiniGenOffloadingManager(OffloadingManager):
-    """Scheduler-side manager for InfiniGen-style token-selective offloading.
+class QuestOffloadingManager(OffloadingManager):
+    """Scheduler-side manager for Quest page-level offloading.
 
-    The manager tracks which blocks are offloaded in CPU memory using an LRU
-    policy (identical to ``LRUOffloadingManager``), and additionally maintains
-    per-layer token importance masks that are updated each decode step by the
-    rehearsal engine.
-
-    The key extension over ``LRUOffloadingManager`` is
-    :meth:`set_layer_token_mask` which allows the rehearsal engine to specify
-    which tokens within the offloaded blocks should be prefetched for each
-    layer.
+    Tracks which blocks are offloaded in CPU memory using an LRU policy
+    and additionally maintains per-layer page selections that are updated
+    each decode step by the page selector.
     """
 
     def __init__(
         self,
         backend: Backend,
         num_layers: int,
+        page_size: int = 16,
         enable_events: bool = False,
     ):
         self.backend = backend
         self.num_layers = num_layers
+        self.page_size = page_size
         # block_hash -> BlockStatus
         self.blocks: OrderedDict[BlockHash, BlockStatus] = OrderedDict()
         self.events: list[OffloadingEvent] | None = (
             [] if enable_events else None
         )
 
-        # Per-layer token masks set by the rehearsal engine.
-        # layer_idx -> (block_hashes, bool mask) — updated each decode step.
-        self._layer_token_masks: dict[int, tuple[list[BlockHash], np.ndarray]] = {}
+        # Per-layer page selections set by the hook/selector.
+        # layer_idx -> (block_hashes, selected_page_indices)
+        self._layer_page_selections: dict[
+            int, tuple[list[BlockHash], np.ndarray]
+        ] = {}
 
-    # -- Rehearsal interface -------------------------------------------------
+    # -- Page selection interface --------------------------------------------
 
-    def set_layer_token_mask(
+    def set_layer_page_selection(
         self,
         layer_idx: int,
         block_hashes: list[BlockHash],
-        mask: np.ndarray,
+        selected_pages: np.ndarray,
     ) -> None:
-        """Store the token importance mask for a specific layer.
+        """Store the page selection for a specific layer.
 
-        Called by the rehearsal engine after computing approximate attention
-        scores.  The mask is consumed by :meth:`prepare_load_layer`.
+        Called by the page selector after computing upper-bound scores.
+        Consumed by :meth:`prepare_load_layer`.
         """
-        self._layer_token_masks[layer_idx] = (block_hashes, mask)
+        self._layer_page_selections[layer_idx] = (
+            block_hashes,
+            selected_pages,
+        )
 
-    def get_layer_token_mask(
+    def get_layer_page_selection(
         self,
         layer_idx: int,
     ) -> tuple[list[BlockHash], np.ndarray] | None:
-        """Retrieve the stored token mask for a layer (if any)."""
-        return self._layer_token_masks.get(layer_idx)
+        """Retrieve the stored page selection for a layer (if any)."""
+        return self._layer_page_selections.get(layer_idx)
 
-    def clear_layer_token_masks(self) -> None:
-        """Clear all per-layer masks (called at the end of each step)."""
-        self._layer_token_masks.clear()
+    def clear_layer_page_selections(self) -> None:
+        """Clear all per-layer page selections (called at end of step)."""
+        self._layer_page_selections.clear()
 
     # -- Standard OffloadingManager interface --------------------------------
 
@@ -156,17 +154,16 @@ class InfiniGenOffloadingManager(OffloadingManager):
             assert block.is_ready
             block.ref_cnt += 1
             blocks.append(block)
-
         return self.backend.get_load_store_spec(block_hashes, blocks)
 
     def prepare_load_layer(
         self,
         block_hashes: Iterable[BlockHash],
         layer_idx: int,
-    ) -> InfiniGenLoadSpec:
-        """Prepare a layer-specific load with token mask.
+    ) -> QuestLoadSpec:
+        """Prepare a layer-specific load with page selection.
 
-        Falls back to full-block load if no mask is set for the layer.
+        Falls back to full-block load if no page selection is set.
         """
         block_hashes_list = list(block_hashes)
         blocks = []
@@ -177,21 +174,22 @@ class InfiniGenOffloadingManager(OffloadingManager):
             blocks.append(block)
 
         block_ids = [block.block_id for block in blocks]  # type: ignore[attr-defined]
-        token_mask_entry = self._layer_token_masks.get(layer_idx)
-        token_masks = (
-            {layer_idx: token_mask_entry[1]}
-            if token_mask_entry is not None
+        selection_entry = self._layer_page_selections.get(layer_idx)
+        selected_pages = (
+            {layer_idx: selection_entry[1]}
+            if selection_entry is not None
             else None
         )
-        spec = InfiniGenLoadSpec(block_ids, token_masks=token_masks)
+        spec = QuestLoadSpec(block_ids, selected_pages=selected_pages)
 
         # Attach token tracking metadata for stats collection
-        if token_mask_entry is not None:
-            mask = token_mask_entry[1]
-            spec._tokens_total = len(mask)
-            spec._tokens_selected = int(mask.sum())
+        if selection_entry is not None:
+            num_selected = len(selection_entry[1])
+            num_total = len(block_ids)
+            spec._tokens_total = num_total * self.page_size
+            spec._tokens_selected = num_selected * self.page_size
         else:
-            total_tokens = len(block_ids) * self.backend.block_size
+            total_tokens = len(block_ids) * self.page_size
             spec._tokens_total = total_tokens
             spec._tokens_selected = total_tokens
 
@@ -211,7 +209,6 @@ class InfiniGenOffloadingManager(OffloadingManager):
     def prepare_store(
         self, block_hashes: Iterable[BlockHash]
     ) -> PrepareStoreOutput | None:
-        # Filter out blocks that are already stored
         block_hashes_to_store = [
             bh for bh in block_hashes if bh not in self.blocks
         ]
@@ -229,9 +226,8 @@ class InfiniGenOffloadingManager(OffloadingManager):
                     if num_blocks_to_evict == 0:
                         break
             else:
-                return None  # not enough evictable blocks
+                return None
 
-        # Perform eviction
         for block_hash in to_evict:
             self.backend.free(self.blocks.pop(block_hash))
 
@@ -295,24 +291,21 @@ class InfiniGenOffloadingManager(OffloadingManager):
 
 
 # ---------------------------------------------------------------------------
-# InfiniGen Offloading Spec (top-level entry point)
+# Quest Offloading Spec (top-level entry point)
 # ---------------------------------------------------------------------------
 
-class InfiniGenOffloadingSpec(OffloadingSpec):
-    """Offloading spec for InfiniGen-style token-selective KV cache loading.
+class QuestOffloadingSpec(OffloadingSpec):
+    """Offloading spec for Quest page-level selective KV cache loading.
 
-    Configuration is provided via ``kv_connector_extra_config`` in the
-    ``KVTransferConfig``.  Recognised keys (in addition to standard ones):
+    Configuration via ``kv_connector_extra_config``:
 
-    - ``cpu_bytes_to_use`` (int, required): Total CPU memory budget in bytes.
-    - ``infinigen_budget`` (float, default 0.2): Base token selection budget
-      as a fraction of total cached tokens.
-    - ``infinigen_alpha`` (float, default 5.0): Threshold scaling factor for
-      dynamic budget computation.
-    - ``infinigen_dynamic_budget`` (bool, default True): Whether to use
-      per-layer dynamic budgets.
-    - ``eviction_policy`` (str, default "lru"): CPU-side block eviction
-      policy ("lru" supported).
+    - ``cpu_bytes_to_use`` (int, required): Total CPU memory budget.
+    - ``quest_page_size`` (int, default 16): Tokens per page.
+    - ``quest_budget`` (float, default 0.2): Base page selection budget.
+    - ``quest_alpha`` (float, default 5.0): Threshold scaling factor.
+    - ``quest_dynamic_budget`` (bool, default True): Per-layer dynamic.
+    - ``quest_stats_enabled`` (bool, default False): Enable stats.
+    - ``eviction_policy`` (str, default "lru"): CPU eviction policy.
     """
 
     def __init__(
@@ -326,10 +319,9 @@ class InfiniGenOffloadingSpec(OffloadingSpec):
         if not cpu_bytes_to_use:
             raise ValueError(
                 "cpu_bytes_to_use must be specified in "
-                "kv_connector_extra_config for InfiniGen"
+                "kv_connector_extra_config for Quest"
             )
 
-        # Compute bytes per offloaded block (same logic as CPUOffloadingSpec)
         assert kv_cache_config is not None
         page_sizes = {
             group.kv_cache_spec.page_size_bytes
@@ -352,18 +344,23 @@ class InfiniGenOffloadingSpec(OffloadingSpec):
             else 0
         )
 
-        # InfiniGen-specific parameters
-        self.infinigen_budget: float = float(
-            self.extra_config.get("infinigen_budget", 0.2)
+        # Quest-specific parameters
+        self.quest_page_size: int = int(
+            self.extra_config.get("quest_page_size", 16)
         )
-        self.infinigen_alpha: float = float(
-            self.extra_config.get("infinigen_alpha", 5.0)
+        self.quest_budget: float = float(
+            self.extra_config.get("quest_budget", 0.2)
         )
-        self.infinigen_dynamic_budget: bool = bool(
-            self.extra_config.get("infinigen_dynamic_budget", True)
+        self.quest_alpha: float = float(
+            self.extra_config.get("quest_alpha", 5.0)
+        )
+        self.quest_dynamic_budget: bool = bool(
+            self.extra_config.get("quest_dynamic_budget", True)
+        )
+        self.quest_stats_enabled: bool = bool(
+            self.extra_config.get("quest_stats_enabled", False)
         )
 
-        # Determine number of layers from model config
         self.num_layers: int = (
             vllm_config.model_config.hf_config.num_hidden_layers
         )
@@ -372,8 +369,7 @@ class InfiniGenOffloadingSpec(OffloadingSpec):
             "eviction_policy", "lru"
         )
 
-        # Lazily initialised
-        self._manager: InfiniGenOffloadingManager | None = None
+        self._manager: QuestOffloadingManager | None = None
         self._handlers: CpuGpuOffloadingHandlers | None = None
 
     def get_manager(self) -> OffloadingManager:
@@ -391,13 +387,14 @@ class InfiniGenOffloadingSpec(OffloadingSpec):
 
             if self.eviction_policy != "lru":
                 raise ValueError(
-                    f"InfiniGen currently only supports 'lru' eviction "
+                    f"Quest currently only supports 'lru' eviction "
                     f"policy, got: {self.eviction_policy}"
                 )
 
-            self._manager = InfiniGenOffloadingManager(
+            self._manager = QuestOffloadingManager(
                 backend=backend,
                 num_layers=self.num_layers,
+                page_size=self.quest_page_size,
                 enable_events=enable_events,
             )
         return self._manager
@@ -412,7 +409,7 @@ class InfiniGenOffloadingSpec(OffloadingSpec):
         if self._handlers is None:
             if not current_platform.is_cuda_alike():
                 raise RuntimeError(
-                    "InfiniGen offloading is currently only supported "
+                    "Quest offloading is currently only supported "
                     "on CUDA-alike GPUs"
                 )
 

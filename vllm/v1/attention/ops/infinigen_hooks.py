@@ -59,11 +59,13 @@ class InfiniGenHookManager:
         budget_computer: Any,   # DynamicBudgetComputer
         num_layers: int,
         kv_connector: Any | None = None,
+        stats: Any | None = None,  # InfiniGenStats
     ):
         self.rehearsal_engine = rehearsal_engine
         self.budget_computer = budget_computer
         self.num_layers = num_layers
         self.kv_connector = kv_connector
+        self.stats = stats
 
         # Registered hook handles (for cleanup)
         self._hook_handles: list[torch.utils.hooks.RemovableHook] = []
@@ -222,6 +224,7 @@ class InfiniGenHookManager:
                     hidden_states=residual,
                     next_layer_idx=next_layer_idx,
                     budget=budget,
+                    infinigen_stats=self.stats,
                 )
             except Exception:
                 # Don't let hook errors break the forward pass
