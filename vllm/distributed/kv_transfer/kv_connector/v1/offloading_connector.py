@@ -85,8 +85,11 @@ class OffloadingConnectorStats(KVConnectorStats):
         for transfer_type, ops_list in self.data.items():
             assert isinstance(ops_list, list)
 
-            # InfiniGen per-layer stats (different schema)
-            if transfer_type == "infinigen_layer_stats":
+            # Per-layer prefetch stats (different schema from transfer stats)
+            if transfer_type in (
+                "prefetch_layer_stats", "infinigen_layer_stats"
+            ):
+                prefix = "prefetch" if "prefetch" in transfer_type else "infinigen"
                 total_rehearsal = 0.0
                 total_fetch = 0.0
                 total_forward = 0.0
@@ -101,13 +104,13 @@ class OffloadingConnectorStats(KVConnectorStats):
                     total_stall += op.get("stall_ms", 0.0)
                     total_bytes += op.get("kv_bytes_fetched", 0)
                     total_selected += op.get("tokens_selected", 0)
-                return_dict["infinigen_total_rehearsal_ms"] = total_rehearsal
-                return_dict["infinigen_total_fetch_ms"] = total_fetch
-                return_dict["infinigen_total_forward_ms"] = total_forward
-                return_dict["infinigen_total_stall_ms"] = total_stall
-                return_dict["infinigen_total_kv_bytes"] = total_bytes
-                return_dict["infinigen_total_tokens_selected"] = total_selected
-                return_dict["infinigen_num_layer_samples"] = len(ops_list)
+                return_dict[f"{prefix}_total_rehearsal_ms"] = total_rehearsal
+                return_dict[f"{prefix}_total_fetch_ms"] = total_fetch
+                return_dict[f"{prefix}_total_forward_ms"] = total_forward
+                return_dict[f"{prefix}_total_stall_ms"] = total_stall
+                return_dict[f"{prefix}_total_kv_bytes"] = total_bytes
+                return_dict[f"{prefix}_total_tokens_selected"] = total_selected
+                return_dict[f"{prefix}_num_layer_samples"] = len(ops_list)
                 continue
 
             total_bytes = 0
@@ -137,6 +140,15 @@ class OffloadingConnectorStats(KVConnectorStats):
 class OffloadingConnectorMetadata(KVConnectorMetadata):
     reqs_to_load: dict[ReqId, TransferSpec]
     reqs_to_store: dict[ReqId, TransferSpec]
+    # Number of new (query) tokens per request in this scheduler step.
+    # Used by AdaptiveBandwidthAllocator to estimate per-layer compute time.
+    # Populated by OffloadingConnectorScheduler.build_connector_meta() from
+    # scheduler_output.num_scheduled_tokens.
+    reqs_new_tokens: dict[ReqId, int] = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.reqs_new_tokens is None:
+            self.reqs_new_tokens = {}
 
 
 class OffloadingConnector(KVConnectorBase_V1):
@@ -210,8 +222,11 @@ class OffloadingConnector(KVConnectorBase_V1):
         For non-offloading specs this is a no-op.
         """
         if self.connector_worker is not None:
-            # Quest path: if quest_selected_pages is in kwargs
-            if "quest_selected_pages" in kwargs:
+            # Quest path: selective pages, query for CPU scoring, or all pages
+            if ("quest_selected_pages" in kwargs
+                    or "quest_query" in kwargs
+                    or kwargs.get("quest_all_pages")
+                    or kwargs.get("quest_reuse_selection")):
                 self.connector_worker.trigger_quest_prefetch(
                     layer_name=layer_name,
                     kv_layer=kv_layer,
@@ -535,9 +550,16 @@ class OffloadingConnectorScheduler:
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
+        reqs_to_load = self._reqs_to_load
         meta = OffloadingConnectorMetadata(
-            reqs_to_load=self._reqs_to_load,
+            reqs_to_load=reqs_to_load,
             reqs_to_store=self._get_reqs_to_store(scheduler_output),
+            # Snapshot of new-token counts for requests being loaded.
+            # AdaptiveBandwidthAllocator uses this to estimate compute time.
+            reqs_new_tokens={
+                req_id: scheduler_output.num_scheduled_tokens.get(req_id, 128)
+                for req_id in reqs_to_load
+            },
         )
         self._reqs_to_load = {}
 
@@ -636,6 +658,27 @@ class OffloadingConnectorWorker:
 
         self._finished_reqs_waiting_for_store: set[ReqId] = set()
 
+        # Quest CPU-side scoring state (initialised lazily).
+        self._quest_page_selector: "QuestPageSelector | None" = None
+        self._quest_cpu_handlers: "CpuGpuOffloadingHandlers | None" = None
+        # Tracks which CPU block IDs are currently loaded for each request,
+        # so trigger_quest_prefetch can map page indices → block IDs.
+        self._quest_req_cpu_block_ids: dict[ReqId, list[int]] = {}
+        # job_id -> CPU block IDs pending metadata update after store.
+        self._quest_pending_store_blocks: dict[int, Any] = {}
+
+        # Adaptive bandwidth allocator (shared with QuestHookManager).
+        # Non-None only when adaptive_bandwidth=True in extra_config.
+        # The allocator is owned by QuestOffloadingSpec and shared here via
+        # reference — both this worker and the hook manager run in the same
+        # EngineCore subprocess, so no IPC is needed.
+        from vllm.v1.kv_offload.quest import QuestOffloadingSpec
+        self._adaptive_allocator = (
+            spec.get_adaptive_allocator()
+            if isinstance(spec, QuestOffloadingSpec)
+            else None
+        )
+
     def _generate_job_id(self) -> int:
         job_id = self._job_counter
         self._job_counter = job_id + 1
@@ -661,6 +704,7 @@ class OffloadingConnectorWorker:
             for layer_name in layer_names
         }
         self._register_handlers(kv_caches, attn_backends)
+        self._maybe_init_quest_cpu_state()
 
     def register_cross_layers_kv_cache(
         self, kv_cache: torch.Tensor, attn_backend: type[AttentionBackend]
@@ -669,6 +713,67 @@ class OffloadingConnectorWorker:
         kv_caches = {cross_layer_name: kv_cache}
         attn_backends = {cross_layer_name: attn_backend}
         self._register_handlers(kv_caches, attn_backends)
+
+    def _maybe_init_quest_cpu_state(self) -> None:
+        """Initialise CPU-side Quest page selector if spec is Quest.
+
+        Creates a QuestPageSelector with CPU-resident PageMetadata for
+        each transformer layer.  The metadata is co-located with the CPU
+        KV cache and updated during the GPU→CPU store path.
+        """
+        from vllm.v1.kv_offload.quest import QuestOffloadingSpec
+        if not isinstance(self.spec, QuestOffloadingSpec):
+            return
+
+        from vllm.v1.attention.ops.quest_page_selector import (
+            QuestConfig,
+            QuestPageSelector,
+        )
+        from vllm.v1.kv_offload.worker.cpu_gpu import CpuGpuOffloadingHandlers
+
+        quest_spec = self.spec
+
+        config = QuestConfig(
+            page_size=quest_spec.quest_page_size,
+            budget=quest_spec.quest_budget,
+            alpha=quest_spec.quest_alpha,
+            dynamic_budget=quest_spec.quest_dynamic_budget,
+        )
+        selector = QuestPageSelector(
+            config=config,
+            num_layers=quest_spec.num_layers,
+        )
+
+        # Find the CpuGpuOffloadingHandlers to get CPU tensor references.
+        handlers: CpuGpuOffloadingHandlers | None = None
+        if quest_spec._handlers is not None:
+            handlers = quest_spec._handlers
+
+        num_pages = quest_spec.num_blocks
+        key_dim = quest_spec.num_kv_heads * quest_spec.head_dim
+
+        for layer_idx in range(quest_spec.num_layers):
+            selector.init_layer_metadata(
+                layer_idx=layer_idx,
+                num_pages=num_pages,
+                key_dim=key_dim,
+                dtype=torch.float16,
+                device="cpu",
+                num_kv_heads=quest_spec.num_kv_heads,
+                head_dim=quest_spec.head_dim,
+            )
+
+        self._quest_page_selector = selector
+        self._quest_cpu_handlers = handlers
+        logger.info(
+            "Initialised Quest CPU-side page selector: %d layers, "
+            "%d pages, key_dim=%d (num_kv_heads=%d, head_dim=%d)",
+            quest_spec.num_layers,
+            num_pages,
+            key_dim,
+            quest_spec.num_kv_heads,
+            quest_spec.head_dim,
+        )
 
     def handle_preemptions(self, preempted_req_ids: set[str]):
         for job_id, transfer_spec in self._unsubmitted_store_jobs:
@@ -695,6 +800,30 @@ class OffloadingConnectorWorker:
             success = self.worker.transfer_async(job_id, transfer_spec)
             assert success
 
+            # Register the request's bandwidth demand with the adaptive
+            # allocator so compute_budget() reflects the current load.
+            if self._adaptive_allocator is not None:
+                src_spec, _ = transfer_spec
+                num_cpu_blocks = len(getattr(src_spec, "block_ids", []))
+                block_size = getattr(self.spec, "offloaded_block_size", 16)
+                num_prefix_tokens = num_cpu_blocks * block_size
+                num_new = metadata.reqs_new_tokens.get(req_id, 128)
+
+                from vllm.v1.attention.ops.adaptive_bandwidth import (
+                    compute_kv_bytes_per_layer,
+                )
+                kv_bytes = compute_kv_bytes_per_layer(
+                    num_prefix_tokens=num_prefix_tokens,
+                    num_kv_heads=getattr(self.spec, "num_kv_heads", 8),
+                    head_dim=getattr(self.spec, "head_dim", 128),
+                )
+                self._adaptive_allocator.register_request(
+                    req_id=req_id,
+                    kv_bytes_per_layer=kv_bytes,
+                    num_new_tokens=num_new,
+                    context_length=num_prefix_tokens,
+                )
+
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
         for req_id, transfer_spec in metadata.reqs_to_store.items():
             job_id = self._generate_job_id()
@@ -704,6 +833,13 @@ class OffloadingConnectorWorker:
             # so that offloading starts AFTER transfers related to token sampling,
             # thereby avoiding delays to token generation due to offloading.
             self._unsubmitted_store_jobs.append((job_id, transfer_spec))
+
+            # Track the CPU-side block IDs for Quest metadata update
+            # after the store completes.
+            if self._quest_page_selector is not None:
+                _, dst_spec = transfer_spec
+                if hasattr(dst_spec, "block_ids"):
+                    self._quest_pending_store_blocks[job_id] = dst_spec.block_ids
 
     def wait_for_pending_loads(self) -> None:
         """Block until all submitted load transfers complete.
@@ -756,6 +892,11 @@ class OffloadingConnectorWorker:
                     transfer_type=transfer_result.transfer_type,
                 )
             if store:
+                # Update Quest CPU-side page metadata now that the
+                # GPU→CPU transfer has completed and the data is
+                # accessible on the CPU tensors.
+                self._quest_update_metadata_after_store(job_id)
+
                 req_jobs = self._store_jobs[req_id]
                 req_jobs.remove(job_id)
                 if req_jobs:
@@ -779,7 +920,96 @@ class OffloadingConnectorWorker:
                 finished_sending.add(req_id)
                 del self._store_jobs[req_id]
 
+        # Remove finished requests from the adaptive bandwidth allocator so
+        # their demand is no longer counted when computing budgets for
+        # remaining requests.
+        if self._adaptive_allocator is not None:
+            for req_id in finished_req_ids | finished_recving:
+                self._adaptive_allocator.unregister_request(req_id)
+
         return finished_sending, finished_recving
+
+    # -- Quest metadata update after GPU→CPU store -----------------------------
+
+    def _quest_update_metadata_after_store(self, job_id: int) -> None:
+        """Update CPU-side page metadata after a GPU→CPU store completes.
+
+        Reads the key vectors from the CPU KV tensors and computes
+        per-page min/max for each transformer layer.  This keeps the
+        page metadata co-located with the KV data on CPU.
+        """
+        pending_blocks = self._quest_pending_store_blocks.pop(job_id, None)
+        if pending_blocks is None:
+            return
+
+        selector = self._quest_page_selector
+        handlers = self._quest_cpu_handlers
+        if selector is None or handlers is None:
+            return
+
+        import numpy as np
+
+        cpu_block_ids = np.asarray(pending_blocks)
+
+        # The CPU tensors hold all layers in a single tensor when using
+        # cross-layer layout.  cpu_tensors[0] is the key cache (first
+        # tensor registered is typically K).
+        # Shape: [num_cpu_kernel_blocks, block_size, num_kv_heads, head_dim]
+        # or similar depending on the attention backend.
+        cpu_tensors = handlers.cpu_tensors
+        if not cpu_tensors:
+            return
+
+        # Key cache is the first CPU tensor (K).  The handler registers
+        # tensors as [K, V] or [K0, V0, K1, V1, ...] depending on
+        # split_k_and_v.  We only need the key tensors (even indices).
+        block_size = handlers.kernel_block_size
+        num_layers = selector.num_layers
+
+        # For cross-layer layout: cpu_tensors[0] has shape
+        # [num_layers * num_blocks_per_layer * block_size_factor, ...]
+        # For per-layer layout: iterate over even-indexed tensors.
+        #
+        # We extract key vectors for each stored block and update
+        # the page metadata for every layer.
+        cpu_bsf = handlers.cpu_block_size_factor
+
+        for cpu_block_id in cpu_block_ids:
+            # Each CPU "block" maps to cpu_bsf kernel blocks.
+            for sub_idx in range(cpu_bsf):
+                kernel_block_idx = cpu_block_id * cpu_bsf + sub_idx
+                # The page index in Quest metadata is the CPU block ID.
+                page_idx = cpu_block_id
+
+                # Extract keys from each layer's CPU tensor and update
+                # the corresponding PageMetadata.
+                for layer_idx in range(num_layers):
+                    meta = selector.page_metadata.get(layer_idx)
+                    if meta is None:
+                        continue
+
+                    # Determine which CPU tensor holds this layer's keys.
+                    # With cross-layer layout there's one tensor; with
+                    # per-layer layout, key tensor for layer i is at
+                    # index 2*i (K, V pairs).
+                    if len(cpu_tensors) == 2:
+                        # Cross-layer: single K tensor, single V tensor
+                        key_tensor = cpu_tensors[0]
+                    elif len(cpu_tensors) == 2 * num_layers:
+                        # Per-layer: K_i, V_i pairs
+                        key_tensor = cpu_tensors[2 * layer_idx]
+                    else:
+                        # Unknown layout, skip
+                        break
+
+                    if kernel_block_idx >= key_tensor.shape[0]:
+                        continue
+
+                    # key_tensor[kernel_block_idx]: [block_size, num_kv_heads, head_dim]
+                    keys_block = key_tensor[kernel_block_idx]
+                    # Flatten to [block_size, num_kv_heads * head_dim]
+                    keys_flat = keys_block.reshape(block_size, -1)
+                    meta.update_page(page_idx, keys_flat)
 
     # -- InfiniGen layer-level prefetch support --------------------------------
 
@@ -791,6 +1021,8 @@ class OffloadingConnectorWorker:
         kernel.  No-op if InfiniGen is not active or no prefetch is in
         flight for this layer.
         """
+        if not hasattr(self, "_infinigen_layer_events"):
+            return
         event = self._infinigen_layer_events.get(layer_name)
         if event is not None:
             layer_idx = self._parse_layer_idx(layer_name)
@@ -879,8 +1111,8 @@ class OffloadingConnectorWorker:
                         cache_cfg, 'infinigen_stats_enabled', False
                     )
 
-            from vllm.v1.attention.ops.infinigen_stats import InfiniGenStats
-            self._infinigen_stats: InfiniGenStats | None = InfiniGenStats(
+            from vllm.v1.attention.ops.prefetch_stats import PrefetchStats
+            self._infinigen_stats: PrefetchStats | None = PrefetchStats(
                 enabled=bool(stats_enabled)
             )
 
@@ -935,34 +1167,162 @@ class OffloadingConnectorWorker:
     ) -> None:
         """Trigger async prefetch of selected pages for Quest.
 
-        Called after layer L's forward completes via the hook manager.
-        The selected page indices are passed via kwargs.
-        """
-        selected_pages = kwargs.get("quest_selected_pages")
-        if selected_pages is None:
-            return
+        Called after layer L's forward completes.  The hook passes either
+        pre-computed ``quest_selected_pages`` (GPU-side scoring) or
+        ``quest_query`` (the query vector for CPU-side scoring).
 
+        CPU-side scoring flow:
+        1. Copy query GPU→CPU (tiny: B × key_dim × 2 bytes).
+        2. Score all pages on CPU using co-located PageMetadata.
+        3. Select top-K page indices.
+        4. Map page indices → CPU/GPU block IDs.
+        5. Issue async selective CPU→GPU transfer on the prefetch stream.
+        """
         if not hasattr(self, "_quest_prefetch_stream"):
             self._init_quest_state()
 
         layer_idx = self._parse_layer_idx(layer_name)
+        if layer_idx is None:
+            return
+
         q_stats = kwargs.get("quest_stats", self._quest_stats)
+        next_layer_idx = kwargs.get("next_layer_idx", layer_idx + 1)
+        budget = kwargs.get("budget")
+
+        # Determine selected pages: all pages (baseline), pre-computed, or
+        # via CPU scoring.
+        selected_pages = kwargs.get("quest_selected_pages")
+        quest_query = kwargs.get("quest_query")
+        all_pages = kwargs.get("quest_all_pages", False)
+        reuse_selection = kwargs.get("quest_reuse_selection", False)
+
+        if reuse_selection:
+            # Single-layer scoring baseline: reuse the page selection that was
+            # computed at layer 0.  No Q computation or scoring overhead — the
+            # hook fires immediately after the previous layer completes and we
+            # can start the transfer without any blocking work.
+            selected_pages = getattr(self, "_quest_last_selection", None)
+
+        elif all_pages:
+            # Baseline pipelined path: transfer ALL initialised pages for
+            # the next layer.  No Q computation, no scoring.
+            selector = self._quest_page_selector
+            if selector is not None:
+                meta = selector.page_metadata.get(next_layer_idx)
+                if meta is not None and meta.num_initialised > 0:
+                    selected_pages = (
+                        meta._initialised.nonzero(as_tuple=False)
+                        .squeeze(-1)
+                        .sort()
+                        .values
+                    )
+                    # Record page counts for stats.
+                    if q_stats is not None:
+                        num_init = meta.num_initialised
+                        with q_stats._lock:
+                            ls = q_stats._get_or_create_layer(next_layer_idx)
+                            ls.pages_selected = num_init
+                            ls.pages_total = num_init
+        elif selected_pages is None and quest_query is not None:
+            # CPU-side scoring path.
+            selector = self._quest_page_selector
+            if selector is not None:
+                if q_stats is not None:
+                    q_stats.begin_rehearsal(next_layer_idx)
+
+                # Move query to CPU and score.
+                q_cpu = quest_query.detach().cpu()
+                selected_pages = selector.select_pages(
+                    query=q_cpu,
+                    layer_idx=next_layer_idx,
+                    budget=budget,
+                )
+
+                if q_stats is not None:
+                    meta = selector.page_metadata.get(next_layer_idx)
+                    num_init = meta.num_initialised if meta else 0
+                    num_selected = (
+                        len(selected_pages)
+                        if selected_pages is not None
+                        else 0
+                    )
+                    q_stats.end_rehearsal(
+                        next_layer_idx,
+                        tokens_cached=num_init * selector.config.page_size,
+                        tokens_selected=(
+                            num_selected * selector.config.page_size
+                        ),
+                    )
+                    # Record page-level counts for debugging.
+                    with q_stats._lock:
+                        ls = q_stats._get_or_create_layer(next_layer_idx)
+                        ls.pages_selected = num_selected
+                        ls.pages_total = num_init
+
+                # Cache selection for single-layer scoring reuse.
+                self._quest_last_selection = selected_pages
+
+        if selected_pages is None or len(selected_pages) == 0:
+            return
+
+        # -- Selective CPU→GPU transfer ----------------------------------------
+        # Map selected page indices to (src_cpu_block_ids, dst_gpu_block_ids)
+        # and issue the transfer via the existing handler infrastructure.
+        handlers = self._quest_cpu_handlers
+        if handlers is None:
+            return
+
+        # selected_pages is a tensor of page indices (CPU block IDs in
+        # the offloaded store).  We need to find which GPU block slots
+        # to copy them into.  The current request's load mapping provides
+        # the GPU-side destination block IDs.
+        #
+        # For now, we use the same block mapping that was established
+        # during start_kv_transfers — the selected pages are a subset
+        # of the full block set.
 
         stream = self._quest_prefetch_stream
         event = self._quest_event_pool_pop()
         with torch.cuda.stream(stream):
             if q_stats and layer_idx is not None:
-                q_stats.begin_fetch(layer_idx, stream)
+                q_stats.begin_fetch(next_layer_idx, stream)
 
-            # Full implementation: map selected page indices to CPU block
-            # IDs and initiate async transfer.  Currently records events
-            # for the pipeline synchronisation scaffolding.
+            # Convert selected page indices to numpy for the handler.
+            if isinstance(selected_pages, torch.Tensor):
+                sel_np = selected_pages.cpu().numpy()
+            else:
+                import numpy as np
+                sel_np = np.asarray(selected_pages)
 
-            if q_stats and layer_idx is not None:
-                num_bytes = 0  # computed from actual transfer size
-                q_stats.end_fetch(layer_idx, stream, num_bytes)
+            # Issue selective block copy: only the selected pages.
+            cpu_handler = handlers.cpu_to_gpu_handler
+            src_block_ids = sel_np.astype(
+                cpu_handler.src_tensors[0].dtype
+                if hasattr(cpu_handler.src_tensors[0], 'dtype')
+                else 'int64'
+            )
+
+            import numpy as np
+            from vllm.v1.kv_offload.mediums import CPULoadStoreSpec
+
+            src_spec = CPULoadStoreSpec(src_block_ids.tolist())
+            dst_spec = GPULoadStoreSpec(src_block_ids.tolist())
+
+            job_id = self._generate_job_id()
+            success = cpu_handler.transfer_async(
+                job_id, (src_spec, dst_spec)
+            )
+
+            if q_stats and next_layer_idx is not None:
+                num_bytes = (
+                    len(sel_np)
+                    * handlers.cpu_block_size_factor
+                    * cpu_handler.total_block_size_in_bytes
+                )
+                q_stats.end_fetch(next_layer_idx, stream, num_bytes)
 
             event.record(stream)
+
         self._quest_layer_events[layer_name] = event
 
     def _init_quest_state(self) -> None:
@@ -982,8 +1342,8 @@ class OffloadingConnectorWorker:
                         cache_cfg, 'quest_stats_enabled', False
                     )
 
-            from vllm.v1.attention.ops.infinigen_stats import InfiniGenStats
-            self._quest_stats: InfiniGenStats | None = InfiniGenStats(
+            from vllm.v1.attention.ops.prefetch_stats import PrefetchStats
+            self._quest_stats: PrefetchStats | None = PrefetchStats(
                 enabled=bool(stats_enabled)
             )
 

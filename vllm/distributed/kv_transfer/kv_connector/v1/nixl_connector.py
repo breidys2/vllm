@@ -470,11 +470,36 @@ class NixlConnector(KVConnectorBase_V1):
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
         assert isinstance(self._connector_metadata, NixlConnectorMetadata)
-        self.connector_worker.start_load_kv(self._connector_metadata)
+
+        # Determine whether layer-by-layer pipelining should be active.
+        # Disable under CUDA graph mode since the decorator hooks won't
+        # fire during graph replay.
+        from vllm.config import CUDAGraphMode
+        pipeline_enabled = True
+        if (forward_context is not None
+                and forward_context.cudagraph_runtime_mode
+                != CUDAGraphMode.NONE):
+            pipeline_enabled = False
+
+        self.connector_worker.start_load_kv(
+            self._connector_metadata,
+            pipeline_enabled=pipeline_enabled,
+        )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        """NixlConnector does not do layerwise saving."""
-        pass
+        """Block until a specific layer's KV is loaded.
+
+        When layer_pipeline_depth > 0, this polls NIXL for the
+        per-layer transfer to complete. Otherwise it is a no-op
+        (bulk transfer completes before the forward pass).
+        """
+        assert self.connector_worker is not None
+        if not self.connector_worker._pipeline_active:
+            return
+        layer_idx = NixlConnectorWorker._parse_layer_idx(layer_name)
+        if layer_idx is None:
+            return
+        self.connector_worker.wait_for_layer(layer_idx)
 
     def save_kv_layer(
         self,
@@ -483,8 +508,19 @@ class NixlConnector(KVConnectorBase_V1):
         attn_metadata: AttentionMetadata,
         **kwargs,
     ) -> None:
-        """NixlConnector does not save explicitly."""
-        pass
+        """After layer attention completes, advance the pipeline.
+
+        When pipelining is active, this triggers prefetch of the
+        next layer(s). When inactive, this is a no-op (NIXL RDMA
+        writes directly into KV cache pages, no explicit save needed).
+        """
+        assert self.connector_worker is not None
+        if not self.connector_worker._pipeline_active:
+            return
+        layer_idx = NixlConnectorWorker._parse_layer_idx(layer_name)
+        if layer_idx is None:
+            return
+        self.connector_worker.advance_pipeline(layer_idx)
 
     def wait_for_save(self):
         assert self.connector_worker is not None
@@ -992,6 +1028,24 @@ class NixlConnectorWorker:
         self._invalid_block_ids: set[int] = set()
         # requests that skipped transfer (handshake or transfer failures)
         self._failed_recv_reqs: set[ReqId] = set()
+
+        # Layer-by-layer pipelining state.
+        self.layer_pipeline_depth: int = (
+            vllm_config.kv_transfer_config.layer_pipeline_depth
+        )
+        # Per-request state for pipelined transfers:
+        # req_id -> {layer_idx -> list[TransferHandle]}
+        self._layer_xfer_handles: dict[
+            ReqId, dict[int, list[TransferHandle]]
+        ] = {}
+        # req_id -> next layer index to issue transfer for
+        self._layer_next_to_issue: dict[ReqId, int] = {}
+        # req_id -> set of layer indices confirmed complete
+        self._layer_complete: dict[ReqId, set[int]] = {}
+        # req_id -> (meta args needed for _read_blocks_for_layer)
+        self._layer_pipeline_req_args: dict[ReqId, dict[str, Any]] = {}
+        # Whether pipelining is active this step (disabled under CUDA graphs)
+        self._pipeline_active: bool = False
 
         # Handshake metadata of this worker for NIXL transfers.
         self.xfer_handshake_metadata: NixlHandshakePayload | None = None
@@ -1927,6 +1981,52 @@ class NixlConnectorWorker:
                             cache, indices, block_size_ratio
                         )
 
+    # ---- Layer-pipeline worker-side API ------------------------------------
+
+    def wait_for_layer(self, layer_idx: int) -> None:
+        """Block until layer_idx is complete for all pipelined requests.
+
+        Called from NixlConnector.wait_for_layer_load().
+        """
+        if not self._pipeline_active:
+            return
+        for req_id in list(self._layer_pipeline_req_args.keys()):
+            if req_id in self._failed_recv_reqs:
+                continue
+            self._wait_for_layer_complete(req_id, layer_idx)
+
+    def advance_pipeline(self, completed_layer_idx: int) -> None:
+        """After layer completes, issue next layer transfer(s).
+
+        Called from NixlConnector.save_kv_layer() (via the decorator)
+        after each attention layer finishes.
+        """
+        if not self._pipeline_active:
+            return
+        for req_id in list(self._layer_pipeline_req_args.keys()):
+            if req_id in self._failed_recv_reqs:
+                continue
+            next_to_issue = self._layer_next_to_issue.get(req_id, 0)
+            # Issue next `pipeline_depth` layers beyond what we had.
+            new_end = min(
+                completed_layer_idx + 1 + self.layer_pipeline_depth + 1,
+                self.num_layers,
+            )
+            if new_end > next_to_issue:
+                self._issue_layer_transfers(req_id, next_to_issue, new_end)
+                self._layer_next_to_issue[req_id] = new_end
+
+            # Check if all layers done -> send notification and clean up.
+            completed = self._layer_complete.get(req_id, set())
+            if len(completed) == self.num_layers:
+                self._send_pipeline_notif(req_id)
+                # Move to _recving_transfers as empty so get_finished
+                # picks it up as done.
+                self._recving_transfers[req_id] = []
+                self._cleanup_pipeline_state(req_id)
+
+    # ---- End layer-pipeline worker-side API --------------------------------
+
     def get_finished(self) -> tuple[set[str], set[str]]:
         """
         Get requests that are done sending or recving on this specific worker.
@@ -2104,11 +2204,21 @@ class NixlConnectorWorker:
         self.nixl_wrapper.release_xfer_handle(handle)
         self.xfer_stats.record_failed_transfer()
 
-    def start_load_kv(self, metadata: NixlConnectorMetadata):
+    def start_load_kv(
+        self,
+        metadata: NixlConnectorMetadata,
+        pipeline_enabled: bool = False,
+    ):
         """
         Start loading by triggering non-blocking nixl_xfer.
         We check for these trnxs to complete in each step().
+
+        When pipeline_enabled is True and layer_pipeline_depth > 0,
+        transfers are issued per-layer instead of in bulk.
         """
+        self._pipeline_active = (
+            pipeline_enabled and self.layer_pipeline_depth > 0
+        )
         for req_id, meta in metadata.reqs_to_recv.items():
             meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
                 meta.local_block_ids
@@ -2201,16 +2311,30 @@ class NixlConnectorWorker:
             remote_xfer_side_handle = self.dst_xfer_side_handles[meta.remote.engine_id][
                 remote_rank
             ]
-            self._read_blocks(
-                request_id=req_id,
-                dst_engine_id=meta.remote.engine_id,
-                remote_request_id=meta.remote.request_id,
-                local_block_ids=meta.local_physical_block_ids,
-                remote_block_ids=meta.remote.block_ids,
-                remote_rank=remote_rank,
-                local_xfer_side_handle=local_xfer_side_handle,
-                remote_xfer_side_handle=remote_xfer_side_handle,
-            )
+
+            # Branch: pipelined layer-by-layer or bulk transfer.
+            if self._pipeline_active:
+                self._start_pipelined_req(
+                    req_id=req_id,
+                    meta=meta,
+                    dst_engine_id=meta.remote.engine_id,
+                    remote_request_id=meta.remote.request_id,
+                    local_block_ids=meta.local_physical_block_ids,
+                    remote_block_ids=meta.remote.block_ids,
+                    local_xfer_side_handle=local_xfer_side_handle,
+                    remote_xfer_side_handle=remote_xfer_side_handle,
+                )
+            else:
+                self._read_blocks(
+                    request_id=req_id,
+                    dst_engine_id=meta.remote.engine_id,
+                    remote_request_id=meta.remote.request_id,
+                    local_block_ids=meta.local_physical_block_ids,
+                    remote_block_ids=meta.remote.block_ids,
+                    remote_rank=remote_rank,
+                    local_xfer_side_handle=local_xfer_side_handle,
+                    remote_xfer_side_handle=remote_xfer_side_handle,
+                )
 
             if self.use_mla and tp_ratio < 0:
                 # ..but we still need to notify the other remote ranks that we
@@ -2220,6 +2344,78 @@ class NixlConnectorWorker:
                 for rank_to_notify, agent in remote_agents.items():
                     if rank_to_notify != remote_rank:
                         self.nixl_wrapper.send_notif(agent, notif_msg=notif_id)
+
+    def _start_pipelined_req(
+        self,
+        req_id: str,
+        meta: ReqMeta,
+        dst_engine_id: str,
+        remote_request_id: str,
+        local_block_ids: list[int],
+        remote_block_ids: list[int],
+        local_xfer_side_handle: int,
+        remote_xfer_side_handle: int,
+    ) -> None:
+        """Set up per-layer pipeline state and issue initial transfers."""
+        assert self.kv_topo is not None
+
+        # Handle block_size_ratio remapping (heterogeneous block sizes).
+        block_size_ratio = self.kv_topo.block_size_ratio_from_engine_id(
+            dst_engine_id
+        )
+        if block_size_ratio > 1:
+            local_block_ids = self.get_mapped_blocks(
+                np.asarray(local_block_ids), block_size_ratio
+            ).tolist()
+            if len(local_block_ids) > len(remote_block_ids):
+                local_block_ids = local_block_ids[: len(remote_block_ids)]
+
+        # Handle zero-block case (full prefix cache hit) — just send notif.
+        if len(local_block_ids) == 0:
+            assert meta.remote is not None
+            notif_id = (
+                f"{meta.remote.request_id}:{self.world_size}".encode()
+            )
+            agent_name = self._remote_agents[dst_engine_id][
+                self.kv_topo.get_target_remote_ranks_from_engine_id(
+                    dst_engine_id
+                )[0]
+            ]
+            self.nixl_wrapper.send_notif(agent_name, notif_msg=notif_id)
+            return
+
+        # Align remote blocks (partial prefix cache hit).
+        num_local = len(local_block_ids)
+        num_remote = len(remote_block_ids)
+        if num_local < num_remote:
+            remote_block_ids = remote_block_ids[-num_local:]
+
+        # Store args for _read_blocks_for_layer calls.
+        self._layer_pipeline_req_args[req_id] = dict(
+            local_block_ids=local_block_ids,
+            remote_block_ids=remote_block_ids,
+            dst_engine_id=dst_engine_id,
+            remote_request_id=remote_request_id,
+            local_xfer_side_handle=local_xfer_side_handle,
+            remote_xfer_side_handle=remote_xfer_side_handle,
+        )
+        self._layer_xfer_handles[req_id] = {}
+        self._layer_complete[req_id] = set()
+
+        # Issue transfers for layers [0, pipeline_depth + 1).
+        initial_end = min(
+            self.layer_pipeline_depth + 1, self.num_layers
+        )
+        self._layer_next_to_issue[req_id] = initial_end
+        self._issue_layer_transfers(req_id, 0, initial_end)
+        logger.debug(
+            "Pipelined start for req %s: issued layers 0..%d "
+            "(depth=%d, total_layers=%d)",
+            req_id,
+            initial_end - 1,
+            self.layer_pipeline_depth,
+            self.num_layers,
+        )
 
     def _read_blocks(
         self,
@@ -2442,6 +2638,196 @@ class NixlConnectorWorker:
         block_ids = np.array(block_ids)[None, :]
         descs_ids = region_ids * num_blocks + block_ids
         return descs_ids.flatten()
+
+    # ---- Layer-by-layer pipelining helpers --------------------------------
+
+    @staticmethod
+    def _parse_layer_idx(layer_name: str) -> int | None:
+        """Extract integer layer index from name like
+        'model.layers.5.self_attn'."""
+        import re
+        m = re.search(r'\.(\d+)\.', layer_name)
+        return int(m.group(1)) if m else None
+
+    def _read_blocks_for_layer(
+        self,
+        request_id: str,
+        layer_idx: int,
+        local_block_ids: list[int],
+        remote_block_ids: list[int],
+        dst_engine_id: str,
+        remote_request_id: str,
+        local_xfer_side_handle: int,
+        remote_xfer_side_handle: int,
+    ) -> list[TransferHandle]:
+        """Issue a NIXL transfer for a single layer's KV blocks.
+
+        Returns list of transfer handles (one per layer).
+        """
+        assert self.kv_topo is not None
+        block_size_ratio = self.kv_topo.block_size_ratio_from_engine_id(
+            dst_engine_id
+        )
+
+        # Get per-layer block window (local attention optimization).
+        if self.block_window_per_layer:
+            block_window = self.block_window_per_layer[layer_idx]
+            if block_window is not None:
+                local_block_ids = local_block_ids[-block_window:]
+                remote_block_ids = remote_block_ids[-block_window:]
+
+        local_block_descs_ids = self._get_block_descs_ids(
+            self.engine_id,
+            local_block_ids,
+            layer_idx,
+            block_size_ratio=block_size_ratio,
+        )
+        remote_block_descs_ids = self._get_block_descs_ids(
+            dst_engine_id,
+            remote_block_ids,
+            layer_idx,
+        )
+        assert len(local_block_descs_ids) == len(remote_block_descs_ids)
+
+        handles: list[TransferHandle] = []
+        handle = None
+        try:
+            handle = self.nixl_wrapper.make_prepped_xfer(
+                "READ",
+                local_xfer_side_handle,
+                local_block_descs_ids,
+                remote_xfer_side_handle,
+                remote_block_descs_ids,
+                notif_msg=None,  # No notif for per-layer; sent after all.
+            )
+            self.nixl_wrapper.transfer(handle)
+            handles.append(handle)
+        except Exception as e:
+            self._log_failure(
+                failure_type="layer_transfer_setup_failed",
+                req_id=request_id,
+                msg=f"Layer {layer_idx} transfer failed, "
+                "marking blocks as invalid",
+                error=e,
+                dst_engine_id=dst_engine_id,
+            )
+            if meta := self._recving_metadata.get(request_id):
+                self._invalid_block_ids.update(meta.local_block_ids)
+            self.xfer_stats.record_failed_transfer()
+            if handle is not None:
+                self.nixl_wrapper.release_xfer_handle(handle)
+            self._failed_recv_reqs.add(request_id)
+        return handles
+
+    def _issue_layer_transfers(
+        self,
+        req_id: str,
+        start_layer: int,
+        end_layer: int,
+    ) -> None:
+        """Issue NIXL transfers for layers [start_layer, end_layer).
+
+        Stores handles in self._layer_xfer_handles[req_id].
+        """
+        if req_id in self._failed_recv_reqs:
+            return
+        args = self._layer_pipeline_req_args.get(req_id)
+        if args is None:
+            return
+        end_layer = min(end_layer, self.num_layers)
+        for layer_idx in range(start_layer, end_layer):
+            if layer_idx in self._layer_xfer_handles.get(req_id, {}):
+                continue  # Already issued.
+            handles = self._read_blocks_for_layer(
+                request_id=req_id,
+                layer_idx=layer_idx,
+                **args,
+            )
+            self._layer_xfer_handles.setdefault(req_id, {})[layer_idx] = (
+                handles
+            )
+
+    def _wait_for_layer_complete(
+        self, req_id: str, layer_idx: int
+    ) -> bool:
+        """Poll until layer_idx transfer is complete for req_id.
+
+        Returns True if complete (or already complete), False on failure.
+        """
+        if layer_idx in self._layer_complete.get(req_id, set()):
+            return True
+
+        handles = self._layer_xfer_handles.get(req_id, {}).get(
+            layer_idx, []
+        )
+        for handle in handles:
+            while True:
+                try:
+                    state = self.nixl_wrapper.check_xfer_state(handle)
+                except Exception as e:
+                    self._log_failure(
+                        failure_type="layer_transfer_poll_failed",
+                        req_id=req_id,
+                        msg=f"Layer {layer_idx} poll failed",
+                        error=e,
+                    )
+                    self._handle_failed_transfer(req_id, handle)
+                    return False
+                if state == "DONE":
+                    res = self.nixl_wrapper.get_xfer_telemetry(handle)
+                    self.xfer_stats.record_transfer(res)
+                    self.nixl_wrapper.release_xfer_handle(handle)
+                    break
+                elif state == "PROC":
+                    continue  # Busy-wait.
+                else:
+                    self._log_failure(
+                        failure_type="layer_transfer_failed",
+                        req_id=req_id,
+                        msg=f"Layer {layer_idx} xfer state: {state}",
+                    )
+                    self._handle_failed_transfer(req_id, handle)
+                    return False
+
+        self._layer_complete.setdefault(req_id, set()).add(layer_idx)
+        return True
+
+    def _send_pipeline_notif(self, req_id: str) -> None:
+        """Send NIXL notification after all layers complete (pipelined).
+
+        When using layer-by-layer pipelining, we skip the per-transfer
+        notif_msg and instead send one notification after all layers
+        are done.
+        """
+        meta = self._recving_metadata.get(req_id)
+        if meta is None or meta.remote is None:
+            return
+        notif_id = (
+            f"{meta.remote.request_id}:{self.world_size}".encode()
+        )
+        try:
+            agent_name = self._remote_agents[meta.remote.engine_id][
+                self.kv_topo.get_target_remote_ranks_from_engine_id(
+                    meta.remote.engine_id
+                )[0]
+            ]
+            self.nixl_wrapper.send_notif(agent_name, notif_msg=notif_id)
+        except Exception as e:
+            self._log_failure(
+                failure_type="pipeline_notification_failed",
+                req_id=req_id,
+                msg="Post-pipeline notification failed",
+                error=e,
+            )
+
+    def _cleanup_pipeline_state(self, req_id: str) -> None:
+        """Remove per-layer pipeline tracking for a completed request."""
+        self._layer_xfer_handles.pop(req_id, None)
+        self._layer_next_to_issue.pop(req_id, None)
+        self._layer_complete.pop(req_id, None)
+        self._layer_pipeline_req_args.pop(req_id, None)
+
+    # ---- End layer-by-layer pipelining helpers -----------------------------
 
     def _logical_to_kernel_block_ids(self, block_ids: list[int]) -> list[int]:
         """

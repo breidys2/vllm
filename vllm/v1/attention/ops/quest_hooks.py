@@ -48,7 +48,7 @@ class QuestHookManager:
             ``infinigen_budget.py``, reused).
         num_layers: Number of decoder layers.
         kv_connector: Reference to the OffloadingConnector.
-        stats: Optional InfiniGenStats for timing (reused).
+        stats: Optional PrefetchStats for timing (reused).
     """
 
     def __init__(
@@ -57,13 +57,16 @@ class QuestHookManager:
         budget_computer: Any,  # DynamicBudgetComputer
         num_layers: int,
         kv_connector: Any | None = None,
-        stats: Any | None = None,  # InfiniGenStats
+        stats: Any | None = None,  # PrefetchStats
+        cpu_scoring: bool = True,
     ):
         self.page_selector = page_selector
         self.budget_computer = budget_computer
         self.num_layers = num_layers
         self.kv_connector = kv_connector
         self.stats = stats
+        self.cpu_scoring = cpu_scoring
+        self.single_layer_scoring = False  # set after __init__ if needed
 
         # Registered hook handles (for cleanup)
         self._hook_handles: list[torch.utils.hooks.RemovableHook] = []
@@ -278,11 +281,6 @@ class QuestHookManager:
         if residual is None:
             return
 
-        # Compute exact Q for the next layer
-        query = self._compute_exact_q(residual, next_layer_idx)
-        if query is None:
-            return
-
         # Compute budget for this layer
         budget = self.budget_computer.compute_budget(
             approximate_scores=torch.empty(0),
@@ -290,31 +288,101 @@ class QuestHookManager:
             num_layers=self.num_layers,
         )
 
-        # Select pages
-        selected = self.page_selector.select_pages(
-            query=query,
-            layer_idx=next_layer_idx,
-            budget=budget,
-            stats=self.stats,
-        )
+        if budget >= 1.0:
+            # Baseline pipelined path: transfer ALL pages for the next
+            # layer without computing Q or scoring.  This gives the
+            # baseline full compute/IO overlap (layer-pipelined) without
+            # paying for the Q projection or CPU scoring overhead.
+            if self.kv_connector is not None:
+                try:
+                    self.kv_connector.save_kv_layer(
+                        layer_name=f"layer_{layer_idx}",
+                        kv_layer=torch.empty(0),
+                        attn_metadata=None,
+                        quest_all_pages=True,
+                        next_layer_idx=next_layer_idx,
+                        budget=budget,
+                        quest_stats=self.stats,
+                    )
+                except Exception:
+                    pass
+            return
 
-        self._current_selections[next_layer_idx] = selected
+        if self.single_layer_scoring and layer_idx > 0:
+            # Single-layer scoring baseline: layer 0 computed Q and scored
+            # pages; all subsequent layers reuse that selection.  The connector
+            # looks up its cached _quest_last_selection and immediately starts
+            # the transfer — no Q computation or scoring in the critical path.
+            if self.kv_connector is not None:
+                try:
+                    self.kv_connector.save_kv_layer(
+                        layer_name=f"layer_{layer_idx}",
+                        kv_layer=torch.empty(0),
+                        attn_metadata=None,
+                        quest_reuse_selection=True,
+                        next_layer_idx=next_layer_idx,
+                        budget=budget,
+                        quest_stats=self.stats,
+                    )
+                except Exception:
+                    pass
+            return
 
-        # Trigger async prefetch if connector available
-        if self.kv_connector is not None:
-            try:
-                self.kv_connector.save_kv_layer(
-                    layer_name=f"layer_{layer_idx}",
-                    kv_layer=torch.empty(0),
-                    attn_metadata=None,
-                    hidden_states=residual,
-                    next_layer_idx=next_layer_idx,
-                    budget=budget,
-                    quest_selected_pages=selected,
-                    quest_stats=self.stats,
-                )
-            except Exception:
-                pass
+        # Compute exact Q for the next layer (timed for stats).
+        if self.stats is not None:
+            self.stats.begin_q_compute(next_layer_idx)
+
+        query = self._compute_exact_q(residual, next_layer_idx)
+
+        if self.stats is not None:
+            self.stats.end_q_compute(next_layer_idx)
+
+        if query is None:
+            return
+
+        if self.cpu_scoring:
+            # CPU-side scoring: send the query vector to the connector.
+            # The connector will copy Q to CPU, score against CPU-resident
+            # page metadata, select pages, and issue a selective transfer.
+            if self.kv_connector is not None:
+                try:
+                    self.kv_connector.save_kv_layer(
+                        layer_name=f"layer_{layer_idx}",
+                        kv_layer=torch.empty(0),
+                        attn_metadata=None,
+                        quest_query=query,
+                        next_layer_idx=next_layer_idx,
+                        budget=budget,
+                        quest_stats=self.stats,
+                    )
+                except Exception:
+                    pass
+        else:
+            # GPU-side scoring: score and select pages on GPU, then send
+            # the selected page indices to the connector for transfer.
+            selected = self.page_selector.select_pages(
+                query=query,
+                layer_idx=next_layer_idx,
+                budget=budget,
+                stats=self.stats,
+            )
+
+            self._current_selections[next_layer_idx] = selected
+
+            if self.kv_connector is not None:
+                try:
+                    self.kv_connector.save_kv_layer(
+                        layer_name=f"layer_{layer_idx}",
+                        kv_layer=torch.empty(0),
+                        attn_metadata=None,
+                        hidden_states=residual,
+                        next_layer_idx=next_layer_idx,
+                        budget=budget,
+                        quest_selected_pages=selected,
+                        quest_stats=self.stats,
+                    )
+                except Exception:
+                    pass
 
     @torch.no_grad()
     def _compute_exact_q(

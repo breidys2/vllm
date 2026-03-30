@@ -305,6 +305,13 @@ class CpuGpuOffloadingHandlers:
             gpu_tensors.extend(gpu_tensor.unbind(0) if split_k_and_v else [gpu_tensor])
             cpu_tensors.extend(cpu_tensor.unbind(0) if split_k_and_v else [cpu_tensor])
 
+        # Expose CPU tensors for external use (e.g. Quest CPU-side scoring).
+        self.cpu_tensors = cpu_tensors
+        self.gpu_tensors = gpu_tensors
+        self.cpu_block_size_factor = cpu_block_size_factor
+        self.gpu_block_size_factor = gpu_block_size_factor
+        self.kernel_block_size = kernel_block_size
+
         self.gpu_to_cpu_handler = SingleDirectionOffloadingHandler(
             src_tensors=gpu_tensors,
             dst_tensors=cpu_tensors,

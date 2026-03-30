@@ -66,6 +66,13 @@ class KVTransferConfig:
     'recompute': reschedule the request to recompute failed blocks (default)
     'fail': immediately fail the request with an error finish reason"""
 
+    layer_pipeline_depth: int = 0
+    """Number of layers to prefetch ahead during KV cache loading.
+    0 = disabled (bulk transfer, current default behavior).
+    1 = prefetch one layer ahead (overlap layer N fetch with layer N-1 compute).
+    2+ = deeper prefetch pipeline.
+    Only effective for connectors that support layer-by-layer pipelining."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,

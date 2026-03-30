@@ -60,11 +60,15 @@ class PageMetadata:
         key_dim: int,
         dtype: torch.dtype = torch.float16,
         device: torch.device | str = "cpu",
+        num_kv_heads: int | None = None,
+        head_dim: int | None = None,
     ):
         self.num_pages = num_pages
         self.key_dim = key_dim
         self.dtype = dtype
         self.device = torch.device(device)
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
 
         # Initialise min to +inf and max to -inf so first update sets values
         self.key_min = torch.full(
@@ -93,15 +97,16 @@ class PageMetadata:
         """
         if key_vectors.numel() == 0:
             return
-        keys = key_vectors.to(device=self.device, dtype=self.dtype)
+        # Compute min/max in FP32 for precision, then store in self.dtype.
+        keys = key_vectors.to(device=self.device).float()
         if keys.ndim == 1:
             keys = keys.unsqueeze(0)
         # Flatten to [num_tokens, key_dim] if needed
         if keys.shape[-1] != self.key_dim:
             keys = keys.reshape(-1, self.key_dim)
 
-        page_min = keys.min(dim=0).values
-        page_max = keys.max(dim=0).values
+        page_min = keys.min(dim=0).values.to(self.dtype)
+        page_max = keys.max(dim=0).values.to(self.dtype)
 
         if self._initialised[page_idx]:
             self.key_min[page_idx] = torch.min(
@@ -129,7 +134,8 @@ class PageMetadata:
         """
         if page_indices.numel() == 0:
             return
-        keys = key_vectors.to(device=self.device, dtype=self.dtype)
+        # Compute min/max in FP32 for precision, then store in self.dtype.
+        keys = key_vectors.to(device=self.device).float()
         if keys.ndim == 2:
             # [P, key_dim] — single token per page
             keys = keys.unsqueeze(1)
@@ -138,8 +144,8 @@ class PageMetadata:
         if keys.shape[-1] != self.key_dim:
             keys = keys.reshape(keys.shape[0], -1, self.key_dim)
 
-        batch_min = keys.min(dim=1).values  # [P, key_dim]
-        batch_max = keys.max(dim=1).values  # [P, key_dim]
+        batch_min = keys.min(dim=1).values.to(self.dtype)  # [P, key_dim]
+        batch_max = keys.max(dim=1).values.to(self.dtype)  # [P, key_dim]
 
         idx = page_indices.to(self.device).long()
         already_init = self._initialised[idx]
@@ -191,6 +197,8 @@ class QuestPageSelector:
         key_dim: int,
         dtype: torch.dtype = torch.float16,
         device: torch.device | str = "cpu",
+        num_kv_heads: int | None = None,
+        head_dim: int | None = None,
     ) -> PageMetadata:
         """Allocate GPU-resident page metadata for a layer."""
         meta = PageMetadata(
@@ -198,6 +206,8 @@ class QuestPageSelector:
             key_dim=key_dim,
             dtype=dtype,
             device=device,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
         )
         self.page_metadata[layer_idx] = meta
         return meta
@@ -253,10 +263,17 @@ class QuestPageSelector:
         This is a provable upper bound on the maximum dot-product
         attention score between Q and any token in page i.
 
+        When the model uses GQA (num_heads > num_kv_heads), the query
+        heads that share each KV-head are **mean-pooled** to produce a
+        single representative query of dimension ``key_dim =
+        num_kv_heads * head_dim``.  This matches the benchmark scorer
+        from ``quest_selection_quality.py``.
+
         Args:
-            query: Query vector(s).  Shape ``[B, key_dim]`` or
-                ``[B, num_heads, head_dim]`` (will be mean-pooled over
-                heads to produce ``[B, key_dim]``).
+            query: Query vector(s).  Shape ``[B, key_dim]``,
+                ``[B, num_kv_heads, head_dim]``, or
+                ``[B, num_heads, head_dim]`` (GQA — will be mean-pooled
+                across the heads-per-group that share each KV-head).
             layer_idx: The layer whose metadata to score against.
 
         Returns:
@@ -268,23 +285,44 @@ class QuestPageSelector:
 
         device = meta.device
 
+        # On CPU, use FP32 for scoring precision; on GPU use meta.dtype.
+        scoring_dtype = torch.float32 if device.type == "cpu" else meta.dtype
+
         # Normalise query to [B, key_dim]
-        q = query.to(device=device, dtype=meta.dtype)
+        q = query.to(device=device, dtype=scoring_dtype)
         if q.ndim == 3:
-            # [B, num_heads, head_dim] -> [B, num_heads * head_dim]
-            q = q.reshape(q.shape[0], -1)
+            B, H, D = q.shape
+            num_kv_heads = meta.num_kv_heads
+            head_dim = meta.head_dim
+
+            if (num_kv_heads is not None
+                    and head_dim is not None
+                    and H > num_kv_heads):
+                # GQA: mean-pool the heads_per_group Q-heads that share
+                # each KV-head, then concatenate across KV-heads.
+                # [B, H, D] -> [B, KVH, heads_per_group, D] -> mean
+                #            -> [B, KVH, D] -> [B, key_dim]
+                heads_per_group = H // num_kv_heads
+                q = (
+                    q.reshape(B, num_kv_heads, heads_per_group, D)
+                    .mean(dim=2)
+                    .reshape(B, num_kv_heads * D)
+                )
+            else:
+                # No GQA or already key_dim-aligned
+                q = q.reshape(B, -1)
         if q.ndim == 1:
             q = q.unsqueeze(0)  # [1, key_dim]
 
-        # Trim or pad q to match key_dim
+        # Trim q to match key_dim (safety fallback)
         if q.shape[-1] != meta.key_dim:
             min_dim = min(q.shape[-1], meta.key_dim)
             q = q[:, :min_dim]
-            key_min = meta.key_min[:, :min_dim]
-            key_max = meta.key_max[:, :min_dim]
+            key_min = meta.key_min[:, :min_dim].to(scoring_dtype)
+            key_max = meta.key_max[:, :min_dim].to(scoring_dtype)
         else:
-            key_min = meta.key_min
-            key_max = meta.key_max
+            key_min = meta.key_min.to(scoring_dtype)
+            key_max = meta.key_max.to(scoring_dtype)
 
         # Upper-bound per channel: max(Q_c * m_c, Q_c * M_c)
         # q: [B, D], key_min/key_max: [P, D]
@@ -318,7 +356,7 @@ class QuestPageSelector:
         query: torch.Tensor,
         layer_idx: int,
         budget: float | None = None,
-        stats: "InfiniGenStats | None" = None,
+        stats: "PrefetchStats | None" = None,
     ) -> torch.Tensor:
         """Select top-K pages based on upper-bound scores.
 
@@ -326,7 +364,7 @@ class QuestPageSelector:
             query: Query vector(s), same as ``compute_page_scores``.
             layer_idx: Layer index.
             budget: Override for ``config.budget``.
-            stats: Optional stats accumulator (reuses InfiniGenStats;
+            stats: Optional stats accumulator (reuses PrefetchStats;
                 "rehearsal" maps to page scoring time).
 
         Returns:

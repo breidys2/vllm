@@ -273,8 +273,122 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
+        # Register Quest hooks if Quest offloading is active.
+        self._maybe_register_quest_hooks()
+
         # Attention groups are not supported.
         self.attn_groups = []  # type: ignore
+
+    def _maybe_register_quest_hooks(self) -> None:
+        """Register Quest forward hooks if Quest offloading is active.
+
+        This wires the QuestHookManager to the model so that after each
+        decoder layer's forward pass, the exact Q_{L+1} is computed and
+        sent to the KV connector for CPU-side page scoring and selective
+        prefetch.
+        """
+        try:
+            from vllm.v1.kv_offload.quest import QuestOffloadingSpec
+        except ImportError:
+            return
+
+        # Check if we're using Quest offloading.
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        if kv_transfer_config is None:
+            return
+
+        extra = kv_transfer_config.kv_connector_extra_config or {}
+        if "quest_budget" not in extra and "quest_page_size" not in extra:
+            return
+
+        try:
+            from vllm.v1.attention.ops.quest_hooks import QuestHookManager
+
+            # Create a no-op budget computer that returns the configured
+            # budget.  The actual QuestPageSelector lives on the worker
+            # side (CPU-resident), so the hook only needs to compute Q
+            # and forward it.
+            quest_budget = float(extra.get("quest_budget", 0.2))
+
+            class ConstantBudget:
+                def compute_budget(self, **kwargs):
+                    return quest_budget
+
+            num_layers = (
+                self.vllm_config.model_config.hf_config.num_hidden_layers
+            )
+
+            # Get a reference to the underlying KV connector for the hook
+            # to call save_kv_layer.
+            kv_connector_ref = None
+            if hasattr(self.kv_connector, "kv_connector"):
+                kv_connector_ref = self.kv_connector.kv_connector
+
+            single_layer_scoring = bool(
+                extra.get("quest_single_layer_scoring", False)
+            )
+
+            # Select budget computer: adaptive (bandwidth-based) or constant.
+            # The adaptive allocator is owned by QuestOffloadingSpec and shared
+            # via get_adaptive_allocator() — it tracks concurrent request demand
+            # and returns budget = min(1, bandwidth / total_demand).
+            budget_computer = ConstantBudget()
+            if extra.get("adaptive_bandwidth", False):
+                # Retrieve the shared allocator from the spec.  The spec is
+                # reachable through the connector worker that was already
+                # initialised before this hook registration runs.
+                try:
+                    from vllm.v1.kv_offload.quest import QuestOffloadingSpec
+                    connector_worker = getattr(
+                        getattr(kv_connector_ref, "connector_worker", None),
+                        None, None,
+                    ) or getattr(kv_connector_ref, "connector_worker", None)
+                    spec = getattr(connector_worker, "spec", None)
+                    if isinstance(spec, QuestOffloadingSpec):
+                        allocator = spec.get_adaptive_allocator()
+                        if allocator is not None:
+                            budget_computer = allocator
+                            logger.info(
+                                "Quest hooks: using AdaptiveBandwidthAllocator"
+                            )
+                        else:
+                            logger.warning(
+                                "adaptive_bandwidth=True but allocator is None; "
+                                "falling back to ConstantBudget(%.2f)",
+                                quest_budget,
+                            )
+                except Exception:
+                    logger.warning(
+                        "Failed to retrieve AdaptiveBandwidthAllocator; "
+                        "falling back to ConstantBudget(%.2f)",
+                        quest_budget, exc_info=True,
+                    )
+
+            hook_manager = QuestHookManager(
+                page_selector=None,  # CPU-side, not used by hook
+                budget_computer=budget_computer,
+                num_layers=num_layers,
+                kv_connector=kv_connector_ref,
+                cpu_scoring=True,
+            )
+            hook_manager.single_layer_scoring = single_layer_scoring
+
+            num_registered = hook_manager.register_hooks(self.model)
+            if num_registered > 0:
+                self._quest_hook_manager = hook_manager
+                logger.info(
+                    "Quest hooks registered on %d decoder layers "
+                    "(cpu_scoring=True, budget=%.2f, single_layer_scoring=%s, "
+                    "adaptive=%s)",
+                    num_registered,
+                    quest_budget,
+                    single_layer_scoring,
+                    extra.get("adaptive_bandwidth", False),
+                )
+        except Exception:
+            logger.warning(
+                "Failed to register Quest hooks", exc_info=True
+            )
 
     def prepare_dummy_attn_metadata(self, input_batch: InputBatch) -> None:
         block_tables = self.block_tables.get_dummy_block_tables(input_batch.num_reqs)
