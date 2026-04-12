@@ -266,6 +266,26 @@ class IcmsConnector(KVConnectorBase_V1):
         quest_all_pages = kwargs.get("quest_all_pages", False)
         quest_reuse_selection = kwargs.get("quest_reuse_selection", False)
 
+        if quest_query is not None:
+            logger.info("save_kv_layer QUEST: layer=%s next=%s worker=%s "
+                         "all=%s reuse=%s query_is_none=%s",
+                         layer_name, next_layer_idx, self._worker is not None,
+                         quest_all_pages, quest_reuse_selection,
+                         quest_query is None)
+
+        # Standard save_kv_layer: extract per-block K summaries and populate
+        # the icms group buffers (C2 write path). Only when kv_layer has
+        # actual data (not from Quest hooks which pass empty tensors).
+        is_quest_call = (quest_query is not None
+                         or quest_all_pages
+                         or quest_reuse_selection)
+        if (not is_quest_call
+                and self._worker is not None
+                and kv_layer is not None
+                and kv_layer.numel() > 0
+                and attn_metadata is not None):
+            self._worker.extract_and_record(layer_name, kv_layer, attn_metadata)
+
         if quest_all_pages:
             # Budget >= 1.0: transfer all pages. For icms this means "no
             # sparse selection needed" — skip scoring entirely.
@@ -278,11 +298,15 @@ class IcmsConnector(KVConnectorBase_V1):
             self._worker.on_layer_reuse(next_layer_idx, budget, quest_stats)
             return
 
+        logger.info("BEFORE_DISPATCH: quest_query=%s next_layer=%s",
+                     quest_query is not None, next_layer_idx)
         if quest_query is not None and next_layer_idx is not None:
             # CPU-scoring path: Q arrived, fire Score against icms.
+            logger.info("DISPATCH on_layer_score layer=%d", next_layer_idx)
             self._worker.on_layer_score(
                 next_layer_idx, quest_query, budget, quest_stats,
             )
+            logger.info("DISPATCH on_layer_score DONE layer=%d", next_layer_idx)
 
     def wait_for_save(self) -> None:
         if self._worker is not None:
@@ -370,38 +394,22 @@ class _Scheduler:
         rid = request.request_id
         if rid in self._chains:
             return  # already seen
-        # Derive group-hash chain from block_hashes (C1).
-        bh = getattr(request, "block_hashes", None)
-        if bh is None or len(bh) == 0:
-            self._chains[rid] = []
-            return
-        # block_hashes is a list of BlockHash objects. Each BlockHash has a
-        # .hash_value (int). Group identity = last block hash in each group.
+
+        # v1: block_hashes may be empty at alloc time (prompt not yet
+        # tokenized/hashed). Generate a synthetic chain from request_id
+        # so each request gets a unique, stable trie path. Real block
+        # hashes (for dedup) are a follow-up.
+        #
+        # We don't know the final number of groups yet, so we generate
+        # a generous chain (64 groups = 32K tokens). The worker will
+        # only use as many as it needs.
+        max_groups = 64
         chain: list[int] = []
-        for i in range(_GROUP_BLOCKS - 1, len(bh), _GROUP_BLOCKS):
-            h = bh[i]
-            # BlockHash may be a namedtuple or dataclass; extract int.
-            if isinstance(h, int):
-                chain.append(h & 0xFFFFFFFFFFFFFFFF)
-            elif hasattr(h, "hash_value"):
-                chain.append(h.hash_value & 0xFFFFFFFFFFFFFFFF)
-            else:
-                chain.append(hash(h) & 0xFFFFFFFFFFFFFFFF)
-        # Partial trailing group: use the last available hash.
-        if len(bh) % _GROUP_BLOCKS != 0:
-            last = bh[-1]
-            if isinstance(last, int):
-                chain.append(last & 0xFFFFFFFFFFFFFFFF)
-            elif hasattr(last, "hash_value"):
-                chain.append(last.hash_value & 0xFFFFFFFFFFFFFFFF)
-            else:
-                chain.append(hash(last) & 0xFFFFFFFFFFFFFFFF)
+        for g in range(max_groups):
+            h = hash((rid, g)) & 0xFFFFFFFFFFFFFFFF
+            chain.append(h)
         self._chains[rid] = chain
         self._pending_chain_sends.add(rid)
-
-        # TODO(C2): extract in-order block IDs from `blocks` for the
-        # block_id → intra_request_idx mapping. For v1 the worker uses
-        # the direct helper API which bypasses this mapping.
 
     def build_meta(self, scheduler_output: SchedulerOutput) -> IcmsConnectorMetadata:
         meta = IcmsConnectorMetadata()
@@ -516,9 +524,12 @@ class _Worker:
 
     def on_step_start(self, meta: IcmsConnectorMetadata):
         """Called from start_load_kv. Drains scheduler metadata into caches."""
+        logger.info("on_step_start: %d reqs, %d new_chains",
+                     len(meta.requests), len(meta.new_chains))
         for rid, chain in meta.new_chains.items():
             rs = self._requests.setdefault(rid, _RequestState(request_id=rid))
             rs.chain = chain
+            logger.info("  chain for %s: len=%d", rid, len(chain))
         for rid, bids in meta.block_id_maps.items():
             rs = self._requests.setdefault(rid, _RequestState(request_id=rid))
             rs.block_ids = bids
@@ -557,6 +568,14 @@ class _Worker:
 
     def on_layer_score(self, next_layer_idx, quest_query, budget, stats):
         """CPU-scoring path: Q arrived, fire Score against icms (C9 State 2/3)."""
+        import sys
+        print(f"[ICMS] on_layer_score ENTER: layer={next_layer_idx} budget={budget} n_reqs={len(self._requests)}", file=sys.stderr, flush=True)
+        try:
+            self._on_layer_score_impl(next_layer_idx, quest_query, budget, stats)
+        except Exception:
+            logger.exception("on_layer_score FAILED for layer %d", next_layer_idx)
+
+    def _on_layer_score_impl(self, next_layer_idx, quest_query, budget, stats):
         # Find the active request. With batch=1 (C3) there's exactly one.
         if not self._requests:
             return
@@ -564,8 +583,18 @@ class _Worker:
         if not rs.chain:
             return
 
+        # C2: flush partial group buffers before scoring so the icms trie
+        # has the latest pages.
+        for gidx in list(rs.active_group_buffers.keys()):
+            self._flush_group(rid, gidx, partial=True)
+
         icms_rid = self._icms_request_id(rid, 0)
-        k = max(1, int(len(rs.chain) * _GROUP_BLOCKS * budget))
+        # Compute k from the number of pages actually in the trie.
+        total_pages = rs.num_groups_written * _GROUP_BLOCKS
+        # Add pages from the just-flushed partial groups.
+        for gidx, buf in rs.active_group_buffers.items():
+            total_pages += len({p for (_, p) in buf.filled})
+        k = max(1, int(total_pages * budget)) if total_pages > 0 else 1
         k = min(k, self._k)
 
         # Marshal query to fp32 numpy.
@@ -598,7 +627,8 @@ class _Worker:
                 self._pending_scores[layer_name] = (reply, slot)
         except Exception as e:
             self._sink_pool.release(slot)
-            logger.warning("Score failed for layer %d: %s", next_layer_idx, e)
+            logger.info("Score for layer %d: %s (chain_len=%d, k=%d, total_pages=%d)",
+                         next_layer_idx, e, len(rs.chain), k, total_pages)
 
     def wait_for_layer(self, layer_name: str):
         """Block until Score result for this layer is available."""
@@ -616,6 +646,119 @@ class _Worker:
         for rid, rs in self._requests.items():
             for gidx in list(rs.active_group_buffers.keys()):
                 self._flush_group(rid, gidx, partial=True)
+
+    # ─── KV extraction from GPU paged buffer (C2 write path) ────────────
+
+    def extract_and_record(self, layer_name: str, kv_layer: torch.Tensor,
+                            attn_metadata) -> None:
+        """Extract per-block K/V from the GPU KV cache and populate icms buffers.
+
+        Called from save_kv_layer for each standard (non-Quest) per-layer call.
+
+        kv_layer shape: [2 (K+V), num_blocks, block_size, num_kv_heads, head_dim]
+        attn_metadata: FlashAttentionMetadata with block_table, seq_lens, etc.
+        """
+        if not self._requests or self._geom is None:
+            return
+
+        # Parse layer index from layer_name like "model.layers.5.self_attn.attn"
+        layer_idx = self._parse_layer_idx(layer_name)
+        if layer_idx is None or layer_idx >= self._geom.num_layers:
+            return
+
+        # kv_layer: [2, num_blocks, block_size, num_kv_heads, head_dim]
+        if kv_layer.ndim != 5 or kv_layer.shape[0] != 2:
+            return
+        k_cache = kv_layer[0]  # [num_blocks, block_size, num_kv_heads, head_dim]
+        v_cache = kv_layer[1]
+
+        # block_table: [num_reqs, max_num_blocks_per_req] — per-request block IDs
+        block_table = getattr(attn_metadata, "block_table", None)
+        seq_lens = getattr(attn_metadata, "seq_lens", None)
+        if block_table is None or seq_lens is None:
+            return
+
+        # Block size from the KV cache tensor.
+        block_size = k_cache.shape[1]
+
+        # With batch=1 (C3), process only the first request.
+        # block_table may be a tensor on GPU; move to CPU for indexing.
+        if isinstance(block_table, torch.Tensor):
+            bt_cpu = block_table.cpu()
+        else:
+            bt_cpu = block_table
+        if isinstance(seq_lens, torch.Tensor):
+            sl_cpu = seq_lens.cpu()
+        else:
+            sl_cpu = seq_lens
+
+        # Find the first active request.
+        rid = None
+        rs = None
+        for r, s in self._requests.items():
+            rid = r
+            rs = s
+            break
+        if rs is None or not rs.chain:
+            return
+
+        # Number of blocks for this request.
+        if hasattr(sl_cpu, '__len__') and len(sl_cpu) > 0:
+            seq_len = int(sl_cpu[0]) if isinstance(sl_cpu[0], (int, float, torch.Tensor)) else 0
+        else:
+            seq_len = 0
+        if seq_len <= 0:
+            return
+        num_blocks = (seq_len + block_size - 1) // block_size
+
+        # Extract the request's block IDs from the block table.
+        if bt_cpu.ndim >= 2:
+            req_block_ids = bt_cpu[0, :num_blocks].tolist()
+        elif bt_cpu.ndim == 1:
+            req_block_ids = bt_cpu[:num_blocks].tolist()
+        else:
+            return
+
+        # Only process blocks we haven't recorded yet for this layer.
+        # Track per (request, layer) which intra-request blocks are done.
+        recorded_key = (rid, layer_idx)
+        if not hasattr(rs, '_recorded_blocks'):
+            rs._recorded_blocks = {}
+        already_recorded = rs._recorded_blocks.get(recorded_key, 0)
+
+        new_blocks = 0
+        for intra_idx in range(already_recorded, len(req_block_ids)):
+            gpu_block_id = req_block_ids[intra_idx]
+            if gpu_block_id < 0 or gpu_block_id >= k_cache.shape[0]:
+                continue
+            # Extract K and V blocks: [block_size, num_kv_heads, head_dim]
+            key_block = k_cache[gpu_block_id].cpu()
+            val_block = v_cache[gpu_block_id].cpu()
+            self.record_page(rid, intra_idx, layer_idx, key_block, val_block)
+            new_blocks += 1
+
+        rs._recorded_blocks[recorded_key] = len(req_block_ids)
+        if new_blocks > 0 and layer_idx == 0:
+            n_groups = len(rs.active_group_buffers)
+            n_written = rs.num_groups_written
+            logger.info(
+                "extract_and_record: layer=%d new_blocks=%d total_blocks=%d "
+                "active_bufs=%d groups_written=%d",
+                layer_idx, new_blocks, len(req_block_ids),
+                n_groups, n_written,
+            )
+
+    @staticmethod
+    def _parse_layer_idx(layer_name: str) -> int | None:
+        """Extract layer index from 'model.layers.N.self_attn.attn'."""
+        parts = layer_name.split(".")
+        for i, part in enumerate(parts):
+            if part == "layers" and i + 1 < len(parts):
+                try:
+                    return int(parts[i + 1])
+                except ValueError:
+                    pass
+        return None
 
     # ─── group buffer management (C2) ────────────────────────────────────
 
