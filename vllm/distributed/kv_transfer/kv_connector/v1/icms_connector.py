@@ -266,13 +266,6 @@ class IcmsConnector(KVConnectorBase_V1):
         quest_all_pages = kwargs.get("quest_all_pages", False)
         quest_reuse_selection = kwargs.get("quest_reuse_selection", False)
 
-        if quest_query is not None:
-            logger.info("save_kv_layer QUEST: layer=%s next=%s worker=%s "
-                         "all=%s reuse=%s query_is_none=%s",
-                         layer_name, next_layer_idx, self._worker is not None,
-                         quest_all_pages, quest_reuse_selection,
-                         quest_query is None)
-
         # Standard save_kv_layer: extract per-block K summaries and populate
         # the icms group buffers (C2 write path). Only when kv_layer has
         # actual data (not from Quest hooks which pass empty tensors).
@@ -298,15 +291,14 @@ class IcmsConnector(KVConnectorBase_V1):
             self._worker.on_layer_reuse(next_layer_idx, budget, quest_stats)
             return
 
-        logger.info("BEFORE_DISPATCH: quest_query=%s next_layer=%s",
-                     quest_query is not None, next_layer_idx)
         if quest_query is not None and next_layer_idx is not None:
             # CPU-scoring path: Q arrived, fire Score against icms.
-            logger.info("DISPATCH on_layer_score layer=%d", next_layer_idx)
+            # Pass the bound metadata so the worker can find the request
+            # chain even if _requests was evicted between steps.
             self._worker.on_layer_score(
                 next_layer_idx, quest_query, budget, quest_stats,
+                connector_meta=self._connector_metadata,
             )
-            logger.info("DISPATCH on_layer_score DONE layer=%d", next_layer_idx)
 
     def wait_for_save(self) -> None:
         if self._worker is not None:
@@ -472,6 +464,10 @@ class _Worker:
         # Per-request state (C1 worker-side cache).
         self._requests: dict[str, _RequestState] = {}
 
+        # Persistent chain cache: survives request eviction so Quest hooks
+        # can find the chain even after request_finished runs.
+        self._last_chain_for_rid: dict[str, list[int]] = {}
+
         # Pending async score results (C9).
         self._pending_scores: dict[str, Any] = {}  # layer_name → result
         self._score_lock = threading.Lock()
@@ -524,12 +520,10 @@ class _Worker:
 
     def on_step_start(self, meta: IcmsConnectorMetadata):
         """Called from start_load_kv. Drains scheduler metadata into caches."""
-        logger.info("on_step_start: %d reqs, %d new_chains",
-                     len(meta.requests), len(meta.new_chains))
         for rid, chain in meta.new_chains.items():
             rs = self._requests.setdefault(rid, _RequestState(request_id=rid))
             rs.chain = chain
-            logger.info("  chain for %s: len=%d", rid, len(chain))
+            self._last_chain_for_rid[rid] = chain
         for rid, bids in meta.block_id_maps.items():
             rs = self._requests.setdefault(rid, _RequestState(request_id=rid))
             rs.block_ids = bids
@@ -566,21 +560,45 @@ class _Worker:
         # the Score call for this layer will hit the cache.
         pass
 
-    def on_layer_score(self, next_layer_idx, quest_query, budget, stats):
+    def on_layer_score(self, next_layer_idx, quest_query, budget, stats,
+                        connector_meta=None):
         """CPU-scoring path: Q arrived, fire Score against icms (C9 State 2/3)."""
-        import sys
-        print(f"[ICMS] on_layer_score ENTER: layer={next_layer_idx} budget={budget} n_reqs={len(self._requests)}", file=sys.stderr, flush=True)
         try:
-            self._on_layer_score_impl(next_layer_idx, quest_query, budget, stats)
+            self._on_layer_score_impl(
+                next_layer_idx, quest_query, budget, stats, connector_meta)
         except Exception:
             logger.exception("on_layer_score FAILED for layer %d", next_layer_idx)
 
-    def _on_layer_score_impl(self, next_layer_idx, quest_query, budget, stats):
+    def _on_layer_score_impl(self, next_layer_idx, quest_query, budget, stats,
+                              connector_meta=None):
         # Find the active request. With batch=1 (C3) there's exactly one.
-        if not self._requests:
-            return
-        rid, rs = next(iter(self._requests.items()))
-        if not rs.chain:
+        rid = None
+        rs = None
+        if self._requests:
+            rid, rs = next(iter(self._requests.items()))
+
+        # Fallback: if _requests is empty (request may have been evicted
+        # between steps), reconstruct from the bound connector metadata
+        # which is still available during the forward pass.
+        if rs is None or not rs.chain:
+            if (connector_meta is not None
+                    and isinstance(connector_meta, IcmsConnectorMetadata)
+                    and connector_meta.requests):
+                # Use the first request from the metadata.
+                step_req = connector_meta.requests[0]
+                rid = step_req.request_id
+                rs = self._requests.get(rid)
+                if rs is None:
+                    # Create a minimal request state from metadata.
+                    chain = connector_meta.new_chains.get(rid, [])
+                    if not chain:
+                        # Use the cached chain from a previous step.
+                        chain = self._last_chain_for_rid.get(rid, [])
+                    if not chain:
+                        return
+                    rs = _RequestState(request_id=rid, chain=chain)
+                    self._requests[rid] = rs
+        if rs is None or not rs.chain:
             return
 
         # C2: flush partial group buffers before scoring so the icms trie
@@ -597,15 +615,25 @@ class _Worker:
         k = max(1, int(total_pages * budget)) if total_pages > 0 else 1
         k = min(k, self._k)
 
-        # Marshal query to fp32 numpy.
+        # Marshal query to fp32 numpy, mean-pooling Q heads per KV-head
+        # group for GQA (matching QuestPageSelector.compute_page_scores).
+        geom = self._geom
         if isinstance(quest_query, torch.Tensor):
             q = quest_query.detach().to(dtype=torch.float32, device="cpu")
             if q.ndim == 3:
-                # [B, num_heads, head_dim] → mean-pool if GQA, then flatten
-                q = q.mean(dim=0) if q.shape[0] > 1 else q.squeeze(0)
-            if q.ndim == 2:
-                # [num_heads, head_dim] → flatten
-                q = q.reshape(-1)
+                q = q.squeeze(0) if q.shape[0] == 1 else q.mean(dim=0)
+            # q is now [num_heads, head_dim]. Mean-pool for GQA:
+            # [num_heads, head_dim] → [num_kv_heads, heads_per_group, head_dim]
+            # → mean → [num_kv_heads, head_dim] → [key_dim]
+            if q.ndim == 2 and geom is not None:
+                num_heads = q.shape[0]
+                num_kv_heads = geom.num_kv_heads
+                head_dim = geom.head_dim
+                if num_heads > num_kv_heads and num_heads % num_kv_heads == 0:
+                    heads_per_group = num_heads // num_kv_heads
+                    q = (q.reshape(num_kv_heads, heads_per_group, head_dim)
+                          .mean(dim=1))  # [num_kv_heads, head_dim]
+            q = q.reshape(-1)
             q_np = q.contiguous().numpy()
         else:
             q_np = np.asarray(quest_query, dtype=np.float32).ravel()
@@ -738,15 +766,6 @@ class _Worker:
             new_blocks += 1
 
         rs._recorded_blocks[recorded_key] = len(req_block_ids)
-        if new_blocks > 0 and layer_idx == 0:
-            n_groups = len(rs.active_group_buffers)
-            n_written = rs.num_groups_written
-            logger.info(
-                "extract_and_record: layer=%d new_blocks=%d total_blocks=%d "
-                "active_bufs=%d groups_written=%d",
-                layer_idx, new_blocks, len(req_block_ids),
-                n_groups, n_written,
-            )
 
     @staticmethod
     def _parse_layer_idx(layer_name: str) -> int | None:
