@@ -45,7 +45,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
-from vllm.v1.core.kv_cache_utils import KVCacheBlocks
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import Request
@@ -405,22 +405,33 @@ class _Scheduler:
 
     def build_meta(self, scheduler_output: SchedulerOutput) -> IcmsConnectorMetadata:
         meta = IcmsConnectorMetadata()
-        # Pack per-request step info.
+        # Per-step scheduled token counts (req_id → num_tokens this step).
+        sched_tokens = getattr(scheduler_output, "scheduled_num_tokens", {})
+
+        # New requests: list[NewRequestData] with .req_id, .num_computed_tokens.
         for sr in getattr(scheduler_output, "scheduled_new_reqs", []):
-            rid = sr.req_id if hasattr(sr, "req_id") else str(sr)
+            rid = sr.req_id
+            n_computed = getattr(sr, "num_computed_tokens", 0)
+            n_step = sched_tokens.get(rid, 0)
             meta.requests.append(_PerRequestStep(
                 request_id=rid,
-                num_computed_tokens_start=0,
-                num_computed_tokens_end=getattr(sr, "num_tokens", 0),
+                num_computed_tokens_start=n_computed,
+                num_computed_tokens_end=n_computed + n_step,
             ))
-        for sr in getattr(scheduler_output, "scheduled_cached_reqs", []):
-            rid = sr.req_id if hasattr(sr, "req_id") else str(sr)
-            meta.requests.append(_PerRequestStep(
-                request_id=rid,
-                num_computed_tokens_start=getattr(sr, "num_computed_tokens", 0),
-                num_computed_tokens_end=getattr(sr, "num_computed_tokens", 0)
-                                       + getattr(sr, "num_new_tokens", 0),
-            ))
+
+        # Cached requests: CachedRequestData with parallel lists
+        # (.req_ids, .num_computed_tokens, etc.).
+        cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
+        if cached is not None and hasattr(cached, "req_ids"):
+            for i, rid in enumerate(cached.req_ids):
+                n_computed = cached.num_computed_tokens[i] if i < len(cached.num_computed_tokens) else 0
+                n_step = sched_tokens.get(rid, 0)
+                meta.requests.append(_PerRequestStep(
+                    request_id=rid,
+                    num_computed_tokens_start=n_computed,
+                    num_computed_tokens_end=n_computed + n_step,
+                ))
+
         # Deliver chains for requests we haven't sent yet.
         for rid in list(self._pending_chain_sends):
             if rid in self._chains:
