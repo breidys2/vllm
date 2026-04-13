@@ -638,9 +638,10 @@ class _Worker:
         else:
             q_np = np.asarray(quest_query, dtype=np.float32).ravel()
 
-        # Fire Score synchronously for v1.
-        # TODO(C9): make this async with a background thread.
-        slot = self._sink_pool.acquire()
+        # Fire Score synchronously for v1. Use the shared sink (slot 0)
+        # without the slot pool — in v1 we don't fetch KV back to GPU, so
+        # we don't need per-request sink isolation. The score result is
+        # just for measuring page selection accuracy.
         try:
             reply = self._client.score(
                 request_id=icms_rid,
@@ -652,9 +653,8 @@ class _Worker:
             )
             layer_name = f"layer_{next_layer_idx}"
             with self._score_lock:
-                self._pending_scores[layer_name] = (reply, slot)
+                self._pending_scores[layer_name] = (reply, None)
         except Exception as e:
-            self._sink_pool.release(slot)
             logger.info("Score for layer %d: %s (chain_len=%d, k=%d, total_pages=%d)",
                          next_layer_idx, e, len(rs.chain), k, total_pages)
 
@@ -667,7 +667,8 @@ class _Worker:
             # TODO: cudaMemcpyAsync from sink slot into GPU block slots.
             # For v1 we just release the slot; the actual GPU copy is
             # deferred to the full integration (R12).
-            self._sink_pool.release(slot)
+            if slot is not None:
+                self._sink_pool.release(slot)
 
     def wait_for_pending_writes(self):
         """Block until all buffered WriteGroups are flushed."""
@@ -748,22 +749,26 @@ class _Worker:
             return
 
         # Only process blocks we haven't recorded yet for this layer.
-        # Track per (request, layer) which intra-request blocks are done.
         recorded_key = (rid, layer_idx)
         if not hasattr(rs, '_recorded_blocks'):
             rs._recorded_blocks = {}
         already_recorded = rs._recorded_blocks.get(recorded_key, 0)
+        if already_recorded >= len(req_block_ids):
+            return  # nothing new
 
-        new_blocks = 0
-        for intra_idx in range(already_recorded, len(req_block_ids)):
-            gpu_block_id = req_block_ids[intra_idx]
-            if gpu_block_id < 0 or gpu_block_id >= k_cache.shape[0]:
-                continue
-            # Extract K and V blocks: [block_size, num_kv_heads, head_dim]
-            key_block = k_cache[gpu_block_id].cpu()
-            val_block = v_cache[gpu_block_id].cpu()
-            self.record_page(rid, intra_idx, layer_idx, key_block, val_block)
-            new_blocks += 1
+        new_ids = req_block_ids[already_recorded:]
+        valid_ids = [bid for bid in new_ids if 0 <= bid < k_cache.shape[0]]
+        if not valid_ids:
+            rs._recorded_blocks[recorded_key] = len(req_block_ids)
+            return
+
+        # Batched GPU→CPU copy: index all new blocks at once.
+        idx_tensor = torch.tensor(valid_ids, dtype=torch.long, device=k_cache.device)
+        k_batch = k_cache[idx_tensor].cpu()  # [N, block_size, num_kv_heads, head_dim]
+        v_batch = v_cache[idx_tensor].cpu()
+
+        for i, intra_idx in enumerate(range(already_recorded, already_recorded + len(valid_ids))):
+            self.record_page(rid, intra_idx, layer_idx, k_batch[i], v_batch[i])
 
         rs._recorded_blocks[recorded_key] = len(req_block_ids)
 
