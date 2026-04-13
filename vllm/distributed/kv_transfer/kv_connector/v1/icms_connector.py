@@ -27,9 +27,11 @@ Design decisions (from the walkthrough):
 
 from __future__ import annotations
 
+import os
 import struct
 import sys
 import threading
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -118,6 +120,120 @@ class _GroupBuffer:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  Timing / debug statistics
+# ═══════════════════════════════════════════════════════════════════════════
+
+class IcmsTimingStats:
+    """Accumulated timing and event stats for the icms connector.
+
+    Populated by the worker during forward passes. Can be queried by the
+    benchmark script via ``IcmsConnector.get_timing_stats()``.
+
+    Stats levels:
+      0 = off (no collection, zero overhead)
+      1 = aggregates only (counters + totals, negligible overhead)
+      2 = per-call detail (per-layer latency lists, page_ids — adds
+          perf_counter calls on every Score/WriteGroup/extract)
+    """
+
+    def __init__(self, level: int = 1):
+        self.level = level
+
+        # ── Level 1: aggregate counters ──────────────────────────────
+        self.requests_seen: int = 0
+        self.total_groups_written: int = 0
+        self.total_pages_recorded: int = 0
+        self.total_score_calls: int = 0
+        self.total_score_cache_hits: int = 0
+        self.total_writegroup_calls: int = 0
+        self.total_extract_us: float = 0.0
+        self.total_flush_us: float = 0.0
+        self.total_score_us: float = 0.0
+        self.peak_buffer_bytes: int = 0
+
+        # ── Level 2: per-call detail lists ───────────────────────────
+        self.extract_and_record_us: list[float] = []
+        self.flush_group_us: list[float] = []
+        self.score_roundtrip_us: list[float] = []
+        self.score_cache_hit: list[bool] = []
+        self.score_page_ids: list[list[int]] = []
+        self.score_layer_idx: list[int] = []
+
+    def record_extract(self, us: float, n_pages: int):
+        if self.level == 0:
+            return
+        self.total_extract_us += us
+        self.total_pages_recorded += n_pages
+        if self.level >= 2:
+            self.extract_and_record_us.append(us)
+
+    def record_flush(self, us: float):
+        if self.level == 0:
+            return
+        self.total_flush_us += us
+        self.total_writegroup_calls += 1
+        if self.level >= 2:
+            self.flush_group_us.append(us)
+
+    def record_score(self, us: float, cache_hit: bool, page_ids: list[int],
+                      layer_idx: int):
+        if self.level == 0:
+            return
+        self.total_score_us += us
+        self.total_score_calls += 1
+        if cache_hit:
+            self.total_score_cache_hits += 1
+        if self.level >= 2:
+            self.score_roundtrip_us.append(us)
+            self.score_cache_hit.append(cache_hit)
+            self.score_page_ids.append(page_ids)
+            self.score_layer_idx.append(layer_idx)
+
+    def to_dict(self) -> dict:
+        """Serialize for JSON output."""
+        if self.level == 0:
+            return {"level": 0}
+
+        def _percentiles(vals):
+            if not vals:
+                return {}
+            s = sorted(vals)
+            n = len(s)
+            return {
+                "count": n,
+                "p50_us": s[n // 2],
+                "p95_us": s[int(n * 0.95)] if n >= 20 else s[-1],
+                "p99_us": s[int(n * 0.99)] if n >= 100 else s[-1],
+                "mean_us": sum(s) / n,
+                "max_us": s[-1],
+                "total_us": sum(s),
+            }
+
+        result: dict = {
+            "level": self.level,
+            "requests_seen": self.requests_seen,
+            "total_groups_written": self.total_groups_written,
+            "total_pages_recorded": self.total_pages_recorded,
+            "total_score_calls": self.total_score_calls,
+            "total_score_cache_hits": self.total_score_cache_hits,
+            "total_writegroup_calls": self.total_writegroup_calls,
+            "total_extract_us": self.total_extract_us,
+            "total_flush_us": self.total_flush_us,
+            "total_score_us": self.total_score_us,
+            "score_cache_hit_rate": (
+                self.total_score_cache_hits / self.total_score_calls
+                if self.total_score_calls > 0 else 0.0
+            ),
+            "peak_buffer_bytes": self.peak_buffer_bytes,
+        }
+        if self.level >= 2:
+            result["extract_and_record"] = _percentiles(self.extract_and_record_us)
+            result["flush_group"] = _percentiles(self.flush_group_us)
+            result["score_roundtrip"] = _percentiles(self.score_roundtrip_us)
+        return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  Per-request worker-side state
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -198,6 +314,7 @@ class IcmsConnector(KVConnectorBase_V1):
         self._model_name: str  = extra.get("icms_model_name", "")
         self._k: int           = int(extra.get("icms_k", 16))
         self._budget: float    = float(extra.get("icms_budget", 0.2))
+        self._stats_level: int = int(extra.get("icms_stats_level", 1))
 
         self._sched: _Scheduler | None = None
         self._worker: _Worker | None = None
@@ -209,6 +326,7 @@ class IcmsConnector(KVConnectorBase_V1):
                 socket_path=self._socket_path,
                 model_name=self._model_name,
                 k=self._k,
+                stats_level=self._stats_level,
             )
 
     # ══════════════════════════════════════════════════════════════════════
@@ -365,6 +483,45 @@ class IcmsConnector(KVConnectorBase_V1):
             raise RuntimeError("worker-side only")
         return self._worker.direct_score(request_id, chain, layer, query, k or self._k)
 
+    def get_timing_stats(self) -> dict | None:
+        """Return accumulated timing/debug stats from the worker.
+
+        Call from the benchmark script BEFORE shutdown to capture stats.
+        Returns a JSON-serializable dict, or None if no worker.
+        """
+        if self._worker is not None:
+            return self._worker.stats.to_dict()
+        return None
+
+    def get_icms_server_stats(self) -> dict | None:
+        """Query the icms_server's Stats reply and return as a dict.
+
+        Call from the benchmark script BEFORE server teardown.
+        """
+        if self._worker is None or self._worker._client is None:
+            return None
+        try:
+            s = self._worker._client.stats()
+            return {
+                "trie_num_nodes": s.trie_num_nodes,
+                "trie_num_inserts": s.trie_num_inserts,
+                "trie_total_groups": s.trie_total_groups,
+                "trie_max_depth": s.trie_max_depth,
+                "trie_mean_path_len": s.trie_mean_path_len,
+                "trie_leaf_count": s.trie_leaf_count,
+                "alloc_capacity_bytes": s.alloc_capacity_bytes,
+                "alloc_free_bytes": s.alloc_free_bytes,
+                "alloc_used_bytes": s.alloc_used_bytes,
+                "alloc_num_chunks": s.alloc_num_chunks,
+                "alloc_total_extents": s.alloc_total_extents,
+                "score_cache_size": s.score_cache_size,
+                "score_cache_hits": s.score_cache_hits,
+                "score_cache_misses": s.score_cache_misses,
+            }
+        except Exception as e:
+            logger.warning("Failed to query icms server stats: %s", e)
+            return None
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Scheduler
@@ -452,7 +609,8 @@ class _Scheduler:
 class _Worker:
     """Worker-side state. Owns IcmsClient, sink pool, per-request buffers."""
 
-    def __init__(self, *, socket_path: str, model_name: str, k: int):
+    def __init__(self, *, socket_path: str, model_name: str, k: int,
+                 stats_level: int = 1):
         self._socket_path = socket_path
         self._model_name = model_name
         self._k = k
@@ -467,6 +625,9 @@ class _Worker:
         # Persistent chain cache: survives request eviction so Quest hooks
         # can find the chain even after request_finished runs.
         self._last_chain_for_rid: dict[str, list[int]] = {}
+
+        # Timing / debug stats.
+        self.stats = IcmsTimingStats(level=stats_level)
 
         # Pending async score results (C9).
         self._pending_scores: dict[str, Any] = {}  # layer_name → result
@@ -500,6 +661,16 @@ class _Worker:
     def shutdown(self):
         if self._client is None:
             return
+        # Dump connector-side timing stats to a file before teardown.
+        if self.stats.level > 0:
+            try:
+                import json
+                stats_path = f"/tmp/icms_connector_stats_{os.getpid()}.json"
+                with open(stats_path, "w") as f:
+                    json.dump(self.stats.to_dict(), f, indent=2)
+                logger.info("Connector stats dumped to %s", stats_path)
+            except Exception as e:
+                logger.warning("Failed to dump connector stats: %s", e)
         # Evict all active requests.
         for rid, rs in list(self._requests.items()):
             if rs.chain:
@@ -642,6 +813,7 @@ class _Worker:
         # without the slot pool — in v1 we don't fetch KV back to GPU, so
         # we don't need per-request sink isolation. The score result is
         # just for measuring page selection accuracy.
+        t_score_start = time.perf_counter()
         try:
             reply = self._client.score(
                 request_id=icms_rid,
@@ -651,10 +823,22 @@ class _Worker:
                 k=k,
                 sink=self._sink_pool.sink,
             )
+            t_score_end = time.perf_counter()
+            self.stats.record_score(
+                (t_score_end - t_score_start) * 1e6,
+                reply.cache_hit,
+                list(reply.page_ids),
+                next_layer_idx,
+            )
             layer_name = f"layer_{next_layer_idx}"
             with self._score_lock:
                 self._pending_scores[layer_name] = (reply, None)
         except Exception as e:
+            t_score_end = time.perf_counter()
+            self.stats.record_score(
+                (t_score_end - t_score_start) * 1e6,
+                False, [], next_layer_idx,
+            )
             logger.info("Score for layer %d: %s (chain_len=%d, k=%d, total_pages=%d)",
                          next_layer_idx, e, len(rs.chain), k, total_pages)
 
@@ -687,6 +871,7 @@ class _Worker:
         kv_layer shape: [2 (K+V), num_blocks, block_size, num_kv_heads, head_dim]
         attn_metadata: FlashAttentionMetadata with block_table, seq_lens, etc.
         """
+        t0 = time.perf_counter()
         if not self._requests or self._geom is None:
             return
 
@@ -771,6 +956,8 @@ class _Worker:
             self.record_page(rid, intra_idx, layer_idx, k_batch[i], v_batch[i])
 
         rs._recorded_blocks[recorded_key] = len(req_block_ids)
+        self.stats.record_extract(
+            (time.perf_counter() - t0) * 1e6, len(valid_ids))
 
     @staticmethod
     def _parse_layer_idx(layer_name: str) -> int | None:
@@ -854,14 +1041,18 @@ class _Worker:
         if not chain_prefix:
             return
         pages = _GROUP_BLOCKS if not partial else len({p for (_, p) in buf.filled})
+        t0 = time.perf_counter()
         try:
             self._client.write_group(
                 chain_prefix, bytes(buf.summary_blob), bytes(buf.kv_blob),
                 pages_in_group=pages,
             )
+            self.stats.record_flush((time.perf_counter() - t0) * 1e6)
+            self.stats.total_groups_written += 1
             if group_idx >= rs.num_groups_written:
                 rs.num_groups_written = group_idx + 1
         except Exception as e:
+            self.stats.record_flush((time.perf_counter() - t0) * 1e6)
             logger.warning("WriteGroup failed for req=%s group=%d: %s",
                            request_id, group_idx, e)
 
