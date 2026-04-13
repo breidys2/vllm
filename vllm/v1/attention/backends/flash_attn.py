@@ -888,6 +888,20 @@ class FlashAttentionImpl(AttentionImpl):
                            else attn_metadata.block_table)
             scheduler_metadata = attn_metadata.scheduler_metadata
 
+            # ICMS Path B: if the connector set a fetch state for this
+            # layer, use the separate k-page KV buffer instead of the
+            # main cache. This restricts attention to only the k selected
+            # pages with proper softmax normalization.
+            from vllm.v1.attention.icms_fetch_state import get_active as _icms_get
+            _icms_state = _icms_get()
+            if _icms_state is not None:
+                key_cache = _icms_state.key_cache
+                value_cache = _icms_state.value_cache
+                block_table = _icms_state.block_table
+                seqused_k = _icms_state.seq_lens
+                max_seqlen_k = _icms_state.max_seq_len
+                scheduler_metadata = _icms_state.scheduler_metadata
+
             descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
 
             q_descale = layer._q_scale.expand(descale_shape)

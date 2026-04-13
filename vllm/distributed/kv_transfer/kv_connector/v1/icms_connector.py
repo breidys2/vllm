@@ -136,8 +136,9 @@ class IcmsTimingStats:
           perf_counter calls on every Score/WriteGroup/extract)
     """
 
-    def __init__(self, level: int = 1):
+    def __init__(self, level: int = 1, log_selections: bool = False):
         self.level = level
+        self.log_selections = log_selections
 
         # ── Level 1: aggregate counters ──────────────────────────────
         self.requests_seen: int = 0
@@ -159,6 +160,12 @@ class IcmsTimingStats:
         self.score_page_ids: list[list[int]] = []
         self.score_layer_idx: list[int] = []
 
+        # ── Selection log (for A/B comparison) ───────────────────────
+        # Each entry: {"step": N, "layer": L, "page_ids": [...], "scores": [...], "cache_hit": bool}
+        # Enabled by log_selections=True; zero overhead when off.
+        self.selections: list[dict] = []
+        self._step_counter: int = 0
+
     def record_extract(self, us: float, n_pages: int):
         if self.level == 0:
             return
@@ -176,18 +183,32 @@ class IcmsTimingStats:
             self.flush_group_us.append(us)
 
     def record_score(self, us: float, cache_hit: bool, page_ids: list[int],
-                      layer_idx: int):
-        if self.level == 0:
+                      layer_idx: int, scores: list[float] | None = None):
+        if self.level == 0 and not self.log_selections:
             return
-        self.total_score_us += us
-        self.total_score_calls += 1
-        if cache_hit:
-            self.total_score_cache_hits += 1
+        if self.level >= 1:
+            self.total_score_us += us
+            self.total_score_calls += 1
+            if cache_hit:
+                self.total_score_cache_hits += 1
         if self.level >= 2:
             self.score_roundtrip_us.append(us)
             self.score_cache_hit.append(cache_hit)
             self.score_page_ids.append(page_ids)
             self.score_layer_idx.append(layer_idx)
+        if self.log_selections and page_ids:
+            self.selections.append({
+                "step": self._step_counter,
+                "layer": layer_idx,
+                "page_ids": page_ids,
+                "scores": scores or [],
+                "cache_hit": cache_hit,
+                "k": len(page_ids),
+            })
+
+    def advance_step(self):
+        """Call at the start of each forward pass to increment the step counter."""
+        self._step_counter += 1
 
     def to_dict(self) -> dict:
         """Serialize for JSON output."""
@@ -315,6 +336,7 @@ class IcmsConnector(KVConnectorBase_V1):
         self._k: int           = int(extra.get("icms_k", 16))
         self._budget: float    = float(extra.get("icms_budget", 0.2))
         self._stats_level: int = int(extra.get("icms_stats_level", 1))
+        self._log_selections: bool = bool(extra.get("icms_log_selections", False))
 
         self._sched: _Scheduler | None = None
         self._worker: _Worker | None = None
@@ -327,33 +349,39 @@ class IcmsConnector(KVConnectorBase_V1):
                 model_name=self._model_name,
                 k=self._k,
                 stats_level=self._stats_level,
+                log_selections=self._log_selections,
             )
 
     # ══════════════════════════════════════════════════════════════════════
     #  Worker-side abstract methods
     # ══════════════════════════════════════════════════════════════════════
 
-    def start_load_kv(self, forward_context: ForwardContext, **kwargs) -> None:
-        """Kick off async KV loading for this step.
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        """Stash GPU KV cache tensors for Path B selective fetch."""
+        if self._worker is not None:
+            self._worker.register_kv_caches(kv_caches)
 
-        In the three-state pipelining model (C9):
-        - For cache-hit layers: fire KV fetch immediately (no Q needed).
-        - For cache-miss layers: fire speculative summary preload.
-        Actual scoring waits for Q in save_kv_layer / wait_for_layer_load.
-        """
+    def start_load_kv(self, forward_context: ForwardContext, **kwargs) -> None:
+        """Stash attn_metadata from the forward context and drain metadata."""
         if self._worker is None:
             return
+        # Stash the per-layer attn_metadata dict so wait_for_layer_load
+        # can override block_table + seq_lens for selective attention.
+        if hasattr(forward_context, "attn_metadata"):
+            self._worker.set_attn_metadata(forward_context.attn_metadata)
         meta = self._connector_metadata
         if meta is None or not isinstance(meta, IcmsConnectorMetadata):
             return
         self._worker.on_step_start(meta)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        """Block until KV for this layer is ready in the GPU buffer.
+        """Path B: fetch selected KV from icms into GPU + override block table.
 
-        For cache-hit layers the KV fetch was fired in start_load_kv and
-        should be complete by now. For cache-miss layers this is where we
-        block on the scoring result.
+        This runs BEFORE each layer's attention. For layers where the
+        connector has Score results (from the previous layer's Quest hook),
+        it fetches the selected pages' KV from the icms sink into GPU
+        block slots and overrides the block_table and seq_lens so
+        FlashAttention only sees the k selected pages.
         """
         if self._worker is None:
             return
@@ -376,6 +404,12 @@ class IcmsConnector(KVConnectorBase_V1):
         """
         if self._worker is None:
             return
+
+        # Path B: restore original block_table + seq_lens after this layer's
+        # attention ran with the overridden values. Must happen before the
+        # Quest hook runs (which will set up overrides for the NEXT layer).
+        if self._worker is not None:
+            self._worker.restore_attn_metadata(layer_name)
 
         quest_query = kwargs.get("quest_query")
         next_layer_idx = kwargs.get("next_layer_idx")
@@ -411,12 +445,13 @@ class IcmsConnector(KVConnectorBase_V1):
 
         if quest_query is not None and next_layer_idx is not None:
             # CPU-scoring path: Q arrived, fire Score against icms.
-            # Pass the bound metadata so the worker can find the request
-            # chain even if _requests was evicted between steps.
-            self._worker.on_layer_score(
-                next_layer_idx, quest_query, budget, quest_stats,
-                connector_meta=self._connector_metadata,
-            )
+            # Skip during dense decode — scoring is only needed for
+            # selective prefill (Path B).
+            if not self._worker._prefill_done:
+                self._worker.on_layer_score(
+                    next_layer_idx, quest_query, budget, quest_stats,
+                    connector_meta=self._connector_metadata,
+                )
 
     def wait_for_save(self) -> None:
         if self._worker is not None:
@@ -544,19 +579,32 @@ class _Scheduler:
         if rid in self._chains:
             return  # already seen
 
-        # v1: block_hashes may be empty at alloc time (prompt not yet
-        # tokenized/hashed). Generate a synthetic chain from request_id
-        # so each request gets a unique, stable trie path. Real block
-        # hashes (for dedup) are a follow-up.
-        #
-        # We don't know the final number of groups yet, so we generate
-        # a generous chain (64 groups = 32K tokens). The worker will
-        # only use as many as it needs.
+        # Generate chain hashes from token IDs (content-based) so the
+        # same prompt always produces the same chain — enabling prefix
+        # reuse across requests. Fall back to request_id-based if tokens
+        # are unavailable.
+        token_ids = getattr(request, "all_token_ids", None)
+        if token_ids is None or len(token_ids) == 0:
+            token_ids = getattr(request, "prompt_token_ids", None)
+
         max_groups = 64
         chain: list[int] = []
-        for g in range(max_groups):
-            h = hash((rid, g)) & 0xFFFFFFFFFFFFFFFF
-            chain.append(h)
+        if token_ids and len(token_ids) > 0:
+            block_size = PAGE_TOKENS  # 16 tokens per block
+            group_tokens = _GROUP_BLOCKS * block_size  # 512 tokens per group
+            for g in range(max_groups):
+                end = min((g + 1) * group_tokens, len(token_ids))
+                if end <= g * group_tokens:
+                    break
+                # Hash the token IDs up to this group's end (chained prefix hash).
+                prefix_ids = tuple(token_ids[:end])
+                h = hash(prefix_ids) & 0xFFFFFFFFFFFFFFFF
+                chain.append(h)
+        else:
+            # Fallback: request_id-based (no prefix reuse).
+            for g in range(max_groups):
+                h = hash((rid, g)) & 0xFFFFFFFFFFFFFFFF
+                chain.append(h)
         self._chains[rid] = chain
         self._pending_chain_sends.add(rid)
 
@@ -610,7 +658,7 @@ class _Worker:
     """Worker-side state. Owns IcmsClient, sink pool, per-request buffers."""
 
     def __init__(self, *, socket_path: str, model_name: str, k: int,
-                 stats_level: int = 1):
+                 stats_level: int = 1, log_selections: bool = False):
         self._socket_path = socket_path
         self._model_name = model_name
         self._k = k
@@ -627,11 +675,26 @@ class _Worker:
         self._last_chain_for_rid: dict[str, list[int]] = {}
 
         # Timing / debug stats.
-        self.stats = IcmsTimingStats(level=stats_level)
+        self.stats = IcmsTimingStats(level=stats_level, log_selections=log_selections)
 
         # Pending async score results (C9).
         self._pending_scores: dict[str, Any] = {}  # layer_name → result
         self._score_lock = threading.Lock()
+
+        # Path B: GPU KV cache tensors + per-step attn_metadata for
+        # selective fetch + block table override.
+        self._gpu_kv_caches: dict[str, torch.Tensor] = {}
+        self._attn_metadata: dict | None = None  # layer_name → AttentionMetadata
+        # Fetch buffer (allocated in register_kv_caches).
+        self._fetch_key_cache: torch.Tensor | None = None
+        self._fetch_value_cache: torch.Tensor | None = None
+        self._fetch_block_table: torch.Tensor | None = None
+        self._fetch_block_size: int = 16
+
+        # Phase tracking: selective prefill → dense decode.
+        # After the first wait_for_save (end of prefill), _prefill_done=True
+        # and all subsequent steps use dense attention (no fetch buffer).
+        self._prefill_done: bool = False
 
         self._connect()
 
@@ -662,13 +725,21 @@ class _Worker:
         if self._client is None:
             return
         # Dump connector-side timing stats to a file before teardown.
-        if self.stats.level > 0:
+        if self.stats.level > 0 or self.stats.log_selections:
             try:
                 import json
-                stats_path = f"/tmp/icms_connector_stats_{os.getpid()}.json"
+                pid = os.getpid()
+                stats_path = f"/tmp/icms_connector_stats_{pid}.json"
                 with open(stats_path, "w") as f:
                     json.dump(self.stats.to_dict(), f, indent=2)
                 logger.info("Connector stats dumped to %s", stats_path)
+                if self.stats.log_selections and self.stats.selections:
+                    sel_path = f"/tmp/icms_selections_{pid}.jsonl"
+                    with open(sel_path, "w") as f:
+                        for entry in self.stats.selections:
+                            f.write(json.dumps(entry) + "\n")
+                    logger.info("Page selections dumped to %s (%d entries)",
+                                 sel_path, len(self.stats.selections))
             except Exception as e:
                 logger.warning("Failed to dump connector stats: %s", e)
         # Evict all active requests.
@@ -691,6 +762,7 @@ class _Worker:
 
     def on_step_start(self, meta: IcmsConnectorMetadata):
         """Called from start_load_kv. Drains scheduler metadata into caches."""
+        self.stats.advance_step()
         for rid, chain in meta.new_chains.items():
             rs = self._requests.setdefault(rid, _RequestState(request_id=rid))
             rs.chain = chain
@@ -772,17 +844,13 @@ class _Worker:
         if rs is None or not rs.chain:
             return
 
-        # C2: flush partial group buffers before scoring so the icms trie
-        # has the latest pages.
-        for gidx in list(rs.active_group_buffers.keys()):
-            self._flush_group(rid, gidx, partial=True)
+        # Score against icms trie. Works when the trie has data from a
+        # prior request or prior prefill pass. If the trie is empty
+        # (first request), Score returns empty winners and no fetch
+        # buffer is populated — attention falls back to full GPU KV.
 
         icms_rid = self._icms_request_id(rid, 0)
-        # Compute k from the number of pages actually in the trie.
         total_pages = rs.num_groups_written * _GROUP_BLOCKS
-        # Add pages from the just-flushed partial groups.
-        for gidx, buf in rs.active_group_buffers.items():
-            total_pages += len({p for (_, p) in buf.filled})
         k = max(1, int(total_pages * budget)) if total_pages > 0 else 1
         k = min(k, self._k)
 
@@ -829,10 +897,13 @@ class _Worker:
                 reply.cache_hit,
                 list(reply.page_ids),
                 next_layer_idx,
+                scores=list(reply.scores),
             )
-            layer_name = f"layer_{next_layer_idx}"
+            # Key by the attention layer name format so wait_for_layer
+            # (called with "model.layers.N.self_attn.attn") can find it.
+            attn_layer_name = f"model.layers.{next_layer_idx}.self_attn.attn"
             with self._score_lock:
-                self._pending_scores[layer_name] = (reply, None)
+                self._pending_scores[attn_layer_name] = (reply, None)
         except Exception as e:
             t_score_end = time.perf_counter()
             self.stats.record_score(
@@ -842,23 +913,142 @@ class _Worker:
             logger.info("Score for layer %d: %s (chain_len=%d, k=%d, total_pages=%d)",
                          next_layer_idx, e, len(rs.chain), k, total_pages)
 
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        """Stash GPU KV cache tensors + allocate Path B fetch buffer."""
+        self._gpu_kv_caches = dict(kv_caches)
+        # Allocate the fetch buffer: k blocks worth of KV on GPU,
+        # reused across layers. Shape matches the main KV cache layout.
+        if kv_caches:
+            sample = next(iter(kv_caches.values()))
+            # sample shape: [2, num_blocks, block_size, num_kv_heads, head_dim]
+            if sample.ndim == 5:
+                _, _, block_size, num_kv_heads, head_dim = sample.shape
+                k = self._k
+                device = sample.device
+                dtype = sample.dtype
+                self._fetch_key_cache = torch.zeros(
+                    k, block_size, num_kv_heads, head_dim,
+                    dtype=dtype, device=device)
+                self._fetch_value_cache = torch.zeros(
+                    k, block_size, num_kv_heads, head_dim,
+                    dtype=dtype, device=device)
+                self._fetch_block_table = torch.arange(
+                    k, dtype=torch.int32, device=device).unsqueeze(0)  # [1, k]
+                self._fetch_block_size = block_size
+                logger.info(
+                    "Path B: allocated fetch buffer k=%d blocks, shape=[%d,%d,%d,%d] on %s",
+                    k, k, block_size, num_kv_heads, head_dim, device)
+        logger.info("Path B: registered %d KV cache layers", len(kv_caches))
+
+    def set_attn_metadata(self, attn_metadata):
+        """Stash per-step attn_metadata dict from ForwardContext."""
+        self._attn_metadata = attn_metadata
+
     def wait_for_layer(self, layer_name: str):
-        """Block until Score result for this layer is available."""
+        """Path B: fetch selected KV from icms → GPU + override block table.
+
+        If there's a pending Score result for this layer (from the previous
+        layer's Quest hook), fetch the winning pages' KV from the icms sink
+        into GPU block slots and override the block_table + seq_lens so
+        FlashAttention only sees the k selected pages.
+
+        If no Score result (e.g., first layer of first step), this is a no-op
+        and attention runs with whatever KV is in the GPU cache.
+        """
         with self._score_lock:
             result = self._pending_scores.pop(layer_name, None)
-        if result is not None:
-            reply, slot = result
-            # TODO: cudaMemcpyAsync from sink slot into GPU block slots.
-            # For v1 we just release the slot; the actual GPU copy is
-            # deferred to the full integration (R12).
+
+        if result is None:
+            return
+
+        reply, slot = result
+        if reply is None or not reply.page_ids:
             if slot is not None:
                 self._sink_pool.release(slot)
+            return
+
+        # ── Path B: populate fetch buffer + set ICMS fetch state ──
+        # Only during prefill (selective attention). After prefill_done,
+        # decode uses dense attention with full GPU KV cache.
+        if (not self._prefill_done
+                and hasattr(self, '_fetch_key_cache')
+                and self._fetch_key_cache is not None
+                and self._attn_metadata is not None):
+            try:
+                self._populate_fetch_buffer(layer_name, reply)
+            except Exception:
+                logger.exception("Path B: populate_fetch_buffer FAILED for %s", layer_name)
+
+        # TODO(Path B full): cudaMemcpyAsync from sink into the
+        # selected GPU block slots. For v1, the KV data is already on
+        # GPU from the full prefill — we're just restricting which
+        # blocks the attention reads. The actual icms→GPU fetch path
+        # (for when GPU doesn't hold the KV) is a follow-up.
+
+        if slot is not None:
+            self._sink_pool.release(slot)
+
+    def _populate_fetch_buffer(self, layer_name: str, reply):
+        """Path B: copy selected pages into fetch buffer + set fetch state."""
+        from vllm.v1.attention import icms_fetch_state
+
+        # Get the main KV cache for this layer.
+        kv = self._gpu_kv_caches.get(layer_name)
+        if kv is None or kv.ndim != 5:
+            return
+        main_key = kv[0]    # [num_blocks, block_size, kv_heads, head_dim]
+        main_value = kv[1]
+
+        # Get the original block table to map page_ids → GPU block indices.
+        am = self._attn_metadata.get(layer_name) if isinstance(self._attn_metadata, dict) else None
+        if am is None or not hasattr(am, "block_table"):
+            return
+        bt = am.block_table  # [num_reqs, max_blocks]
+
+        # Copy selected pages into the fetch buffer.
+        k = min(len(reply.page_ids), self._k)
+        for i in range(k):
+            pid = reply.page_ids[i]
+            if pid >= bt.shape[1]:
+                continue
+            gpu_block_id = int(bt[0, pid])
+            if gpu_block_id >= main_key.shape[0]:
+                continue
+            self._fetch_key_cache[i].copy_(main_key[gpu_block_id])
+            self._fetch_value_cache[i].copy_(main_value[gpu_block_id])
+
+        # Set the module-level fetch state for FlashAttention.
+        # Ensure tensors are contiguous and on the right device.
+        device = self._fetch_key_cache.device
+        fetch_bt = self._fetch_block_table[:, :k].contiguous()
+        fetch_sl = torch.tensor([k * PAGE_TOKENS],
+                                 dtype=torch.int32, device=device)
+        logger.info("Path B: setting fetch state k=%d seq_len=%d bt_shape=%s device=%s",
+                     k, k * PAGE_TOKENS, tuple(fetch_bt.shape), device)
+        icms_fetch_state.set_active(icms_fetch_state.IcmsFetchState(
+            key_cache=self._fetch_key_cache[:k].contiguous(),
+            value_cache=self._fetch_value_cache[:k].contiguous(),
+            block_table=fetch_bt,
+            seq_lens=fetch_sl,
+            max_seq_len=k * PAGE_TOKENS,
+        ))
+
+    def restore_attn_metadata(self, layer_name: str):
+        """Clear the ICMS fetch state after attention ran with it."""
+        from vllm.v1.attention import icms_fetch_state
+        icms_fetch_state.clear()
 
     def wait_for_pending_writes(self):
-        """Block until all buffered WriteGroups are flushed."""
+        """Block until all buffered WriteGroups are flushed.
+
+        Also marks prefill as done — subsequent steps use dense decode.
+        """
         for rid, rs in self._requests.items():
             for gidx in list(rs.active_group_buffers.keys()):
                 self._flush_group(rid, gidx, partial=True)
+        if not self._prefill_done:
+            self._prefill_done = True
+            logger.info("Prefill done. Switching to dense decode (no fetch buffer).")
 
     # ─── KV extraction from GPU paged buffer (C2 write path) ────────────
 
@@ -1062,15 +1252,19 @@ class _Worker:
         rs = self._requests.pop(request_id, None)
         if rs is None:
             return
+        # Reset prefill_done for the next request.
+        self._prefill_done = False
         # Flush any partial group buffers.
         for gidx in list(rs.active_group_buffers.keys()):
             self._flush_group(request_id, gidx, partial=True)
-        # Evict from icms.
-        if rs.chain:
-            try:
-                self._client.evict(rs.chain)
-            except Exception as e:
-                logger.debug("evict failed for %s: %s", request_id, e)
+        # Don't evict from icms — keep data for prefix reuse by the
+        # next request. Eviction should be managed separately (e.g.,
+        # LRU eviction on the server side when capacity is full).
+        # if rs.chain:
+        #     try:
+        #         self._client.evict(rs.chain)
+        #     except Exception as e:
+        #         logger.debug("evict failed for %s: %s", request_id, e)
 
     # ─── direct helper API (backward compat with smoke tests) ────────────
 
