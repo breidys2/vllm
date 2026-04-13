@@ -28,7 +28,6 @@ Design decisions (from the walkthrough):
 from __future__ import annotations
 
 import os
-import struct
 import sys
 import threading
 import time
@@ -579,32 +578,49 @@ class _Scheduler:
         if rid in self._chains:
             return  # already seen
 
-        # Generate chain hashes from token IDs (content-based) so the
-        # same prompt always produces the same chain — enabling prefix
-        # reuse across requests. Fall back to request_id-based if tokens
-        # are unavailable.
-        token_ids = getattr(request, "all_token_ids", None)
-        if token_ids is None or len(token_ids) == 0:
-            token_ids = getattr(request, "prompt_token_ids", None)
-
-        max_groups = 64
-        chain: list[int] = []
-        if token_ids and len(token_ids) > 0:
-            block_size = PAGE_TOKENS  # 16 tokens per block
-            group_tokens = _GROUP_BLOCKS * block_size  # 512 tokens per group
-            for g in range(max_groups):
-                end = min((g + 1) * group_tokens, len(token_ids))
-                if end <= g * group_tokens:
-                    break
-                # Hash the token IDs up to this group's end (chained prefix hash).
-                prefix_ids = tuple(token_ids[:end])
-                h = hash(prefix_ids) & 0xFFFFFFFFFFFFFFFF
-                chain.append(h)
+        # Use vLLM's native block_hashes (content-based, chained from
+        # token IDs). Same prompt → same hashes → prefix reuse in the trie.
+        bh = getattr(request, "block_hashes", [])
+        if bh and len(bh) > 0:
+            # Convert block hashes to group hashes: one group = 32 blocks.
+            # Group identity = hash of the last block in the group.
+            chain: list[int] = []
+            for i in range(_GROUP_BLOCKS - 1, len(bh), _GROUP_BLOCKS):
+                h = bh[i]
+                if hasattr(h, "hash_value"):
+                    chain.append(h.hash_value & 0xFFFFFFFFFFFFFFFF)
+                elif isinstance(h, int):
+                    chain.append(h & 0xFFFFFFFFFFFFFFFF)
+                else:
+                    chain.append(hash(h) & 0xFFFFFFFFFFFFFFFF)
+            # Partial trailing group: use the last available block hash.
+            if len(bh) % _GROUP_BLOCKS != 0:
+                last = bh[-1]
+                if hasattr(last, "hash_value"):
+                    chain.append(last.hash_value & 0xFFFFFFFFFFFFFFFF)
+                elif isinstance(last, int):
+                    chain.append(last & 0xFFFFFFFFFFFFFFFF)
+                else:
+                    chain.append(hash(last) & 0xFFFFFFFFFFFFFFFF)
+            if logger.isEnabledFor(20):  # DEBUG-level gate
+                logger.debug("on_alloc: rid=%s chain from %d block_hashes → %d groups",
+                              rid, len(bh), len(chain))
         else:
-            # Fallback: request_id-based (no prefix reuse).
-            for g in range(max_groups):
-                h = hash((rid, g)) & 0xFFFFFFFFFFFFFFFF
-                chain.append(h)
+            # Fallback: token_ids-based hashing.
+            token_ids = getattr(request, "all_token_ids", [])
+            max_groups = 64
+            chain = []
+            if token_ids:
+                group_tokens = _GROUP_BLOCKS * PAGE_TOKENS
+                for g in range(max_groups):
+                    end = min((g + 1) * group_tokens, len(token_ids))
+                    if end <= g * group_tokens:
+                        break
+                    chain.append(hash(tuple(token_ids[:end])) & 0xFFFFFFFFFFFFFFFF)
+            if not chain:
+                for g in range(max_groups):
+                    chain.append(hash((rid, g)) & 0xFFFFFFFFFFFFFFFF)
+            logger.debug("on_alloc: rid=%s chain from fallback → %d groups", rid, len(chain))
         self._chains[rid] = chain
         self._pending_chain_sends.add(rid)
 
@@ -763,6 +779,9 @@ class _Worker:
     def on_step_start(self, meta: IcmsConnectorMetadata):
         """Called from start_load_kv. Drains scheduler metadata into caches."""
         self.stats.advance_step()
+        # Reset prefill_done when a new request arrives (new chain delivered).
+        if meta.new_chains:
+            self._prefill_done = False
         for rid, chain in meta.new_chains.items():
             rs = self._requests.setdefault(rid, _RequestState(request_id=rid))
             rs.chain = chain
@@ -882,6 +901,7 @@ class _Worker:
         # we don't need per-request sink isolation. The score result is
         # just for measuring page selection accuracy.
         t_score_start = time.perf_counter()
+        logger.debug("Score: layer=%d chain_len=%d k=%d", next_layer_idx, len(rs.chain), k)
         try:
             reply = self._client.score(
                 request_id=icms_rid,
@@ -910,8 +930,8 @@ class _Worker:
                 (t_score_end - t_score_start) * 1e6,
                 False, [], next_layer_idx,
             )
-            logger.info("Score for layer %d: %s (chain_len=%d, k=%d, total_pages=%d)",
-                         next_layer_idx, e, len(rs.chain), k, total_pages)
+            logger.debug("Score for layer %d: %s (chain_len=%d, k=%d)",
+                          next_layer_idx, e, len(rs.chain), k)
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Stash GPU KV cache tensors + allocate Path B fetch buffer."""
@@ -1023,8 +1043,7 @@ class _Worker:
         fetch_bt = self._fetch_block_table[:, :k].contiguous()
         fetch_sl = torch.tensor([k * PAGE_TOKENS],
                                  dtype=torch.int32, device=device)
-        logger.info("Path B: setting fetch state k=%d seq_len=%d bt_shape=%s device=%s",
-                     k, k * PAGE_TOKENS, tuple(fetch_bt.shape), device)
+        logger.debug("Path B: fetch state k=%d seq_len=%d", k, k * PAGE_TOKENS)
         icms_fetch_state.set_active(icms_fetch_state.IcmsFetchState(
             key_cache=self._fetch_key_cache[:k].contiguous(),
             value_cache=self._fetch_value_cache[:k].contiguous(),
@@ -1043,6 +1062,10 @@ class _Worker:
 
         Also marks prefill as done — subsequent steps use dense decode.
         """
+        if logger.isEnabledFor(10):
+            n_reqs = len(self._requests)
+            n_bufs = sum(len(rs.active_group_buffers) for rs in self._requests.values())
+            logger.debug("wait_for_pending_writes: %d reqs, %d buffers", n_reqs, n_bufs)
         for rid, rs in self._requests.items():
             for gidx in list(rs.active_group_buffers.keys()):
                 self._flush_group(rid, gidx, partial=True)
@@ -1231,6 +1254,7 @@ class _Worker:
         if not chain_prefix:
             return
         pages = _GROUP_BLOCKS if not partial else len({p for (_, p) in buf.filled})
+        logger.debug("flush_group: group=%d pages=%d", group_idx, pages)
         t0 = time.perf_counter()
         try:
             self._client.write_group(
@@ -1257,14 +1281,9 @@ class _Worker:
         # Flush any partial group buffers.
         for gidx in list(rs.active_group_buffers.keys()):
             self._flush_group(request_id, gidx, partial=True)
-        # Don't evict from icms — keep data for prefix reuse by the
-        # next request. Eviction should be managed separately (e.g.,
-        # LRU eviction on the server side when capacity is full).
-        # if rs.chain:
-        #     try:
-        #         self._client.evict(rs.chain)
-        #     except Exception as e:
-        #         logger.debug("evict failed for %s: %s", request_id, e)
+        # KV data is NOT evicted — it persists for prefix reuse by
+        # subsequent requests. Eviction is managed by the server's LRU
+        # when capacity is full.
 
     # ─── direct helper API (backward compat with smoke tests) ────────────
 
