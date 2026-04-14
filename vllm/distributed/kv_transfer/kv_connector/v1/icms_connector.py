@@ -346,6 +346,10 @@ class IcmsConnector(KVConnectorBase_V1):
         self._stats_level: int = int(extra.get("icms_stats_level", 1))
         self._log_selections: bool = bool(extra.get("icms_log_selections", False))
         self._score_stride: int = int(extra.get("icms_score_stride", 6))
+        self._adaptive_bandwidth: bool = bool(extra.get("adaptive_bandwidth", False))
+        self._link_bandwidth_bps: float = float(extra.get(
+            "link_bandwidth_bps", 25e9 / 8))  # default 25 Gbps (BF2)
+        self._compute_slack_table: str = extra.get("compute_slack_table", "")
 
         self._sched: _Scheduler | None = None
         self._worker: _Worker | None = None
@@ -360,6 +364,9 @@ class IcmsConnector(KVConnectorBase_V1):
                 score_stride=self._score_stride,
                 stats_level=self._stats_level,
                 log_selections=self._log_selections,
+                adaptive_bandwidth=self._adaptive_bandwidth,
+                link_bandwidth_bps=self._link_bandwidth_bps,
+                compute_slack_table=self._compute_slack_table,
             )
 
     # ══════════════════════════════════════════════════════════════════════
@@ -814,17 +821,32 @@ class _Worker:
 
     def __init__(self, *, socket_path: str, model_name: str, k: int,
                  score_stride: int = 6,
-                 stats_level: int = 1, log_selections: bool = False):
+                 stats_level: int = 1, log_selections: bool = False,
+                 adaptive_bandwidth: bool = False,
+                 link_bandwidth_bps: float = 25e9 / 8,
+                 compute_slack_table: str = ""):
         self._socket_path = socket_path
         self._model_name = model_name
         self._k = k
         # Score stride: fresh Quest scoring every N layers.
-        # Layers within a stride group reuse the first scored layer's
-        # page selection via the ICMS server's score cache.
-        # stride=1 → per-layer scoring (best quality, most scoring overhead)
-        # stride=6 → score at 0,6,12,...  (matches quest_reuse_strided)
-        # stride=48 → single-layer scoring (fastest, worst quality)
+        # stride=1 → per-layer scoring, stride=6 → strided, stride=48 → single
         self._score_stride = max(1, score_stride)
+
+        # Adaptive bandwidth allocator (optional).
+        self._adaptive_allocator = None
+        if adaptive_bandwidth:
+            from vllm.distributed.kv_transfer.kv_connector.v1.adaptive_bandwidth import (
+                AdaptiveBandwidthAllocator, ComputeSlackTable,
+            )
+            slack_table = ComputeSlackTable(
+                compute_slack_table if compute_slack_table else None)
+            # kv_page_bytes will be set after _connect() when geometry is known.
+            # For now use a placeholder; it's updated in _connect().
+            self._adaptive_allocator = AdaptiveBandwidthAllocator(
+                link_bandwidth_bps=link_bandwidth_bps,
+                kv_page_bytes=1,  # updated in _connect()
+                slack_table=slack_table,
+            )
 
         self._client: IcmsClient | None = None
         self._geom: ModelGeometry | None = None
@@ -884,6 +906,10 @@ class _Worker:
             head_dim=ack.head_dim,
             elem_bytes=ack.elem_bytes,
         )
+        # Update allocator with actual kv_page_bytes from model geometry.
+        if self._adaptive_allocator is not None:
+            self._adaptive_allocator._kv_page_bytes = self._geom.kv_page_bytes
+
         # Sink sizing: stride layers × k pages × kv_page_bytes.
         # One stride group's worth of KV fits in the sink at a time.
         per_layer_bytes = self._k * self._geom.kv_page_bytes
@@ -1072,9 +1098,11 @@ class _Worker:
         # (first request), Score returns empty winners and no fetch
         # buffer is populated — attention falls back to full GPU KV.
 
-        # Vary the ICMS request_id by stride group so the server's score
-        # cache produces a fresh score at stride boundaries (0, 6, 12, ...)
-        # and reuses within each group.
+        # NOTE: The server's score cache is currently bypassed (adaptive
+        # bandwidth allocation requires fresh scoring per stride group since
+        # the budget may change).  The stride-group-based request_id is kept
+        # for when the cache is re-enabled; it ensures fresh scores at stride
+        # boundaries while allowing reuse within a group.
         stride_group = next_layer_idx // self._score_stride
         icms_rid = self._icms_request_id(rid, stride_group)
         # Use stored context groups (from prior requests with same prefix)
@@ -1082,7 +1110,29 @@ class _Worker:
         stored_groups = self._get_stored_context_groups(rs.chain)
         effective_groups = max(rs.num_groups_written, stored_groups)
         total_pages = effective_groups * _GROUP_BLOCKS
-        k = max(1, int(total_pages * budget)) if total_pages > 0 else 1
+
+        # Determine effective budget: adaptive allocator or static.
+        effective_budget = budget
+        if self._adaptive_allocator is not None and total_pages > 0:
+            # First layer of the request: register. Subsequent: recompute.
+            if not hasattr(rs, '_adaptive_registered') or not rs._adaptive_registered:
+                # Estimate new_tokens and cache_tokens from request state.
+                cache_tokens = total_pages * PAGE_TOKENS
+                # new_tokens is not directly available here; approximate from
+                # the metadata's num_computed_tokens range.
+                new_tokens = max(16, cache_tokens // 10)  # rough estimate
+                if connector_meta and connector_meta.requests:
+                    step_req = connector_meta.requests[0]
+                    new_tokens = max(16, step_req.num_computed_tokens_end
+                                    - step_req.num_computed_tokens_start)
+                effective_budget = self._adaptive_allocator.register_request(
+                    rid, new_tokens=new_tokens, cache_tokens=cache_tokens,
+                    total_cache_pages=total_pages)
+                rs._adaptive_registered = True
+            else:
+                effective_budget = self._adaptive_allocator.get_budget(rid)
+
+        k = max(1, int(total_pages * effective_budget)) if total_pages > 0 else 1
         k = min(k, self._k)
 
         # Marshal query to fp32 numpy, mean-pooling Q heads per KV-head
@@ -1590,6 +1640,10 @@ class _Worker:
         # KV data is NOT evicted — it persists for prefix reuse by
         # subsequent requests. Eviction is managed by the server's LRU
         # when capacity is full.
+
+        # Unregister from adaptive bandwidth allocator.
+        if self._adaptive_allocator is not None:
+            self._adaptive_allocator.unregister_request(request_id)
 
     # ─── direct helper API (backward compat with smoke tests) ────────────
 
