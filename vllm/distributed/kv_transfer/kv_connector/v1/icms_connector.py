@@ -876,9 +876,13 @@ class _Worker:
         self.stats = IcmsTimingStats(level=stats_level, log_selections=log_selections)
 
         # Pending async score results (C9).
-        self._pending_scores: dict[str, Any] = {}  # layer_name → (reply, slot)
-        self._pending_reuse: dict[str, Any] = {}   # layer_name → (reply, sink_offsets)
+        # Key: layer_name → dict[request_id → (reply, req_idx_in_batch)]
+        self._pending_scores: dict[str, dict[str, tuple]] = {}
+        self._pending_reuse: dict[str, dict[str, tuple]] = {}
         self._score_lock = threading.Lock()
+
+        # Per-layer saved block_table rows for restoration after attention.
+        self._saved_bt_rows: dict[str, list[tuple[int, torch.Tensor, torch.Tensor]]] = {}
 
         # Path B: GPU KV cache tensors + per-step attn_metadata for
         # selective fetch + block table override.
@@ -1045,19 +1049,23 @@ class _Worker:
         and stores as a pending score result. The wait_for_layer path
         picks it up and populates the fetch buffer.
         """
+        import copy
         attn_layer_name = f"model.layers.{next_layer_idx}.self_attn.attn"
         with self._score_lock:
             reuse_data = self._pending_reuse.pop(attn_layer_name, None)
         if reuse_data is None:
             return
-        reply, reuse_offsets = reuse_data
-        # Build a lightweight reply-like object with the adjusted offsets.
-        # We reuse the original reply's page_ids/scores but with new offsets.
-        import copy
-        reuse_reply = copy.copy(reply)
-        reuse_reply.sink_offsets = reuse_offsets
+        # reuse_data is dict[rid → (reply, reuse_offsets)]
         with self._score_lock:
-            self._pending_scores[attn_layer_name] = (reuse_reply, None)
+            pending = self._pending_scores.setdefault(attn_layer_name, {})
+            for rid, (reply, reuse_offsets) in reuse_data.items():
+                reuse_reply = copy.copy(reply)
+                reuse_reply.sink_offsets = reuse_offsets
+                # Preserve req_idx from the original score result.
+                orig = self._pending_scores.get(
+                    f"model.layers.{next_layer_idx - 1}.self_attn.attn", {})
+                req_idx = orig.get(rid, (None, 0))[1] if orig else 0
+                pending[rid] = (reuse_reply, req_idx)
 
     def on_layer_score(self, next_layer_idx, quest_query, budget, stats,
                         connector_meta=None):
@@ -1070,35 +1078,66 @@ class _Worker:
 
     def _on_layer_score_impl(self, next_layer_idx, quest_query, budget, stats,
                               connector_meta=None):
-        # Find the active request. With batch=1 (C3) there's exactly one.
-        rid = None
-        rs = None
-        if self._requests:
-            rid, rs = next(iter(self._requests.items()))
-
-        # Fallback: if _requests is empty (request may have been evicted
-        # between steps), reconstruct from the bound connector metadata
-        # which is still available during the forward pass.
-        if rs is None or not rs.chain:
-            if (connector_meta is not None
-                    and isinstance(connector_meta, IcmsConnectorMetadata)
-                    and connector_meta.requests):
-                # Use the first request from the metadata.
-                step_req = connector_meta.requests[0]
+        # Build the request list in BATCH ORDER from connector metadata.
+        # The metadata.requests list matches the scheduler's batch ordering,
+        # so req_idx corresponds to block_table row index.
+        requests_to_score = []
+        if (connector_meta is not None
+                and isinstance(connector_meta, IcmsConnectorMetadata)
+                and connector_meta.requests):
+            for req_idx, step_req in enumerate(connector_meta.requests):
                 rid = step_req.request_id
                 rs = self._requests.get(rid)
                 if rs is None:
-                    # Create a minimal request state from metadata.
                     chain = connector_meta.new_chains.get(rid, [])
                     if not chain:
-                        # Use the cached chain from a previous step.
                         chain = self._last_chain_for_rid.get(rid, [])
-                    if not chain:
-                        return
-                    rs = _RequestState(request_id=rid, chain=chain)
-                    self._requests[rid] = rs
-        if rs is None or not rs.chain:
+                    if chain:
+                        rs = _RequestState(request_id=rid, chain=chain)
+                        self._requests[rid] = rs
+                if rs is not None and rs.chain:
+                    requests_to_score.append((req_idx, rid, rs))
+
+        # Fallback: use _requests dict order (batch=1 case).
+        if not requests_to_score:
+            for req_idx, (rid, rs) in enumerate(self._requests.items()):
+                if rs.chain:
+                    requests_to_score.append((req_idx, rid, rs))
+
+        if not requests_to_score:
             return
+
+        # Split the Q tensor per request using token counts from metadata.
+        # quest_query shape: [total_tokens, num_heads, head_dim]
+        per_request_q = {}
+        if (quest_query is not None
+                and isinstance(quest_query, torch.Tensor)
+                and quest_query.ndim >= 2
+                and len(requests_to_score) > 1
+                and connector_meta is not None
+                and connector_meta.requests):
+            # Compute per-request token counts from metadata.
+            token_starts = []
+            offset = 0
+            for step_req in connector_meta.requests:
+                n_tokens = max(0, step_req.num_computed_tokens_end
+                               - step_req.num_computed_tokens_start)
+                token_starts.append((offset, offset + n_tokens, step_req.request_id))
+                offset += n_tokens
+            for start, end, rid in token_starts:
+                if end <= quest_query.shape[0]:
+                    per_request_q[rid] = quest_query[start:end]
+
+        # Score each request with its own Q slice.
+        for req_idx, rid, rs in requests_to_score:
+            q_for_request = per_request_q.get(rid, quest_query)
+            self._score_one_request(
+                rid, rs, req_idx, next_layer_idx, q_for_request,
+                budget, stats, connector_meta)
+
+    def _score_one_request(self, rid, rs, req_idx, next_layer_idx,
+                           quest_query, budget, stats, connector_meta):
+        """Score a single request against ICMS and store the result."""
 
         # Score against icms trie. Works when the trie has data from a
         # prior request or prior prefill pass. If the trie is empty
@@ -1202,23 +1241,22 @@ class _Worker:
                 scores=list(reply.scores),
             )
 
-            # Store the score result for the scored layer.
+            # Store the score result keyed by (layer, request_id).
             attn_layer_name = f"model.layers.{next_layer_idx}.self_attn.attn"
             with self._score_lock:
-                self._pending_scores[attn_layer_name] = (reply, None)
+                self._pending_scores.setdefault(attn_layer_name, {})[rid] = (
+                    reply, req_idx)
 
-            # Store references for reuse layers so on_layer_reuse can read
-            # their KV from the pre-filled sink without another Score call.
-            # The sink layout is: [layer_0_pages | layer_1_pages | ...].
+            # Store references for reuse layers.
             per_layer_bytes = self._sink_per_layer_bytes
             for delta in range(1, reuse_through - next_layer_idx + 1):
                 reuse_layer = next_layer_idx + delta
                 reuse_attn = f"model.layers.{reuse_layer}.self_attn.attn"
-                # Build a synthetic reply with adjusted sink_offsets for this layer.
                 reuse_offsets = [off + delta * per_layer_bytes
                                  for off in reply.sink_offsets]
                 with self._score_lock:
-                    self._pending_reuse[reuse_attn] = (reply, reuse_offsets)
+                    self._pending_reuse.setdefault(reuse_attn, {})[rid] = (
+                        reply, reuse_offsets)
         except Exception as e:
             t_score_end = time.perf_counter()
             self.stats.record_score(
@@ -1241,81 +1279,82 @@ class _Worker:
         self._attn_metadata = attn_metadata
 
     def wait_for_layer(self, layer_name: str):
-        """Path B: fetch selected KV from icms → GPU + override block table.
+        """Path B: fetch selected KV from icms → GPU + modify block table rows.
 
-        If there's a pending Score result for this layer (from the previous
-        layer's Quest hook), fetch the winning pages' KV from the icms sink
-        into GPU block slots and override the block_table + seq_lens so
-        FlashAttention only sees the k selected pages.
+        For each pending Score result at this layer, fetches the winning
+        pages' KV from the icms sink into GPU block slots and modifies the
+        corresponding block_table row + seq_lens entry so FlashAttention
+        only sees the k selected pages for that request.
 
-        If no Score result (e.g., first layer of first step), this is a no-op
-        and attention runs with whatever KV is in the GPU cache.
+        Supports batch > 1: each request's block_table row is modified
+        independently. Original values are saved for restoration in
+        restore_attn_metadata.
         """
         with self._score_lock:
-            result = self._pending_scores.pop(layer_name, None)
+            per_request = self._pending_scores.pop(layer_name, None)
 
-        if result is None:
+        if not per_request:
             return
 
-        reply, slot = result
-        if reply is None or not reply.page_ids:
-            if slot is not None:
-                self._sink_pool.release(slot)
+        if (self._prefill_done
+                or not self._gpu_kv_caches
+                or self._attn_metadata is None):
             return
 
-        # ── Path B: populate fetch buffer + set ICMS fetch state ──
-        # Only during prefill (selective attention). After prefill_done,
-        # decode uses dense attention with full GPU KV cache.
-        can_populate = (not self._prefill_done
-                        and bool(self._gpu_kv_caches)
-                        and self._attn_metadata is not None)
-        if can_populate:
+        saved_rows = []
+        for rid, (reply, req_idx) in per_request.items():
+            if reply is None or not reply.page_ids:
+                continue
             try:
-                self._populate_fetch_buffer(layer_name, reply)
+                saved = self._apply_selective_attention(
+                    layer_name, reply, req_idx, rid)
+                if saved:
+                    saved_rows.append(saved)
             except Exception as e:
-                logger.error("Path B: populate_fetch_buffer FAILED for %s: %s",
-                             layer_name, e, exc_info=True)
+                logger.error("Path B: apply_selective FAILED for %s req=%s: %s",
+                             layer_name, rid, e, exc_info=True)
 
-        # TODO(Path B full): cudaMemcpyAsync from sink into the
-        # selected GPU block slots. For v1, the KV data is already on
-        # GPU from the full prefill — we're just restricting which
-        # blocks the attention reads. The actual icms→GPU fetch path
-        # (for when GPU doesn't hold the KV) is a follow-up.
+        if saved_rows:
+            self._saved_bt_rows[layer_name] = saved_rows
 
-        if slot is not None:
-            self._sink_pool.release(slot)
+    def _apply_selective_attention(self, layer_name: str, reply,
+                                   req_idx: int, rid: str = ""):
+        """Modify block_table row for one request: fill selected KV + trim.
 
-    def _populate_fetch_buffer(self, layer_name: str, reply):
-        """Path B: fill allocated external blocks with selected context KV.
+        Fetches selected pages' KV from the ICMS sink into GPU blocks,
+        then rewrites block_table[req_idx] to contain only the selected
+        context blocks + continuation blocks. Saves the original row for
+        restoration.
 
-        With get_num_new_matched_tokens reporting external tokens, vLLM
-        allocates empty blocks for the context prefix and only computes
-        continuation tokens. This method fills the selected context pages'
-        KV into those allocated blocks (current shortcut: copies from the
-        GPU KV cache that was computed during Phase 1 and kept via prefix
-        caching; future: fetch from ICMS via cudaMemcpyAsync).
-
-        Non-selected context blocks remain zeroed — their attention
-        contribution is negligible (zero keys → uniform softmax, but
-        continuation tokens barely attend to them).
+        Returns (req_idx, orig_bt_row, orig_seq_len) for restoration,
+        or None if nothing was modified.
         """
-        # Get the main KV cache for this layer.
         kv = self._gpu_kv_caches.get(layer_name)
         if kv is None or kv.ndim != 5:
-            return
-        main_key = kv[0]    # [num_blocks, block_size, kv_heads, head_dim]
+            return None
+        main_key = kv[0]
         main_value = kv[1]
 
-        # Get the block table for the current request.
         am = self._attn_metadata.get(layer_name) if isinstance(self._attn_metadata, dict) else None
         if am is None or not hasattr(am, "block_table"):
-            return
+            return None
         bt = am.block_table  # [num_reqs, max_blocks]
 
-        seq_len = int(am.seq_lens[0])  # total tokens for request 0
+        if req_idx >= bt.shape[0]:
+            return None
 
-        # Determine context boundary.
-        rid, rs = next(iter(self._requests.items()))
+        seq_len = int(am.seq_lens[req_idx])
+
+        # Look up request state by request_id.
+        rs = self._requests.get(rid)
+        if rs is None:
+            # Fallback: try last known chain.
+            chain = self._last_chain_for_rid.get(rid, [])
+            if chain:
+                rs = _RequestState(request_id=rid, chain=chain)
+            else:
+                return None
+
         stored_groups = self._get_stored_context_groups(rs.chain)
         effective_groups = max(rs.num_groups_written, stored_groups)
         context_pages = effective_groups * _GROUP_BLOCKS
@@ -1323,35 +1362,25 @@ class _Worker:
         total_blocks = (seq_len + PAGE_TOKENS - 1) // PAGE_TOKENS
 
         # ── Fetch selected pages' KV from ICMS sink → GPU blocks ──
-        # The Score call already wrote the winning pages' KV into the
-        # shared-memory sink.  We read from the sink, parse K||V, convert
-        # fp16→model dtype, and copy into the allocated GPU blocks.
-        # Then build a trimmed block table with only the filled blocks +
-        # continuation blocks.
-        from vllm.v1.attention import icms_fetch_state
-
         selected = sorted(
             pid for pid in reply.page_ids[:min(len(reply.page_ids), self._k)]
             if pid < context_pages
         )
         k = len(selected)
         if k == 0:
-            return
+            return None
 
-        # Map page_id → sink offset for selected pages.
         pid_to_sink_off = {}
         for i, pid in enumerate(reply.page_ids):
             if i < len(reply.sink_offsets):
                 pid_to_sink_off[pid] = reply.sink_offsets[i]
 
-        # Copy each selected page from sink → GPU block.
         geom = self._geom
         sink_view = self._sink_pool.sink.view()
         kv_page_bytes = geom.kv_page_bytes
-        half_bytes = kv_page_bytes // 2  # K and V each
+        half_bytes = kv_page_bytes // 2
         model_dtype = main_key.dtype
         device = main_key.device
-        # Shape per page: [PAGE_TOKENS, num_kv_heads, head_dim] in fp16
         page_shape = (PAGE_TOKENS, geom.num_kv_heads, geom.head_dim)
 
         filled_blocks = []
@@ -1359,99 +1388,61 @@ class _Worker:
             sink_off = pid_to_sink_off.get(pid)
             if sink_off is None or pid >= bt.shape[1]:
                 continue
-            phys_block = int(bt[0, pid])
+            phys_block = int(bt[req_idx, pid])
             if phys_block >= main_key.shape[0]:
                 continue
-
-            # Read K||V from sink shared memory.
             raw = bytes(sink_view[sink_off:sink_off + kv_page_bytes])
             k_np = np.frombuffer(raw[:half_bytes], dtype=np.float16).reshape(page_shape)
             v_np = np.frombuffer(raw[half_bytes:], dtype=np.float16).reshape(page_shape)
-
-            # Convert to model dtype and copy to GPU.
             k_t = torch.from_numpy(k_np.copy()).to(dtype=model_dtype, device=device)
             v_t = torch.from_numpy(v_np.copy()).to(dtype=model_dtype, device=device)
             main_key[phys_block].copy_(k_t)
             main_value[phys_block].copy_(v_t)
             filled_blocks.append(phys_block)
 
-        # Build trimmed block table: [filled context blocks | continuation].
-        bt_device = bt.device
+        # ── Modify block_table row in-place ──
+        # Build trimmed entries: [filled context blocks | continuation blocks].
         new_entries = list(filled_blocks)
         for blk_idx in range(context_pages, total_blocks):
             if blk_idx < bt.shape[1]:
-                new_entries.append(int(bt[0, blk_idx]))
-
+                new_entries.append(int(bt[req_idx, blk_idx]))
         if not new_entries:
-            return
+            return None
 
         continuation_tokens = max(0, seq_len - context_tokens)
         new_seq_len = len(filled_blocks) * PAGE_TOKENS + continuation_tokens
 
-        new_bt = torch.tensor([new_entries], dtype=torch.int32, device=bt_device)
-        new_sl = torch.tensor([new_seq_len], dtype=torch.int32, device=bt_device)
+        # Save originals before in-place modification.
+        orig_bt_row = bt[req_idx].clone()
+        orig_seq_len = am.seq_lens[req_idx].clone()
+
+        # Write trimmed entries into block_table row.
+        bt[req_idx, :len(new_entries)] = torch.tensor(
+            new_entries, dtype=bt.dtype, device=bt.device)
+        # Zero out remaining entries (safety).
+        if len(new_entries) < bt.shape[1]:
+            bt[req_idx, len(new_entries):] = 0
+        am.seq_lens[req_idx] = new_seq_len
 
         logger.debug(
-            "Path B: layer=%s fetched %d/%d pages from sink, cont=%d, "
-            "new_seq_len=%d",
-            layer_name, len(filled_blocks), context_pages,
-            continuation_tokens, new_seq_len,
+            "Path B: layer=%s req_idx=%d fetched %d/%d pages, "
+            "seq_len %d→%d",
+            layer_name, req_idx, len(filled_blocks), context_pages,
+            seq_len, new_seq_len,
         )
-        # Pre-compute FA3 scheduler_metadata for the trimmed seq_lens.
-        # Must happen here (before forward) — get_scheduler_metadata is not
-        # reentrant and cannot be called from inside flash_attn's forward.
-        sched_meta = None
-        try:
-            from vllm.v1.attention.backends.fa_utils import (
-                get_flash_attn_version, get_scheduler_metadata,
-            )
-            if get_flash_attn_version() == 3:
-                cu_seqlens_q = am.query_start_loc
-                max_seqlen_q = am.max_query_len
-                # Q head count: infer from the KV cache shape. The cache
-                # stores [num_blocks, block_size, num_kv_heads, head_dim].
-                # Q heads aren't stored directly but we need them for FA3.
-                # Use the cached value from register_kv_caches if available,
-                # else infer from attn_metadata or model geometry.
-                num_q_heads_actual = getattr(self, '_num_q_heads', None)
-                if num_q_heads_actual is None:
-                    # Fallback: check if attn_metadata has it
-                    num_q_heads_actual = getattr(am, 'num_heads_q', None)
-                if num_q_heads_actual is None and geom is not None:
-                    # Last resort: assume GQA ratio from hf config
-                    num_q_heads_actual = geom.num_kv_heads * 8  # common GQA ratio
-                sched_meta = get_scheduler_metadata(
-                    batch_size=cu_seqlens_q.shape[0] - 1,
-                    max_seqlen_q=max_seqlen_q,
-                    max_seqlen_k=new_seq_len,
-                    num_heads_q=num_q_heads_actual,
-                    num_heads_kv=geom.num_kv_heads,
-                    headdim=geom.head_dim,
-                    cache_seqlens=new_sl,
-                    qkv_dtype=main_key.dtype,
-                    cu_seqlens_q=cu_seqlens_q,
-                    page_size=PAGE_TOKENS,
-                    causal=True,
-                )
-        except Exception:
-            pass  # fall back to None (dynamic scheduling)
-
-        if sched_meta is not None:
-            logger.debug("Path B: FA3 scheduler_metadata precomputed shape=%s",
-                         sched_meta.shape)
-        icms_fetch_state.set_active(icms_fetch_state.IcmsFetchState(
-            key_cache=main_key,
-            value_cache=main_value,
-            block_table=new_bt,
-            seq_lens=new_sl,
-            max_seq_len=new_seq_len,
-            scheduler_metadata=sched_meta,
-        ))
+        return (req_idx, orig_bt_row, orig_seq_len)
 
     def restore_attn_metadata(self, layer_name: str):
-        """Clear the ICMS fetch state after attention ran with it."""
-        from vllm.v1.attention import icms_fetch_state
-        icms_fetch_state.clear()
+        """Restore original block_table rows after selective attention."""
+        saved = self._saved_bt_rows.pop(layer_name, None)
+        if not saved:
+            return
+        am = self._attn_metadata.get(layer_name) if isinstance(self._attn_metadata, dict) else None
+        if am is None or not hasattr(am, "block_table"):
+            return
+        for req_idx, orig_bt_row, orig_seq_len in saved:
+            am.block_table[req_idx] = orig_bt_row
+            am.seq_lens[req_idx] = orig_seq_len
 
     def wait_for_pending_writes(self):
         """Block until all buffered WriteGroups are flushed.

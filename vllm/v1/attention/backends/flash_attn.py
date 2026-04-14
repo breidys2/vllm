@@ -879,15 +879,13 @@ class FlashAttentionImpl(AttentionImpl):
             key_cache = key_cache.view(dtype)
             value_cache = value_cache.view(dtype)
 
-        # ICMS Path B: if the connector set a fetch state, use the
-        # reordered block table regardless of cascade mode.  With
-        # get_num_new_matched_tokens, Q only has continuation tokens,
-        # so the causal offset is correct.
-        from vllm.v1.attention import icms_fetch_state as _icms_mod
-        _icms_state = _icms_mod.get_active()
-        _use_cascade = attn_metadata.use_cascade and _icms_state is None
+        # ICMS Path B: selective attention is handled via in-place
+        # block_table and seq_lens modification by the connector's
+        # wait_for_layer / restore_attn_metadata methods.  No fetch
+        # state override needed — FlashAttention reads the modified
+        # block_table directly.
 
-        if not _use_cascade:
+        if not attn_metadata.use_cascade:
             cu_seqlens_q = attn_metadata.query_start_loc
             seqused_k = attn_metadata.seq_lens
             max_seqlen_q = attn_metadata.max_query_len
@@ -895,21 +893,6 @@ class FlashAttentionImpl(AttentionImpl):
             block_table = (kivi_block_table if kivi_block_table is not None
                            else attn_metadata.block_table)
             scheduler_metadata = attn_metadata.scheduler_metadata
-
-            if _icms_state is not None:
-                key_cache = _icms_state.key_cache
-                value_cache = _icms_state.value_cache
-                block_table = _icms_state.block_table
-                seqused_k = _icms_state.seq_lens
-                max_seqlen_k = _icms_state.max_seq_len
-                # Recompute scheduler_metadata for the trimmed seq_lens.
-                # The pre-computed metadata was built for the original
-                # seq_lens and would cause FA3 to read beyond the trimmed
-                # block table.
-                # Use pre-computed scheduler_metadata from the fetch state
-                # (computed in _populate_fetch_buffer before the forward pass).
-                # Falls back to None (dynamic scheduling) if not available.
-                scheduler_metadata = _icms_state.scheduler_metadata
 
             descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
 
