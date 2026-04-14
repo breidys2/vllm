@@ -24,11 +24,18 @@ import torch
 
 @dataclass
 class IcmsFetchState:
-    """Active fetch state for one layer's attention."""
-    key_cache: torch.Tensor       # [k, block_size, num_kv_heads, head_dim]
+    """Active fetch state for one layer's attention.
+
+    Uses a reordered block_table pointing into the main cache, not a
+    separate fetch buffer.  The block table contains:
+      [selected_context_blocks (sorted by page_id) | continuation_blocks]
+    This preserves both selective context attention AND continuation
+    self-attention, matching the HF baseline architecture.
+    """
+    key_cache: torch.Tensor       # main cache [num_blocks, block_size, kv_heads, head_dim]
     value_cache: torch.Tensor     # same shape
-    block_table: torch.Tensor     # [1, k] — identity mapping [0, 1, ..., k-1]
-    seq_lens: torch.Tensor        # [1] — k * block_size
+    block_table: torch.Tensor     # [1, k_selected + n_cont_blocks]
+    seq_lens: torch.Tensor        # [1] — selected_tokens + continuation_tokens
     max_seq_len: int
     scheduler_metadata: object = None  # override to None for fetch state
 

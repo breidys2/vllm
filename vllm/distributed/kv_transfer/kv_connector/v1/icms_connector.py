@@ -76,6 +76,12 @@ from icms_client.sink import Sink, allocate_sink             # noqa: E402
 _SINK_SLOTS = 4           # C8: number of pre-allocated sink slots
 _GROUP_BLOCKS = GROUP_PAGES  # blocks per group (= pages per group = 32)
 
+# Module-level queue: worker → scheduler stored-chain notifications.
+# The worker appends (chain, num_groups) after WriteGroup completes;
+# the scheduler drains it in get_num_new_matched_tokens / build_meta.
+# Safe because both run in the same EngineCore process.
+_stored_chain_queue: list[tuple[list[int], int]] = []
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Metadata: scheduler → worker per-step payload (C1)
@@ -98,6 +104,9 @@ class IcmsConnectorMetadata(KVConnectorMetadata):
     new_chains: dict[str, list[int]] = field(default_factory=dict)
     # Per-request in-order CPU block IDs (for block_id → intra_request_idx mapping).
     block_id_maps: dict[str, list[int]] = field(default_factory=dict)
+    # Worker→scheduler: chains that were stored in ICMS.
+    # List of (chain, num_groups) tuples, drained by the scheduler.
+    stored_chain_notifications: list[tuple[list[int], int]] = field(default_factory=list)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -336,6 +345,7 @@ class IcmsConnector(KVConnectorBase_V1):
         self._budget: float    = float(extra.get("icms_budget", 0.2))
         self._stats_level: int = int(extra.get("icms_stats_level", 1))
         self._log_selections: bool = bool(extra.get("icms_log_selections", False))
+        self._score_stride: int = int(extra.get("icms_score_stride", 6))
 
         self._sched: _Scheduler | None = None
         self._worker: _Worker | None = None
@@ -347,6 +357,7 @@ class IcmsConnector(KVConnectorBase_V1):
                 socket_path=self._socket_path,
                 model_name=self._model_name,
                 k=self._k,
+                score_stride=self._score_stride,
                 stats_level=self._stats_level,
                 log_selections=self._log_selections,
             )
@@ -386,7 +397,7 @@ class IcmsConnector(KVConnectorBase_V1):
             return
         self._worker.wait_for_layer(layer_name)
 
-    def save_kv_layer(
+    def save_kv_layer(  # noqa: C901
         self,
         layer_name: str,
         kv_layer: torch.Tensor,
@@ -443,9 +454,27 @@ class IcmsConnector(KVConnectorBase_V1):
             return
 
         if quest_query is not None and next_layer_idx is not None:
-            # CPU-scoring path: Q arrived, fire Score against icms.
-            # Skip during dense decode — scoring is only needed for
-            # selective prefill (Path B).
+            # With the V2 model runner, the standard save_kv_layer (with
+            # kv_layer data) doesn't fire — only Quest hooks do. So we
+            # extract K/V from the stashed GPU KV caches here instead.
+            if (self._worker is not None
+                    and not self._worker._prefill_done
+                    and self._worker._gpu_kv_caches
+                    and self._worker._attn_metadata is not None):
+                # Map quest hook's layer_name ("layer_N") to attention
+                # layer name ("model.layers.N.self_attn.attn") for the
+                # CURRENT layer (not next_layer_idx — we extract K/V
+                # for the layer that just completed, using its index
+                # from the layer_name).
+                parts = layer_name.split("_")
+                if len(parts) == 2 and parts[1].isdigit():
+                    cur_layer = int(parts[1])
+                    attn_name = f"model.layers.{cur_layer}.self_attn.attn"
+                    kv = self._worker._gpu_kv_caches.get(attn_name)
+                    am = self._worker._attn_metadata.get(attn_name) if isinstance(self._worker._attn_metadata, dict) else None
+                    if kv is not None and kv.ndim == 5 and am is not None:
+                        self._worker.extract_and_record(attn_name, kv, am)
+
             if not self._worker._prefill_done:
                 self._worker.on_layer_score(
                     next_layer_idx, quest_query, budget, quest_stats,
@@ -472,7 +501,9 @@ class IcmsConnector(KVConnectorBase_V1):
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int,
     ) -> tuple[int | None, bool]:
-        # v1: no external prefix match. vLLM does full prefill.
+        if self._sched is not None:
+            return self._sched.get_num_new_matched_tokens(
+                request, num_computed_tokens)
         return 0, False
 
     def update_state_after_alloc(
@@ -573,54 +604,46 @@ class _Scheduler:
         # Requests whose chains haven't been sent to the worker yet.
         self._pending_chain_sends: set[str] = set()
 
+        # ── Global prefix index (Option 1: in-process hash dict) ──
+        # Maps chain prefix (as tuple of group hashes) → num_groups stored.
+        # Updated via metadata from the worker after WriteGroup completes.
+        # Used by get_num_new_matched_tokens to report externally-stored
+        # prefix length to the scheduler, so vLLM skips recomputing them.
+        self._stored_chains: list[tuple[tuple[int, ...], int]] = []
+
     def on_alloc(self, request: Request, blocks: KVCacheBlocks):
         rid = request.request_id
         if rid in self._chains:
             return  # already seen
 
-        # Use vLLM's native block_hashes (content-based, chained from
-        # token IDs). Same prompt → same hashes → prefix reuse in the trie.
-        bh = getattr(request, "block_hashes", [])
-        if bh and len(bh) > 0:
-            # Convert block hashes to group hashes: one group = 32 blocks.
-            # Group identity = hash of the last block in the group.
-            chain: list[int] = []
-            for i in range(_GROUP_BLOCKS - 1, len(bh), _GROUP_BLOCKS):
-                h = bh[i]
-                if hasattr(h, "hash_value"):
-                    chain.append(h.hash_value & 0xFFFFFFFFFFFFFFFF)
-                elif isinstance(h, int):
-                    chain.append(h & 0xFFFFFFFFFFFFFFFF)
-                else:
-                    chain.append(hash(h) & 0xFFFFFFFFFFFFFFFF)
-            # Partial trailing group: use the last available block hash.
-            if len(bh) % _GROUP_BLOCKS != 0:
-                last = bh[-1]
-                if hasattr(last, "hash_value"):
-                    chain.append(last.hash_value & 0xFFFFFFFFFFFFFFFF)
-                elif isinstance(last, int):
-                    chain.append(last & 0xFFFFFFFFFFFFFFFF)
-                else:
-                    chain.append(hash(last) & 0xFFFFFFFFFFFFFFFF)
-            if logger.isEnabledFor(20):  # DEBUG-level gate
-                logger.debug("on_alloc: rid=%s chain from %d block_hashes → %d groups",
-                              rid, len(bh), len(chain))
-        else:
-            # Fallback: token_ids-based hashing.
-            token_ids = getattr(request, "all_token_ids", [])
-            max_groups = 64
-            chain = []
-            if token_ids:
-                group_tokens = _GROUP_BLOCKS * PAGE_TOKENS
-                for g in range(max_groups):
-                    end = min((g + 1) * group_tokens, len(token_ids))
-                    if end <= g * group_tokens:
-                        break
-                    chain.append(hash(tuple(token_ids[:end])) & 0xFFFFFFFFFFFFFFFF)
-            if not chain:
-                for g in range(max_groups):
-                    chain.append(hash((rid, g)) & 0xFFFFFFFFFFFFFFFF)
-            logger.debug("on_alloc: rid=%s chain from fallback → %d groups", rid, len(chain))
+        # Compute chain from token IDs directly using SHA-256.
+        # vLLM's block_hashes include engine_id and differ across processes,
+        # so we bypass them and hash tokens directly for cross-process
+        # prefix matching.
+        import hashlib
+        token_ids = getattr(request, "all_token_ids", None)
+        if token_ids is None or len(token_ids) == 0:
+            token_ids = getattr(request, "prompt_token_ids", [])
+
+        group_tokens = _GROUP_BLOCKS * PAGE_TOKENS  # 512 tokens per group
+        chain: list[int] = []
+        if token_ids and len(token_ids) >= PAGE_TOKENS:
+            for g in range(64):
+                end = min((g + 1) * group_tokens, len(token_ids))
+                start = g * group_tokens
+                if end <= start:
+                    break
+                # Chained: hash all tokens up to this group boundary.
+                h = hashlib.sha256(
+                    repr(tuple(token_ids[:end])).encode()
+                ).digest()[:8]
+                chain.append(int.from_bytes(h, "little"))
+        if not chain:
+            h = hashlib.sha256(repr(tuple(token_ids or [])).encode()).digest()[:8]
+            chain.append(int.from_bytes(h, "little"))
+
+        logger.debug("on_alloc: rid=%s tokens=%d groups=%d",
+                      rid, len(token_ids or []), len(chain))
         self._chains[rid] = chain
         self._pending_chain_sends.add(rid)
 
@@ -660,6 +683,103 @@ class _Scheduler:
             self._pending_chain_sends.discard(rid)
         return meta
 
+    # ── Global prefix index operations ──────────────────────────────
+
+    def record_stored_chain(self, chain: list[int], num_groups: int):
+        """Called when the worker reports that groups were written to ICMS."""
+        key = tuple(chain[:num_groups])
+        # Update existing or append.
+        for i, (sc, ng) in enumerate(self._stored_chains):
+            if sc == key:
+                self._stored_chains[i] = (key, max(ng, num_groups))
+                return
+        self._stored_chains.append((key, num_groups))
+
+    def _lookup_stored_prefix(self, chain: list[int]) -> int:
+        """Find longest stored chain prefix. Returns matched group count."""
+        best = 0
+        for stored_chain, n_groups in self._stored_chains:
+            match_len = 0
+            for a, b in zip(chain, stored_chain):
+                if a == b:
+                    match_len += 1
+                else:
+                    break
+            if match_len > 0:
+                best = max(best, min(n_groups, match_len))
+        return best
+
+    def get_num_new_matched_tokens(
+        self, request: Request, num_computed_tokens: int,
+    ) -> tuple[int | None, bool]:
+        """Report how many tokens beyond local cache are stored in ICMS.
+
+        The scheduler calls this once per new request. We compute the
+        chain from token IDs and check our in-process prefix index.
+        Returns (num_external_tokens, is_async).
+        """
+        # Drain worker → scheduler notifications first.
+        global _stored_chain_queue
+        if _stored_chain_queue:
+            for chain, n_groups in _stored_chain_queue:
+                self.record_stored_chain(chain, n_groups)
+            _stored_chain_queue.clear()
+
+        rid = request.request_id
+        # Ensure chain is computed.
+        if rid not in self._chains:
+            # Compute chain eagerly (before on_alloc which needs blocks).
+            import hashlib
+            token_ids = getattr(request, "all_token_ids", None)
+            if token_ids is None or len(token_ids) == 0:
+                token_ids = getattr(request, "prompt_token_ids", [])
+            group_tokens = _GROUP_BLOCKS * PAGE_TOKENS
+            chain: list[int] = []
+            if token_ids and len(token_ids) >= PAGE_TOKENS:
+                for g in range(64):
+                    end = min((g + 1) * group_tokens, len(token_ids))
+                    start = g * group_tokens
+                    if end <= start:
+                        break
+                    h = hashlib.sha256(
+                        repr(tuple(token_ids[:end])).encode()
+                    ).digest()[:8]
+                    chain.append(int.from_bytes(h, "little"))
+            if not chain:
+                return 0, False
+            self._chains[rid] = chain
+            self._pending_chain_sends.add(rid)
+
+        chain = self._chains[rid]
+        matched_groups = self._lookup_stored_prefix(chain)
+        if matched_groups == 0:
+            return 0, False
+
+        # Convert groups to tokens. Each group = GROUP_PAGES * PAGE_TOKENS.
+        matched_tokens = matched_groups * _GROUP_BLOCKS * PAGE_TOKENS
+        # Subtract what's already locally computed.
+        ext_tokens = max(0, matched_tokens - num_computed_tokens)
+        if ext_tokens == 0:
+            return 0, False
+
+        # Don't claim more external tokens than the prompt has.  Leave at
+        # least PAGE_TOKENS new tokens for the model to actually compute
+        # (otherwise prompt_logprobs would be empty for the continuation).
+        total_prompt = len(token_ids) if token_ids else 0
+        max_ext = max(0, total_prompt - num_computed_tokens - PAGE_TOKENS)
+        ext_tokens = min(ext_tokens, max_ext)
+        if ext_tokens <= 0:
+            return 0, False
+
+        logger.debug(
+            "get_num_new_matched_tokens: rid=%s matched_groups=%d "
+            "matched_tokens=%d local=%d ext=%d",
+            rid, matched_groups, matched_tokens, num_computed_tokens, ext_tokens,
+        )
+        # Synchronous loading (False): the worker fills blocks during
+        # the forward pass via wait_for_layer_load.
+        return ext_tokens, False
+
     def on_finished(self, request_id: str):
         self._chains.pop(request_id, None)
         self._block_ids.pop(request_id, None)
@@ -674,10 +794,18 @@ class _Worker:
     """Worker-side state. Owns IcmsClient, sink pool, per-request buffers."""
 
     def __init__(self, *, socket_path: str, model_name: str, k: int,
+                 score_stride: int = 6,
                  stats_level: int = 1, log_selections: bool = False):
         self._socket_path = socket_path
         self._model_name = model_name
         self._k = k
+        # Score stride: fresh Quest scoring every N layers.
+        # Layers within a stride group reuse the first scored layer's
+        # page selection via the ICMS server's score cache.
+        # stride=1 → per-layer scoring (best quality, most scoring overhead)
+        # stride=6 → score at 0,6,12,...  (matches quest_reuse_strided)
+        # stride=48 → single-layer scoring (fastest, worst quality)
+        self._score_stride = max(1, score_stride)
 
         self._client: IcmsClient | None = None
         self._geom: ModelGeometry | None = None
@@ -689,6 +817,12 @@ class _Worker:
         # Persistent chain cache: survives request eviction so Quest hooks
         # can find the chain even after request_finished runs.
         self._last_chain_for_rid: dict[str, list[int]] = {}
+
+        # Cross-request context tracking: maps chain prefix (as tuple) to
+        # the number of groups written for that prefix.  This lets Phase 2
+        # (read) know how many context pages were stored by Phase 1 (write),
+        # even though they're different vLLM requests.
+        self._stored_chain_groups: list[tuple[list[int], int]] = []
 
         # Timing / debug stats.
         self.stats = IcmsTimingStats(level=stats_level, log_selections=log_selections)
@@ -712,6 +846,10 @@ class _Worker:
         # and all subsequent steps use dense attention (no fetch buffer).
         self._prefill_done: bool = False
 
+        # Pending notifications for the scheduler (stored chain info).
+        # Drained into IcmsConnectorMetadata by the facade.
+        self._pending_stored_notifications: list[tuple[list[int], int]] = []
+
         self._connect()
 
     def _connect(self):
@@ -732,10 +870,37 @@ class _Worker:
         self._sink_pool = _SinkSlotPool(sink, slot_bytes, _SINK_SLOTS)
         logger.info(
             "IcmsConnector worker: connected to %s, model=%s, "
-            "sink=%d slots × %d B = %d B total",
+            "sink=%d slots × %d B = %d B total, score_stride=%d",
             self._socket_path, self._model_name,
-            _SINK_SLOTS, slot_bytes, total_sink,
+            _SINK_SLOTS, slot_bytes, total_sink, self._score_stride,
         )
+
+    def _get_stored_context_groups(self, chain: list[int]) -> int:
+        """Find the longest stored chain prefix matching the given chain.
+
+        Returns the number of groups written for that prefix (0 if none).
+        This allows a new request to know how many context pages were
+        stored by a prior request with the same prefix.
+        """
+        best = 0
+        for stored_chain, n_groups in self._stored_chain_groups:
+            match_len = 0
+            for a, b in zip(chain, stored_chain):
+                if a == b:
+                    match_len += 1
+                else:
+                    break
+            if match_len > 0:
+                best = max(best, min(n_groups, match_len))
+        return best
+
+    def _record_stored_groups(self, chain: list[int], n_groups: int):
+        """Record that n_groups were written for this chain prefix."""
+        for i, (sc, _) in enumerate(self._stored_chain_groups):
+            if sc == chain:
+                self._stored_chain_groups[i] = (chain, max(_, n_groups))
+                return
+        self._stored_chain_groups.append((list(chain), n_groups))
 
     def shutdown(self):
         if self._client is None:
@@ -868,8 +1033,16 @@ class _Worker:
         # (first request), Score returns empty winners and no fetch
         # buffer is populated — attention falls back to full GPU KV.
 
-        icms_rid = self._icms_request_id(rid, 0)
-        total_pages = rs.num_groups_written * _GROUP_BLOCKS
+        # Vary the ICMS request_id by stride group so the server's score
+        # cache produces a fresh score at stride boundaries (0, 6, 12, ...)
+        # and reuses within each group.
+        stride_group = next_layer_idx // self._score_stride
+        icms_rid = self._icms_request_id(rid, stride_group)
+        # Use stored context groups (from prior requests with same prefix)
+        # if the current request hasn't written anything yet.
+        stored_groups = self._get_stored_context_groups(rs.chain)
+        effective_groups = max(rs.num_groups_written, stored_groups)
+        total_pages = effective_groups * _GROUP_BLOCKS
         k = max(1, int(total_pages * budget)) if total_pages > 0 else 1
         k = min(k, self._k)
 
@@ -930,35 +1103,16 @@ class _Worker:
                 (t_score_end - t_score_start) * 1e6,
                 False, [], next_layer_idx,
             )
-            logger.debug("Score for layer %d: %s (chain_len=%d, k=%d)",
-                          next_layer_idx, e, len(rs.chain), k)
+            logger.debug("Score failed layer %d: %s", next_layer_idx, e)
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
-        """Stash GPU KV cache tensors + allocate Path B fetch buffer."""
+        """Stash GPU KV cache tensors for Path B reordered block table."""
         self._gpu_kv_caches = dict(kv_caches)
-        # Allocate the fetch buffer: k blocks worth of KV on GPU,
-        # reused across layers. Shape matches the main KV cache layout.
-        if kv_caches:
-            sample = next(iter(kv_caches.values()))
-            # sample shape: [2, num_blocks, block_size, num_kv_heads, head_dim]
-            if sample.ndim == 5:
-                _, _, block_size, num_kv_heads, head_dim = sample.shape
-                k = self._k
-                device = sample.device
-                dtype = sample.dtype
-                self._fetch_key_cache = torch.zeros(
-                    k, block_size, num_kv_heads, head_dim,
-                    dtype=dtype, device=device)
-                self._fetch_value_cache = torch.zeros(
-                    k, block_size, num_kv_heads, head_dim,
-                    dtype=dtype, device=device)
-                self._fetch_block_table = torch.arange(
-                    k, dtype=torch.int32, device=device).unsqueeze(0)  # [1, k]
-                self._fetch_block_size = block_size
-                logger.info(
-                    "Path B: allocated fetch buffer k=%d blocks, shape=[%d,%d,%d,%d] on %s",
-                    k, k, block_size, num_kv_heads, head_dim, device)
-        logger.info("Path B: registered %d KV cache layers", len(kv_caches))
+        # No separate fetch buffer needed — Path B uses a reordered block
+        # table pointing into the main cache.  This preserves continuation
+        # self-attention (see _populate_fetch_buffer).
+        logger.info("Path B: registered %d KV cache layers (reordered block table mode)",
+                     len(kv_caches))
 
     def set_attn_metadata(self, attn_metadata):
         """Stash per-step attn_metadata dict from ForwardContext."""
@@ -990,14 +1144,15 @@ class _Worker:
         # ── Path B: populate fetch buffer + set ICMS fetch state ──
         # Only during prefill (selective attention). After prefill_done,
         # decode uses dense attention with full GPU KV cache.
-        if (not self._prefill_done
-                and hasattr(self, '_fetch_key_cache')
-                and self._fetch_key_cache is not None
-                and self._attn_metadata is not None):
+        can_populate = (not self._prefill_done
+                        and bool(self._gpu_kv_caches)
+                        and self._attn_metadata is not None)
+        if can_populate:
             try:
                 self._populate_fetch_buffer(layer_name, reply)
-            except Exception:
-                logger.exception("Path B: populate_fetch_buffer FAILED for %s", layer_name)
+            except Exception as e:
+                logger.error("Path B: populate_fetch_buffer FAILED for %s: %s",
+                             layer_name, e, exc_info=True)
 
         # TODO(Path B full): cudaMemcpyAsync from sink into the
         # selected GPU block slots. For v1, the KV data is already on
@@ -1009,9 +1164,19 @@ class _Worker:
             self._sink_pool.release(slot)
 
     def _populate_fetch_buffer(self, layer_name: str, reply):
-        """Path B: copy selected pages into fetch buffer + set fetch state."""
-        from vllm.v1.attention import icms_fetch_state
+        """Path B: fill allocated external blocks with selected context KV.
 
+        With get_num_new_matched_tokens reporting external tokens, vLLM
+        allocates empty blocks for the context prefix and only computes
+        continuation tokens. This method fills the selected context pages'
+        KV into those allocated blocks (current shortcut: copies from the
+        GPU KV cache that was computed during Phase 1 and kept via prefix
+        caching; future: fetch from ICMS via cudaMemcpyAsync).
+
+        Non-selected context blocks remain zeroed — their attention
+        contribution is negligible (zero keys → uniform softmax, but
+        continuation tokens barely attend to them).
+        """
         # Get the main KV cache for this layer.
         kv = self._gpu_kv_caches.get(layer_name)
         if kv is None or kv.ndim != 5:
@@ -1019,37 +1184,77 @@ class _Worker:
         main_key = kv[0]    # [num_blocks, block_size, kv_heads, head_dim]
         main_value = kv[1]
 
-        # Get the original block table to map page_ids → GPU block indices.
+        # Get the block table for the current request.
         am = self._attn_metadata.get(layer_name) if isinstance(self._attn_metadata, dict) else None
         if am is None or not hasattr(am, "block_table"):
             return
         bt = am.block_table  # [num_reqs, max_blocks]
 
-        # Copy selected pages into the fetch buffer.
-        k = min(len(reply.page_ids), self._k)
-        for i in range(k):
-            pid = reply.page_ids[i]
-            if pid >= bt.shape[1]:
-                continue
-            gpu_block_id = int(bt[0, pid])
-            if gpu_block_id >= main_key.shape[0]:
-                continue
-            self._fetch_key_cache[i].copy_(main_key[gpu_block_id])
-            self._fetch_value_cache[i].copy_(main_value[gpu_block_id])
+        seq_len = int(am.seq_lens[0])  # total tokens for request 0
 
-        # Set the module-level fetch state for FlashAttention.
-        # Ensure tensors are contiguous and on the right device.
-        device = self._fetch_key_cache.device
-        fetch_bt = self._fetch_block_table[:, :k].contiguous()
-        fetch_sl = torch.tensor([k * PAGE_TOKENS],
-                                 dtype=torch.int32, device=device)
-        logger.debug("Path B: fetch state k=%d seq_len=%d", k, k * PAGE_TOKENS)
+        # Determine context boundary.
+        rid, rs = next(iter(self._requests.items()))
+        stored_groups = self._get_stored_context_groups(rs.chain)
+        effective_groups = max(rs.num_groups_written, stored_groups)
+        context_pages = effective_groups * _GROUP_BLOCKS
+        context_tokens = context_pages * PAGE_TOKENS
+        total_blocks = (seq_len + PAGE_TOKENS - 1) // PAGE_TOKENS
+
+        # The selected page_ids from the Score reply are indices into the
+        # context pages (0..context_pages-1). The block_table maps logical
+        # blocks to physical blocks. We need to ensure the selected blocks
+        # have valid KV data — currently they already do because Phase 1's
+        # prefix-cached KV is reused.
+        #
+        # Build a reordered block table containing ONLY the selected
+        # context blocks + continuation blocks.  Non-selected context blocks
+        # are excluded entirely — they don't appear in the block table, so
+        # FlashAttention never reads them.  This avoids the "zero K steals
+        # softmax mass" problem.
+        #
+        # This works because get_num_new_matched_tokens ensures Q only has
+        # continuation tokens, so the causal offset is correct:
+        #   offset = seqused_k - max_seqlen_q
+        #          = (k*PAGE_TOKENS + cont) - cont = k*PAGE_TOKENS
+        from vllm.v1.attention import icms_fetch_state
+
+        selected = sorted(
+            pid for pid in reply.page_ids[:min(len(reply.page_ids), self._k)]
+            if pid < context_pages
+        )
+        k = len(selected)
+
+        # Build: [selected context blocks (sorted) | continuation blocks].
+        device = bt.device
+        new_entries = []
+        for pid in selected:
+            if pid < bt.shape[1]:
+                new_entries.append(int(bt[0, pid]))
+        for blk_idx in range(context_pages, total_blocks):
+            if blk_idx < bt.shape[1]:
+                new_entries.append(int(bt[0, blk_idx]))
+
+        if not new_entries:
+            return
+
+        continuation_tokens = max(0, seq_len - context_tokens)
+        new_seq_len = k * PAGE_TOKENS + continuation_tokens
+
+        new_bt = torch.tensor([new_entries], dtype=torch.int32, device=device)
+        new_sl = torch.tensor([new_seq_len], dtype=torch.int32, device=device)
+
+        logger.debug(
+            "Path B: layer=%s selected %d/%d ctx pages, cont=%d, "
+            "new_seq_len=%d, entries=%d",
+            layer_name, k, context_pages, continuation_tokens,
+            new_seq_len, len(new_entries),
+        )
         icms_fetch_state.set_active(icms_fetch_state.IcmsFetchState(
-            key_cache=self._fetch_key_cache[:k].contiguous(),
-            value_cache=self._fetch_value_cache[:k].contiguous(),
-            block_table=fetch_bt,
-            seq_lens=fetch_sl,
-            max_seq_len=k * PAGE_TOKENS,
+            key_cache=main_key,
+            value_cache=main_value,
+            block_table=new_bt,
+            seq_lens=new_sl,
+            max_seq_len=new_seq_len,
         ))
 
     def restore_attn_metadata(self, layer_name: str):
@@ -1069,6 +1274,17 @@ class _Worker:
         for rid, rs in self._requests.items():
             for gidx in list(rs.active_group_buffers.keys()):
                 self._flush_group(rid, gidx, partial=True)
+            # Record how many groups were written for this chain, so future
+            # requests with the same prefix can find the stored context.
+            if rs.chain and rs.num_groups_written > 0:
+                self._record_stored_groups(rs.chain, rs.num_groups_written)
+                # Queue notification for the scheduler's global prefix index.
+                _stored_chain_queue.append(
+                    (list(rs.chain), rs.num_groups_written))
+                logger.info(
+                    "Recorded %d stored groups for chain len=%d",
+                    rs.num_groups_written, len(rs.chain),
+                )
         if not self._prefill_done:
             self._prefill_done = True
             logger.info("Prefill done. Switching to dense decode (no fetch buffer).")
@@ -1085,6 +1301,8 @@ class _Worker:
         attn_metadata: FlashAttentionMetadata with block_table, seq_lens, etc.
         """
         t0 = time.perf_counter()
+        logger.debug("extract_and_record: layer=%s kv_shape=%s", layer_name,
+                      tuple(kv_layer.shape) if hasattr(kv_layer, 'shape') else '?')
         if not self._requests or self._geom is None:
             return
 

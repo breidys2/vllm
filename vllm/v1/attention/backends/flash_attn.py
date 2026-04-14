@@ -879,7 +879,15 @@ class FlashAttentionImpl(AttentionImpl):
             key_cache = key_cache.view(dtype)
             value_cache = value_cache.view(dtype)
 
-        if not attn_metadata.use_cascade:
+        # ICMS Path B: if the connector set a fetch state, use the
+        # reordered block table regardless of cascade mode.  With
+        # get_num_new_matched_tokens, Q only has continuation tokens,
+        # so the causal offset is correct.
+        from vllm.v1.attention.icms_fetch_state import get_active as _icms_get
+        _icms_state = _icms_get()
+        _use_cascade = attn_metadata.use_cascade and _icms_state is None
+
+        if not _use_cascade:
             cu_seqlens_q = attn_metadata.query_start_loc
             seqused_k = attn_metadata.seq_lens
             max_seqlen_q = attn_metadata.max_query_len
@@ -888,12 +896,6 @@ class FlashAttentionImpl(AttentionImpl):
                            else attn_metadata.block_table)
             scheduler_metadata = attn_metadata.scheduler_metadata
 
-            # ICMS Path B: if the connector set a fetch state for this
-            # layer, use the separate k-page KV buffer instead of the
-            # main cache. This restricts attention to only the k selected
-            # pages with proper softmax normalization.
-            from vllm.v1.attention.icms_fetch_state import get_active as _icms_get
-            _icms_state = _icms_get()
             if _icms_state is not None:
                 key_cache = _icms_state.key_cache
                 value_cache = _icms_state.value_cache
