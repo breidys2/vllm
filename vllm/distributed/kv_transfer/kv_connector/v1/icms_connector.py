@@ -847,7 +847,8 @@ class _Worker:
         self.stats = IcmsTimingStats(level=stats_level, log_selections=log_selections)
 
         # Pending async score results (C9).
-        self._pending_scores: dict[str, Any] = {}  # layer_name → result
+        self._pending_scores: dict[str, Any] = {}  # layer_name → (reply, slot)
+        self._pending_reuse: dict[str, Any] = {}   # layer_name → (reply, sink_offsets)
         self._score_lock = threading.Lock()
 
         # Path B: GPU KV cache tensors + per-step attn_metadata for
@@ -883,16 +884,19 @@ class _Worker:
             head_dim=ack.head_dim,
             elem_bytes=ack.elem_bytes,
         )
-        # C8: pre-allocate sink with N slots.
-        slot_bytes = self._k * self._geom.kv_page_bytes
-        total_sink = slot_bytes * _SINK_SLOTS
+        # Sink sizing: stride layers × k pages × kv_page_bytes.
+        # One stride group's worth of KV fits in the sink at a time.
+        per_layer_bytes = self._k * self._geom.kv_page_bytes
+        total_sink = self._score_stride * per_layer_bytes
         sink = self._client.register_sink(total_sink)
-        self._sink_pool = _SinkSlotPool(sink, slot_bytes, _SINK_SLOTS)
+        self._sink_pool = _SinkSlotPool(sink, per_layer_bytes, _SINK_SLOTS)
+        self._sink_per_layer_bytes = per_layer_bytes
         logger.info(
             "IcmsConnector worker: connected to %s, model=%s, "
-            "sink=%d slots × %d B = %d B total, score_stride=%d",
+            "sink=%d layers × %d B/layer = %d B total, score_stride=%d",
             self._socket_path, self._model_name,
-            _SINK_SLOTS, slot_bytes, total_sink, self._score_stride,
+            self._score_stride, per_layer_bytes, total_sink,
+            self._score_stride,
         )
 
     def _get_stored_context_groups(self, chain: list[int]) -> int:
@@ -1002,10 +1006,25 @@ class _Worker:
         pass
 
     def on_layer_reuse(self, next_layer_idx, budget, stats):
-        """Single-layer-scoring reuse: reuse previous selection (C9 State 1)."""
-        # Score cache on the icms server handles this automatically —
-        # the Score call for this layer will hit the cache.
-        pass
+        """Reuse layer: KV already in sink from the stride group's Score call.
+
+        Reads the pre-filled KV from the sink at the pre-computed offsets
+        and stores as a pending score result. The wait_for_layer path
+        picks it up and populates the fetch buffer.
+        """
+        attn_layer_name = f"model.layers.{next_layer_idx}.self_attn.attn"
+        with self._score_lock:
+            reuse_data = self._pending_reuse.pop(attn_layer_name, None)
+        if reuse_data is None:
+            return
+        reply, reuse_offsets = reuse_data
+        # Build a lightweight reply-like object with the adjusted offsets.
+        # We reuse the original reply's page_ids/scores but with new offsets.
+        import copy
+        reuse_reply = copy.copy(reply)
+        reuse_reply.sink_offsets = reuse_offsets
+        with self._score_lock:
+            self._pending_scores[attn_layer_name] = (reuse_reply, None)
 
     def on_layer_score(self, next_layer_idx, quest_query, budget, stats,
                         connector_meta=None):
@@ -1094,7 +1113,16 @@ class _Worker:
         # we don't need per-request sink isolation. The score result is
         # just for measuring page selection accuracy.
         t_score_start = time.perf_counter()
-        logger.debug("Score: layer=%d chain_len=%d k=%d", next_layer_idx, len(rs.chain), k)
+        # Compute reuse range for this stride group.
+        num_layers = self._geom.num_layers if self._geom else 48
+        reuse_through = min(
+            next_layer_idx + self._score_stride - 1, num_layers - 1)
+
+        # Clear sink ready flags before writing a new stride group.
+        self._sink_pool.sink.clear_ready_flags()
+
+        logger.debug("Score: layer=%d reuse_through=%d chain_len=%d k=%d",
+                      next_layer_idx, reuse_through, len(rs.chain), k)
         try:
             reply = self._client.score(
                 request_id=icms_rid,
@@ -1103,6 +1131,7 @@ class _Worker:
                 query=q_np,
                 k=k,
                 sink=self._sink_pool.sink,
+                reuse_through_layer=reuse_through,
             )
             t_score_end = time.perf_counter()
             self.stats.record_score(
@@ -1112,11 +1141,24 @@ class _Worker:
                 next_layer_idx,
                 scores=list(reply.scores),
             )
-            # Key by the attention layer name format so wait_for_layer
-            # (called with "model.layers.N.self_attn.attn") can find it.
+
+            # Store the score result for the scored layer.
             attn_layer_name = f"model.layers.{next_layer_idx}.self_attn.attn"
             with self._score_lock:
                 self._pending_scores[attn_layer_name] = (reply, None)
+
+            # Store references for reuse layers so on_layer_reuse can read
+            # their KV from the pre-filled sink without another Score call.
+            # The sink layout is: [layer_0_pages | layer_1_pages | ...].
+            per_layer_bytes = self._sink_per_layer_bytes
+            for delta in range(1, reuse_through - next_layer_idx + 1):
+                reuse_layer = next_layer_idx + delta
+                reuse_attn = f"model.layers.{reuse_layer}.self_attn.attn"
+                # Build a synthetic reply with adjusted sink_offsets for this layer.
+                reuse_offsets = [off + delta * per_layer_bytes
+                                 for off in reply.sink_offsets]
+                with self._score_lock:
+                    self._pending_reuse[reuse_attn] = (reply, reuse_offsets)
         except Exception as e:
             t_score_end = time.perf_counter()
             self.stats.record_score(
