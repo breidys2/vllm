@@ -37,6 +37,7 @@ class IcmsFetchState:
     block_table: torch.Tensor     # [1, k_selected + n_cont_blocks]
     seq_lens: torch.Tensor        # [1] — selected_tokens + continuation_tokens
     max_seq_len: int
+    scheduler_metadata: torch.Tensor | None = None  # pre-computed FA3 scheduling
 
 
 _active: Optional[IcmsFetchState] = None

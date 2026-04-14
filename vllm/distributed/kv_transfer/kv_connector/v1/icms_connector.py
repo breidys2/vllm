@@ -357,11 +357,17 @@ class IcmsConnector(KVConnectorBase_V1):
         if role == KVConnectorRole.SCHEDULER:
             self._sched = _Scheduler(vllm_config)
         elif role == KVConnectorRole.WORKER:
+            # Extract num_q_heads from model config for FA3 scheduling.
+            num_q_heads = getattr(
+                getattr(vllm_config, "model_config", None),
+                "get_num_attention_heads", lambda _: 32)(
+                getattr(vllm_config, "parallel_config", None))
             self._worker = _Worker(
                 socket_path=self._socket_path,
                 model_name=self._model_name,
                 k=self._k,
                 score_stride=self._score_stride,
+                num_q_heads=num_q_heads,
                 stats_level=self._stats_level,
                 log_selections=self._log_selections,
                 adaptive_bandwidth=self._adaptive_bandwidth,
@@ -820,7 +826,7 @@ class _Worker:
     """Worker-side state. Owns IcmsClient, sink pool, per-request buffers."""
 
     def __init__(self, *, socket_path: str, model_name: str, k: int,
-                 score_stride: int = 6,
+                 score_stride: int = 6, num_q_heads: int = 32,
                  stats_level: int = 1, log_selections: bool = False,
                  adaptive_bandwidth: bool = False,
                  link_bandwidth_bps: float = 25e9 / 8,
@@ -828,6 +834,7 @@ class _Worker:
         self._socket_path = socket_path
         self._model_name = model_name
         self._k = k
+        self._num_q_heads = num_q_heads
         # Score stride: fresh Quest scoring every N layers.
         # stride=1 → per-layer scoring, stride=6 → strided, stride=48 → single
         self._score_stride = max(1, score_stride)
@@ -1184,6 +1191,9 @@ class _Worker:
                 reuse_through_layer=reuse_through,
             )
             t_score_end = time.perf_counter()
+            # Stash storage-side concurrent request count for adaptive budget.
+            rs._last_storage_concurrent = getattr(
+                reply, 'concurrent_requests', 0)
             self.stats.record_score(
                 (t_score_end - t_score_start) * 1e6,
                 reply.cache_hit,
@@ -1387,12 +1397,55 @@ class _Worker:
             layer_name, len(filled_blocks), context_pages,
             continuation_tokens, new_seq_len,
         )
+        # Pre-compute FA3 scheduler_metadata for the trimmed seq_lens.
+        # Must happen here (before forward) — get_scheduler_metadata is not
+        # reentrant and cannot be called from inside flash_attn's forward.
+        sched_meta = None
+        try:
+            from vllm.v1.attention.backends.fa_utils import (
+                get_flash_attn_version, get_scheduler_metadata,
+            )
+            if get_flash_attn_version() == 3:
+                cu_seqlens_q = am.query_start_loc
+                max_seqlen_q = am.max_query_len
+                # Q head count: infer from the KV cache shape. The cache
+                # stores [num_blocks, block_size, num_kv_heads, head_dim].
+                # Q heads aren't stored directly but we need them for FA3.
+                # Use the cached value from register_kv_caches if available,
+                # else infer from attn_metadata or model geometry.
+                num_q_heads_actual = getattr(self, '_num_q_heads', None)
+                if num_q_heads_actual is None:
+                    # Fallback: check if attn_metadata has it
+                    num_q_heads_actual = getattr(am, 'num_heads_q', None)
+                if num_q_heads_actual is None and geom is not None:
+                    # Last resort: assume GQA ratio from hf config
+                    num_q_heads_actual = geom.num_kv_heads * 8  # common GQA ratio
+                sched_meta = get_scheduler_metadata(
+                    batch_size=cu_seqlens_q.shape[0] - 1,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=new_seq_len,
+                    num_heads_q=num_q_heads_actual,
+                    num_heads_kv=geom.num_kv_heads,
+                    headdim=geom.head_dim,
+                    cache_seqlens=new_sl,
+                    qkv_dtype=main_key.dtype,
+                    cu_seqlens_q=cu_seqlens_q,
+                    page_size=PAGE_TOKENS,
+                    causal=True,
+                )
+        except Exception:
+            pass  # fall back to None (dynamic scheduling)
+
+        if sched_meta is not None:
+            logger.debug("Path B: FA3 scheduler_metadata precomputed shape=%s",
+                         sched_meta.shape)
         icms_fetch_state.set_active(icms_fetch_state.IcmsFetchState(
             key_cache=main_key,
             value_cache=main_value,
             block_table=new_bt,
             seq_lens=new_sl,
             max_seq_len=new_seq_len,
+            scheduler_metadata=sched_meta,
         ))
 
     def restore_attn_metadata(self, layer_name: str):

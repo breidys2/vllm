@@ -902,11 +902,14 @@ class FlashAttentionImpl(AttentionImpl):
                 block_table = _icms_state.block_table
                 seqused_k = _icms_state.seq_lens
                 max_seqlen_k = _icms_state.max_seq_len
-                # Clear scheduler_metadata — the pre-computed metadata was
-                # built for the original seq_lens and would cause FA3 to
-                # read beyond the trimmed block table.  With None, FA3
-                # schedules dynamically based on the actual seqused_k.
-                scheduler_metadata = None
+                # Recompute scheduler_metadata for the trimmed seq_lens.
+                # The pre-computed metadata was built for the original
+                # seq_lens and would cause FA3 to read beyond the trimmed
+                # block table.
+                # Use pre-computed scheduler_metadata from the fetch state
+                # (computed in _populate_fetch_buffer before the forward pass).
+                # Falls back to None (dynamic scheduling) if not available.
+                scheduler_metadata = _icms_state.scheduler_metadata
 
             descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
 

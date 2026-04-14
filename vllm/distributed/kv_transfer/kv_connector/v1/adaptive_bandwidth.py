@@ -156,7 +156,11 @@ class AdaptiveBandwidthAllocator:
             self._active.pop(request_id, None)
 
     def _compute_budget(self, demand: RequestDemand) -> float:
-        """Proportional bandwidth allocation → budget.
+        """Proportional bandwidth allocation → budget (compute side only).
+
+        The storage side manages its own contention internally — it throttles
+        KV writes based on its concurrent request load.  The compute side
+        only manages its own demand/supply.
 
         Must be called with self._lock held.
         """
