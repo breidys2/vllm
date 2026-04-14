@@ -488,6 +488,10 @@ class IcmsConnector(KVConnectorBase_V1):
     def get_finished(
         self, finished_req_ids: set[str],
     ) -> tuple[set[str] | None, set[str] | None]:
+        # Clean up worker-side request state for finished requests.
+        if self._worker is not None and finished_req_ids:
+            for rid in finished_req_ids:
+                self._worker.on_request_finished(rid)
         return None, None
 
     def shutdown(self):
@@ -525,6 +529,8 @@ class IcmsConnector(KVConnectorBase_V1):
     ) -> tuple[bool, dict[str, Any] | None]:
         if self._sched is not None:
             self._sched.on_finished(request.request_id)
+        if self._worker is not None:
+            self._worker.on_request_finished(request.request_id)
         return False, None
 
     # ══════════════════════════════════════════════════════════════════════
@@ -648,6 +654,15 @@ class _Scheduler:
         self._pending_chain_sends.add(rid)
 
     def build_meta(self, scheduler_output: SchedulerOutput) -> IcmsConnectorMetadata:
+        # Also drain worker notifications here (belt-and-suspenders with
+        # the drain in get_num_new_matched_tokens) to catch pushes that
+        # arrived between scheduling and metadata building.
+        global _stored_chain_queue
+        if _stored_chain_queue:
+            for chain, n_groups in _stored_chain_queue:
+                self.record_stored_chain(chain, n_groups)
+            _stored_chain_queue.clear()
+
         meta = IcmsConnectorMetadata()
         # Per-step scheduled token counts (req_id → num_tokens this step).
         sched_tokens = getattr(scheduler_output, "scheduled_num_tokens", {})
@@ -752,6 +767,10 @@ class _Scheduler:
 
         chain = self._chains[rid]
         matched_groups = self._lookup_stored_prefix(chain)
+        logger.debug(
+            "prefix_lookup: rid=%s chain_len=%d stored=%d matched=%d",
+            rid, len(chain), len(self._stored_chains), matched_groups,
+        )
         if matched_groups == 0:
             return 0, False
 
@@ -845,6 +864,7 @@ class _Worker:
         # After the first wait_for_save (end of prefill), _prefill_done=True
         # and all subsequent steps use dense attention (no fetch buffer).
         self._prefill_done: bool = False
+
 
         # Pending notifications for the scheduler (stored chain info).
         # Drained into IcmsConnectorMetadata by the facade.
@@ -1200,22 +1220,12 @@ class _Worker:
         context_tokens = context_pages * PAGE_TOKENS
         total_blocks = (seq_len + PAGE_TOKENS - 1) // PAGE_TOKENS
 
-        # The selected page_ids from the Score reply are indices into the
-        # context pages (0..context_pages-1). The block_table maps logical
-        # blocks to physical blocks. We need to ensure the selected blocks
-        # have valid KV data — currently they already do because Phase 1's
-        # prefix-cached KV is reused.
-        #
-        # Build a reordered block table containing ONLY the selected
-        # context blocks + continuation blocks.  Non-selected context blocks
-        # are excluded entirely — they don't appear in the block table, so
-        # FlashAttention never reads them.  This avoids the "zero K steals
-        # softmax mass" problem.
-        #
-        # This works because get_num_new_matched_tokens ensures Q only has
-        # continuation tokens, so the causal offset is correct:
-        #   offset = seqused_k - max_seqlen_q
-        #          = (k*PAGE_TOKENS + cont) - cont = k*PAGE_TOKENS
+        # ── Fetch selected pages' KV from ICMS sink → GPU blocks ──
+        # The Score call already wrote the winning pages' KV into the
+        # shared-memory sink.  We read from the sink, parse K||V, convert
+        # fp16→model dtype, and copy into the allocated GPU blocks.
+        # Then build a trimmed block table with only the filled blocks +
+        # continuation blocks.
         from vllm.v1.attention import icms_fetch_state
 
         selected = sorted(
@@ -1223,13 +1233,49 @@ class _Worker:
             if pid < context_pages
         )
         k = len(selected)
+        if k == 0:
+            return
 
-        # Build: [selected context blocks (sorted) | continuation blocks].
-        device = bt.device
-        new_entries = []
+        # Map page_id → sink offset for selected pages.
+        pid_to_sink_off = {}
+        for i, pid in enumerate(reply.page_ids):
+            if i < len(reply.sink_offsets):
+                pid_to_sink_off[pid] = reply.sink_offsets[i]
+
+        # Copy each selected page from sink → GPU block.
+        geom = self._geom
+        sink_view = self._sink_pool.sink.view()
+        kv_page_bytes = geom.kv_page_bytes
+        half_bytes = kv_page_bytes // 2  # K and V each
+        model_dtype = main_key.dtype
+        device = main_key.device
+        # Shape per page: [PAGE_TOKENS, num_kv_heads, head_dim] in fp16
+        page_shape = (PAGE_TOKENS, geom.num_kv_heads, geom.head_dim)
+
+        filled_blocks = []
         for pid in selected:
-            if pid < bt.shape[1]:
-                new_entries.append(int(bt[0, pid]))
+            sink_off = pid_to_sink_off.get(pid)
+            if sink_off is None or pid >= bt.shape[1]:
+                continue
+            phys_block = int(bt[0, pid])
+            if phys_block >= main_key.shape[0]:
+                continue
+
+            # Read K||V from sink shared memory.
+            raw = bytes(sink_view[sink_off:sink_off + kv_page_bytes])
+            k_np = np.frombuffer(raw[:half_bytes], dtype=np.float16).reshape(page_shape)
+            v_np = np.frombuffer(raw[half_bytes:], dtype=np.float16).reshape(page_shape)
+
+            # Convert to model dtype and copy to GPU.
+            k_t = torch.from_numpy(k_np.copy()).to(dtype=model_dtype, device=device)
+            v_t = torch.from_numpy(v_np.copy()).to(dtype=model_dtype, device=device)
+            main_key[phys_block].copy_(k_t)
+            main_value[phys_block].copy_(v_t)
+            filled_blocks.append(phys_block)
+
+        # Build trimmed block table: [filled context blocks | continuation].
+        bt_device = bt.device
+        new_entries = list(filled_blocks)
         for blk_idx in range(context_pages, total_blocks):
             if blk_idx < bt.shape[1]:
                 new_entries.append(int(bt[0, blk_idx]))
@@ -1238,16 +1284,16 @@ class _Worker:
             return
 
         continuation_tokens = max(0, seq_len - context_tokens)
-        new_seq_len = k * PAGE_TOKENS + continuation_tokens
+        new_seq_len = len(filled_blocks) * PAGE_TOKENS + continuation_tokens
 
-        new_bt = torch.tensor([new_entries], dtype=torch.int32, device=device)
-        new_sl = torch.tensor([new_seq_len], dtype=torch.int32, device=device)
+        new_bt = torch.tensor([new_entries], dtype=torch.int32, device=bt_device)
+        new_sl = torch.tensor([new_seq_len], dtype=torch.int32, device=bt_device)
 
         logger.debug(
-            "Path B: layer=%s selected %d/%d ctx pages, cont=%d, "
-            "new_seq_len=%d, entries=%d",
-            layer_name, k, context_pages, continuation_tokens,
-            new_seq_len, len(new_entries),
+            "Path B: layer=%s fetched %d/%d pages from sink, cont=%d, "
+            "new_seq_len=%d",
+            layer_name, len(filled_blocks), context_pages,
+            continuation_tokens, new_seq_len,
         )
         icms_fetch_state.set_active(icms_fetch_state.IcmsFetchState(
             key_cache=main_key,

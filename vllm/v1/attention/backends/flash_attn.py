@@ -883,8 +883,8 @@ class FlashAttentionImpl(AttentionImpl):
         # reordered block table regardless of cascade mode.  With
         # get_num_new_matched_tokens, Q only has continuation tokens,
         # so the causal offset is correct.
-        from vllm.v1.attention.icms_fetch_state import get_active as _icms_get
-        _icms_state = _icms_get()
+        from vllm.v1.attention import icms_fetch_state as _icms_mod
+        _icms_state = _icms_mod.get_active()
         _use_cascade = attn_metadata.use_cascade and _icms_state is None
 
         if not _use_cascade:
@@ -902,7 +902,11 @@ class FlashAttentionImpl(AttentionImpl):
                 block_table = _icms_state.block_table
                 seqused_k = _icms_state.seq_lens
                 max_seqlen_k = _icms_state.max_seq_len
-                scheduler_metadata = _icms_state.scheduler_metadata
+                # Clear scheduler_metadata — the pre-computed metadata was
+                # built for the original seq_lens and would cause FA3 to
+                # read beyond the trimmed block table.  With None, FA3
+                # schedules dynamically based on the actual seqused_k.
+                scheduler_metadata = None
 
             descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
 
