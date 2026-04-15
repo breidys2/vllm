@@ -879,13 +879,15 @@ class FlashAttentionImpl(AttentionImpl):
             key_cache = key_cache.view(dtype)
             value_cache = value_cache.view(dtype)
 
-        # ICMS Path B: selective attention is handled via in-place
-        # block_table and seq_lens modification by the connector's
-        # wait_for_layer / restore_attn_metadata methods.  No fetch
-        # state override needed — FlashAttention reads the modified
-        # block_table directly.
+        # ICMS Path B: check for fetch state override (selective attention).
+        # The connector sets icms_fetch_state before each layer's attention
+        # with a trimmed block_table containing only selected context pages
+        # + continuation blocks.
+        from vllm.v1.attention import icms_fetch_state as _icms_mod
+        _icms_state = _icms_mod.get_active()
+        _use_cascade = attn_metadata.use_cascade and _icms_state is None
 
-        if not attn_metadata.use_cascade:
+        if not _use_cascade:
             cu_seqlens_q = attn_metadata.query_start_loc
             seqused_k = attn_metadata.seq_lens
             max_seqlen_q = attn_metadata.max_query_len
@@ -893,6 +895,16 @@ class FlashAttentionImpl(AttentionImpl):
             block_table = (kivi_block_table if kivi_block_table is not None
                            else attn_metadata.block_table)
             scheduler_metadata = attn_metadata.scheduler_metadata
+
+            if _icms_state is not None:
+                key_cache = _icms_state.key_cache
+                value_cache = _icms_state.value_cache
+                block_table = _icms_state.block_table
+                seqused_k = _icms_state.seq_lens
+                max_seqlen_k = _icms_state.max_seq_len
+                # scheduler_metadata=None → FA3 dynamic scheduling.
+                # Benchmarked: no performance impact on H100 up to 64K.
+                scheduler_metadata = None
 
             descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
 

@@ -168,9 +168,12 @@ class IcmsTimingStats:
         self.score_page_ids: list[list[int]] = []
         self.score_layer_idx: list[int] = []
 
+        # ── Per-layer TTFT breakdown (level 2) ────────────────────────
+        # Per-layer timing for the selective attention path.
+        # Each entry: {layer, score_us, fetch_us, modify_us, total_us, k_pages}
+        self.layer_breakdown: list[dict] = []
+
         # ── Selection log (for A/B comparison) ───────────────────────
-        # Each entry: {"step": N, "layer": L, "page_ids": [...], "scores": [...], "cache_hit": bool}
-        # Enabled by log_selections=True; zero overhead when off.
         self.selections: list[dict] = []
         self._step_counter: int = 0
 
@@ -213,6 +216,20 @@ class IcmsTimingStats:
                 "cache_hit": cache_hit,
                 "k": len(page_ids),
             })
+
+    def record_layer_breakdown(self, layer: int, score_us: float,
+                               fetch_us: float, modify_us: float,
+                               total_us: float, k_pages: int):
+        if self.level < 2:
+            return
+        self.layer_breakdown.append({
+            "layer": layer,
+            "score_us": round(score_us, 1),
+            "fetch_us": round(fetch_us, 1),
+            "modify_us": round(modify_us, 1),
+            "total_us": round(total_us, 1),
+            "k_pages": k_pages,
+        })
 
     def advance_step(self):
         """Call at the start of each forward pass to increment the step counter."""
@@ -259,6 +276,7 @@ class IcmsTimingStats:
             result["extract_and_record"] = _percentiles(self.extract_and_record_us)
             result["flush_group"] = _percentiles(self.flush_group_us)
             result["score_roundtrip"] = _percentiles(self.score_roundtrip_us)
+            result["layer_breakdown"] = self.layer_breakdown
         return result
 
 
@@ -881,9 +899,6 @@ class _Worker:
         self._pending_reuse: dict[str, dict[str, tuple]] = {}
         self._score_lock = threading.Lock()
 
-        # Per-layer saved block_table rows for restoration after attention.
-        self._saved_bt_rows: dict[str, list[tuple[int, torch.Tensor, torch.Tensor]]] = {}
-
         # Path B: GPU KV cache tensors + per-step attn_metadata for
         # selective fetch + block table override.
         self._gpu_kv_caches: dict[str, torch.Tensor] = {}
@@ -1219,6 +1234,7 @@ class _Worker:
 
         logger.debug("Score: layer=%d reuse_through=%d chain_len=%d k=%d",
                       next_layer_idx, reuse_through, len(rs.chain), k)
+
         try:
             reply = self._client.score(
                 request_id=icms_rid,
@@ -1301,21 +1317,30 @@ class _Worker:
                 or self._attn_metadata is None):
             return
 
-        saved_rows = []
+        t_layer_start = time.perf_counter()
+        total_k_pages = 0
         for rid, (reply, req_idx) in per_request.items():
             if reply is None or not reply.page_ids:
                 continue
             try:
-                saved = self._apply_selective_attention(
+                self._apply_selective_attention(
                     layer_name, reply, req_idx, rid)
-                if saved:
-                    saved_rows.append(saved)
+                total_k_pages += len(reply.page_ids)
             except Exception as e:
                 logger.error("Path B: apply_selective FAILED for %s req=%s: %s",
                              layer_name, rid, e, exc_info=True)
 
-        if saved_rows:
-            self._saved_bt_rows[layer_name] = saved_rows
+        # Record per-layer breakdown for TTFT analysis.
+        t_layer_end = time.perf_counter()
+        layer_idx = self._extract_layer_idx(layer_name)
+        if layer_idx is not None:
+            self.stats.record_layer_breakdown(
+                layer=layer_idx, score_us=0.0,
+                fetch_us=(t_layer_end - t_layer_start) * 1e6,
+                modify_us=0.0,
+                total_us=(t_layer_end - t_layer_start) * 1e6,
+                k_pages=total_k_pages,
+            )
 
     def _apply_selective_attention(self, layer_name: str, reply,
                                    req_idx: int, rid: str = ""):
@@ -1400,8 +1425,8 @@ class _Worker:
             main_value[phys_block].copy_(v_t)
             filled_blocks.append(phys_block)
 
-        # ── Modify block_table row in-place ──
-        # Build trimmed entries: [filled context blocks | continuation blocks].
+        # ── Build trimmed block table ──
+        # [filled context blocks | continuation blocks]
         new_entries = list(filled_blocks)
         for blk_idx in range(context_pages, total_blocks):
             if blk_idx < bt.shape[1]:
@@ -1412,17 +1437,9 @@ class _Worker:
         continuation_tokens = max(0, seq_len - context_tokens)
         new_seq_len = len(filled_blocks) * PAGE_TOKENS + continuation_tokens
 
-        # Save originals before in-place modification.
-        orig_bt_row = bt[req_idx].clone()
-        orig_seq_len = am.seq_lens[req_idx].clone()
-
-        # Write trimmed entries into block_table row.
-        bt[req_idx, :len(new_entries)] = torch.tensor(
-            new_entries, dtype=bt.dtype, device=bt.device)
-        # Zero out remaining entries (safety).
-        if len(new_entries) < bt.shape[1]:
-            bt[req_idx, len(new_entries):] = 0
-        am.seq_lens[req_idx] = new_seq_len
+        bt_device = bt.device
+        new_bt = torch.tensor([new_entries], dtype=torch.int32, device=bt_device)
+        new_sl = torch.tensor([new_seq_len], dtype=torch.int32, device=bt_device)
 
         logger.debug(
             "Path B: layer=%s req_idx=%d fetched %d/%d pages, "
@@ -1430,19 +1447,34 @@ class _Worker:
             layer_name, req_idx, len(filled_blocks), context_pages,
             seq_len, new_seq_len,
         )
-        return (req_idx, orig_bt_row, orig_seq_len)
+
+        # Set fetch state for FlashAttention to read.
+        from vllm.v1.attention import icms_fetch_state
+        icms_fetch_state.set_active(icms_fetch_state.IcmsFetchState(
+            key_cache=main_key,
+            value_cache=main_value,
+            block_table=new_bt,
+            seq_lens=new_sl,
+            max_seq_len=new_seq_len,
+        ))
+        return True  # signal that fetch state was set
+
+    @staticmethod
+    def _extract_layer_idx(layer_name: str) -> int | None:
+        """Extract layer index from 'model.layers.N.self_attn.attn'."""
+        parts = layer_name.split(".")
+        for i, part in enumerate(parts):
+            if part == "layers" and i + 1 < len(parts):
+                try:
+                    return int(parts[i + 1])
+                except ValueError:
+                    pass
+        return None
 
     def restore_attn_metadata(self, layer_name: str):
-        """Restore original block_table rows after selective attention."""
-        saved = self._saved_bt_rows.pop(layer_name, None)
-        if not saved:
-            return
-        am = self._attn_metadata.get(layer_name) if isinstance(self._attn_metadata, dict) else None
-        if am is None or not hasattr(am, "block_table"):
-            return
-        for req_idx, orig_bt_row, orig_seq_len in saved:
-            am.block_table[req_idx] = orig_bt_row
-            am.seq_lens[req_idx] = orig_seq_len
+        """Clear the ICMS fetch state after attention ran with it."""
+        from vllm.v1.attention import icms_fetch_state
+        icms_fetch_state.clear()
 
     def wait_for_pending_writes(self):
         """Block until all buffered WriteGroups are flushed.

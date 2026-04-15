@@ -46,7 +46,10 @@ def maybe_transfer_kv_layer(func: Callable) -> Callable:
         if attn_metadata is None or not connector.has_connector_metadata():
             return func(*args, **kwargs)
 
-        # Wait for KV layer on entry
+        # Wait for KV layer on entry.
+        # Errors here must be loud — silent exceptions cause the forward
+        # pass to fail with an unhelpful 'execute_model_state is None'
+        # assertion in sample_tokens instead of the actual error.
         connector.wait_for_layer_load(layer_name)
 
         # Execute the function

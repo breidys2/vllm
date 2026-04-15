@@ -1068,12 +1068,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 slot_mapping=input_batch.slot_mappings,
             ):
                 self.kv_connector.pre_forward(scheduler_output)
-                hidden_states = self.model(
-                    input_ids=input_ids,
-                    positions=positions,
-                    inputs_embeds=inputs_embeds,
-                    intermediate_tensors=intermediate_tensors,
-                )
+                try:
+                    hidden_states = self.model(
+                        input_ids=input_ids,
+                        positions=positions,
+                        inputs_embeds=inputs_embeds,
+                        intermediate_tensors=intermediate_tensors,
+                    )
+                except Exception:
+                    # Log the actual exception before it gets swallowed
+                    # by vLLM's error handling and surfaces as an unhelpful
+                    # 'execute_model_state is None' in sample_tokens.
+                    logger.exception("Model forward pass failed")
+                    raise
 
         kv_connector_output = self.kv_connector.post_forward(scheduler_output)
 
