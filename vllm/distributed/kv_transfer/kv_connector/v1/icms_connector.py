@@ -27,6 +27,7 @@ Design decisions (from the walkthrough):
 
 from __future__ import annotations
 
+
 import os
 import sys
 import threading
@@ -465,8 +466,12 @@ class IcmsConnector(KVConnectorBase_V1):
         is_quest_call = (quest_query is not None
                          or quest_all_pages
                          or quest_reuse_selection)
+        # KV extraction (write to ICMS) is deferred when the context is
+        # already stored — no need to re-extract during selective read.
+        # This keeps the write path off the TTFT critical path.
         if (not is_quest_call
                 and self._worker is not None
+                and not self._worker._skip_extract
                 and kv_layer is not None
                 and kv_layer.numel() > 0
                 and attn_metadata is not None):
@@ -503,7 +508,8 @@ class IcmsConnector(KVConnectorBase_V1):
                     attn_name = f"model.layers.{cur_layer}.self_attn.attn"
                     kv = self._worker._gpu_kv_caches.get(attn_name)
                     am = self._worker._attn_metadata.get(attn_name) if isinstance(self._worker._attn_metadata, dict) else None
-                    if kv is not None and kv.ndim == 5 and am is not None:
+                    if (kv is not None and kv.ndim == 5 and am is not None
+                            and not self._worker._skip_extract):
                         self._worker.extract_and_record(attn_name, kv, am)
 
             if not self._worker._prefill_done:
@@ -914,6 +920,12 @@ class _Worker:
         # and all subsequent steps use dense attention (no fetch buffer).
         self._prefill_done: bool = False
 
+        # Skip KV extraction when reading from ICMS (Phase 2).
+        # The context is already stored — no need to re-extract on the
+        # critical TTFT path.  Set in on_step_start when stored chains
+        # exist for the incoming request.
+        self._skip_extract: bool = False
+
 
         # Pending notifications for the scheduler (stored chain info).
         # Drained into IcmsConnectorMetadata by the facade.
@@ -1023,6 +1035,15 @@ class _Worker:
         # Reset prefill_done when a new request arrives (new chain delivered).
         if meta.new_chains:
             self._prefill_done = False
+
+        # Check if incoming requests have stored context in ICMS.
+        # If so, skip KV extraction during the forward pass (read-only mode)
+        # to keep the write path off the TTFT critical path.
+        self._skip_extract = False
+        for rid, chain in meta.new_chains.items():
+            if self._get_stored_context_groups(chain) > 0:
+                self._skip_extract = True
+                break
         for rid, chain in meta.new_chains.items():
             rs = self._requests.setdefault(rid, _RequestState(request_id=rid))
             rs.chain = chain
