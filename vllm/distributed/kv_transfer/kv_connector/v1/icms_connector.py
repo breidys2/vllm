@@ -2,8 +2,9 @@
 """ICMS storage service KV connector for vLLM v1.
 
 Standalone connector (does NOT inherit from OffloadingConnector) that routes
-Quest scoring and KV storage through a unix-socket icms_client talking to a
-separate `icms_server` process. See:
+Quest scoring and KV storage through icms_client talking to a separate
+`icms_server` process. Supports both Unix socket (local) and RDMA (remote)
+transport. See:
 
   - docs/icms_storage_service_design.md
   - docs/icms_connector_integration_walkthrough.md  (C1–C10 locked designs)
@@ -72,6 +73,14 @@ from icms_client.geometry import (                           # noqa: E402
     GROUP_PAGES, PAGE_TOKENS, ModelGeometry, find_model,
 )
 from icms_client.sink import Sink, allocate_sink             # noqa: E402
+
+# RDMA client (optional — pyverbs must be installed).
+try:
+    from icms_client.rdma_client import RdmaIcmsClient       # noqa: E402
+    from icms_client.rdma_transport import RdmaTransportConfig  # noqa: E402
+    _HAVE_RDMA = True
+except ImportError:
+    _HAVE_RDMA = False
 
 # ─── constants ───────────────────────────────────────────────────────────
 _SINK_SLOTS = 4           # C8: number of pre-allocated sink slots
@@ -370,6 +379,12 @@ class IcmsConnector(KVConnectorBase_V1):
             "link_bandwidth_bps", 25e9 / 8))  # default 25 Gbps (BF2)
         self._compute_slack_table: str = extra.get("compute_slack_table", "")
 
+        # RDMA transport (replaces Unix socket + POSIX shmem).
+        self._use_rdma: bool = bool(extra.get("icms_rdma", False))
+        self._rdma_server_host: str = extra.get("icms_server_host", "sprc01")
+        self._rdma_port: int = int(extra.get("icms_rdma_port", 18515))
+        self._rdma_ib_dev: str = extra.get("icms_ib_dev", "mlx5_0")
+
         self._sched: _Scheduler | None = None
         self._worker: _Worker | None = None
 
@@ -392,6 +407,10 @@ class IcmsConnector(KVConnectorBase_V1):
                 adaptive_bandwidth=self._adaptive_bandwidth,
                 link_bandwidth_bps=self._link_bandwidth_bps,
                 compute_slack_table=self._compute_slack_table,
+                use_rdma=self._use_rdma,
+                rdma_server_host=self._rdma_server_host,
+                rdma_port=self._rdma_port,
+                rdma_ib_dev=self._rdma_ib_dev,
             )
 
     # ══════════════════════════════════════════════════════════════════════
@@ -854,8 +873,16 @@ class _Worker:
                  stats_level: int = 1, log_selections: bool = False,
                  adaptive_bandwidth: bool = False,
                  link_bandwidth_bps: float = 25e9 / 8,
-                 compute_slack_table: str = ""):
+                 compute_slack_table: str = "",
+                 use_rdma: bool = False,
+                 rdma_server_host: str = "sprc01",
+                 rdma_port: int = 18515,
+                 rdma_ib_dev: str = "mlx5_0"):
         self._socket_path = socket_path
+        self._use_rdma = use_rdma
+        self._rdma_server_host = rdma_server_host
+        self._rdma_port = rdma_port
+        self._rdma_ib_dev = rdma_ib_dev
         self._model_name = model_name
         self._k = k
         self._num_q_heads = num_q_heads
@@ -934,7 +961,23 @@ class _Worker:
         self._connect()
 
     def _connect(self):
-        self._client = IcmsClient(self._socket_path)
+        if self._use_rdma:
+            if not _HAVE_RDMA:
+                raise ImportError(
+                    "icms_rdma=True but pyverbs is not installed. "
+                    "Install python3-pyverbs (apt) or pyverbs (pip)."
+                )
+            cfg = RdmaTransportConfig(
+                server_host=self._rdma_server_host,
+                tcp_port=self._rdma_port,
+                ib_dev_name=self._rdma_ib_dev,
+            )
+            self._client = RdmaIcmsClient(cfg)
+            transport_desc = f"rdma://{self._rdma_server_host}:{self._rdma_port}"
+        else:
+            self._client = IcmsClient(self._socket_path)
+            transport_desc = self._socket_path
+
         self._client.connect()
         ack = self._client.hello(self._model_name)
         self._geom = find_model(self._model_name) or ModelGeometry(
@@ -958,7 +1001,7 @@ class _Worker:
         logger.info(
             "IcmsConnector worker: connected to %s, model=%s, "
             "sink=%d layers × %d B/layer = %d B total, score_stride=%d",
-            self._socket_path, self._model_name,
+            transport_desc, self._model_name,
             self._score_stride, per_layer_bytes, total_sink,
             self._score_stride,
         )
