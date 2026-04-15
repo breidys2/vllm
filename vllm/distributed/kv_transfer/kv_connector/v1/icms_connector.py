@@ -384,6 +384,9 @@ class IcmsConnector(KVConnectorBase_V1):
         self._rdma_server_host: str = extra.get("icms_server_host", "sprc01")
         self._rdma_port: int = int(extra.get("icms_rdma_port", 18515))
         self._rdma_ib_dev: str = extra.get("icms_ib_dev", "mlx5_0")
+        # GPUDirect RDMA: server writes KV directly into GPU HBM.
+        self._gpu_direct: bool = bool(extra.get("icms_gpu_direct", False))
+        self._gpu_device: str = extra.get("icms_gpu_device", "cuda:0")
 
         self._sched: _Scheduler | None = None
         self._worker: _Worker | None = None
@@ -411,6 +414,8 @@ class IcmsConnector(KVConnectorBase_V1):
                 rdma_server_host=self._rdma_server_host,
                 rdma_port=self._rdma_port,
                 rdma_ib_dev=self._rdma_ib_dev,
+                gpu_direct=self._gpu_direct,
+                gpu_device=self._gpu_device,
             )
 
     # ══════════════════════════════════════════════════════════════════════
@@ -877,12 +882,16 @@ class _Worker:
                  use_rdma: bool = False,
                  rdma_server_host: str = "sprc01",
                  rdma_port: int = 18515,
-                 rdma_ib_dev: str = "mlx5_0"):
+                 rdma_ib_dev: str = "mlx5_0",
+                 gpu_direct: bool = False,
+                 gpu_device: str = "cuda:0"):
         self._socket_path = socket_path
         self._use_rdma = use_rdma
         self._rdma_server_host = rdma_server_host
         self._rdma_port = rdma_port
         self._rdma_ib_dev = rdma_ib_dev
+        self._gpu_direct = gpu_direct
+        self._gpu_device = gpu_device
         self._model_name = model_name
         self._k = k
         self._num_q_heads = num_q_heads
@@ -995,13 +1004,18 @@ class _Worker:
         # One stride group's worth of KV fits in the sink at a time.
         per_layer_bytes = self._k * self._geom.kv_page_bytes
         total_sink = self._score_stride * per_layer_bytes
-        sink = self._client.register_sink(total_sink)
+        if self._gpu_direct and self._use_rdma:
+            sink = self._client.register_gpu_sink(total_sink, self._gpu_device)
+            sink_desc = f"gpu_direct({self._gpu_device})"
+        else:
+            sink = self._client.register_sink(total_sink)
+            sink_desc = "host"
         self._sink_pool = _SinkSlotPool(sink, per_layer_bytes, _SINK_SLOTS)
         self._sink_per_layer_bytes = per_layer_bytes
         logger.info(
             "IcmsConnector worker: connected to %s, model=%s, "
-            "sink=%d layers × %d B/layer = %d B total, score_stride=%d",
-            transport_desc, self._model_name,
+            "sink=%s %d layers × %d B/layer = %d B total, score_stride=%d",
+            transport_desc, self._model_name, sink_desc,
             self._score_stride, per_layer_bytes, total_sink,
             self._score_stride,
         )
@@ -1465,12 +1479,13 @@ class _Worker:
                 pid_to_sink_off[pid] = reply.sink_offsets[i]
 
         geom = self._geom
-        sink_view = self._sink_pool.sink.view()
+        sink = self._sink_pool.sink
         kv_page_bytes = geom.kv_page_bytes
         half_bytes = kv_page_bytes // 2
         model_dtype = main_key.dtype
         device = main_key.device
         page_shape = (PAGE_TOKENS, geom.num_kv_heads, geom.head_dim)
+        gpu_direct = getattr(sink, 'is_gpu_direct', False)
 
         filled_blocks = []
         for pid in selected:
@@ -1480,11 +1495,21 @@ class _Worker:
             phys_block = int(bt[req_idx, pid])
             if phys_block >= main_key.shape[0]:
                 continue
-            raw = bytes(sink_view[sink_off:sink_off + kv_page_bytes])
-            k_np = np.frombuffer(raw[:half_bytes], dtype=np.float16).reshape(page_shape)
-            v_np = np.frombuffer(raw[half_bytes:], dtype=np.float16).reshape(page_shape)
-            k_t = torch.from_numpy(k_np.copy()).to(dtype=model_dtype, device=device)
-            v_t = torch.from_numpy(v_np.copy()).to(dtype=model_dtype, device=device)
+            if gpu_direct:
+                # GPUDirect: data already in GPU HBM — zero-copy view.
+                raw = sink.gpu_view(sink_off, kv_page_bytes)
+                k_t = raw[:half_bytes].view(torch.float16).reshape(
+                    page_shape).to(dtype=model_dtype)
+                v_t = raw[half_bytes:].view(torch.float16).reshape(
+                    page_shape).to(dtype=model_dtype)
+            else:
+                # Host sink: copy via numpy → torch → GPU.
+                sink_view = sink.view()
+                raw = bytes(sink_view[sink_off:sink_off + kv_page_bytes])
+                k_np = np.frombuffer(raw[:half_bytes], dtype=np.float16).reshape(page_shape)
+                v_np = np.frombuffer(raw[half_bytes:], dtype=np.float16).reshape(page_shape)
+                k_t = torch.from_numpy(k_np.copy()).to(dtype=model_dtype, device=device)
+                v_t = torch.from_numpy(v_np.copy()).to(dtype=model_dtype, device=device)
             main_key[phys_block].copy_(k_t)
             main_value[phys_block].copy_(v_t)
             filled_blocks.append(phys_block)
