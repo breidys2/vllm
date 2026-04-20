@@ -341,9 +341,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 try:
                     from vllm.v1.kv_offload.quest import QuestOffloadingSpec
                     connector_worker = getattr(
-                        getattr(kv_connector_ref, "connector_worker", None),
-                        None, None,
-                    ) or getattr(kv_connector_ref, "connector_worker", None)
+                        kv_connector_ref, "connector_worker", None)
                     spec = getattr(connector_worker, "spec", None)
                     if isinstance(spec, QuestOffloadingSpec):
                         allocator = spec.get_adaptive_allocator()

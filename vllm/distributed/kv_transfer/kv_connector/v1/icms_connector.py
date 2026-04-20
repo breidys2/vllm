@@ -301,6 +301,7 @@ class _RequestState:
     block_ids: list[int] = field(default_factory=list)    # in-order CPU block IDs
     num_groups_written: int = 0                            # groups fully flushed to icms
     active_group_buffers: dict[int, _GroupBuffer] = field(default_factory=dict)  # group_idx → buf
+    stored_groups: int = 0  # groups already in ICMS under this chain prefix (dedup-aware skip)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -498,27 +499,22 @@ class IcmsConnector(KVConnectorBase_V1):
         quest_all_pages = kwargs.get("quest_all_pages", False)
         quest_reuse_selection = kwargs.get("quest_reuse_selection", False)
 
-        # Standard save_kv_layer: extract per-block K summaries and populate
-        # the icms group buffers (C2 write path). Only when kv_layer has
-        # actual data (not from Quest hooks which pass empty tensors).
+        # KV extraction is deferred OFF the forward-pass critical path:
+        # save_kv_layer no longer calls extract_and_record inline. The
+        # actual GPU→CPU copy + summary compute + buffer fill runs in a
+        # batch at end-of-forward-pass in wait_for_pending_writes.
         is_quest_call = (quest_query is not None
                          or quest_all_pages
                          or quest_reuse_selection)
-        # KV extraction (write to ICMS) is deferred when the context is
-        # already stored — no need to re-extract during selective read.
-        # This keeps the write path off the TTFT critical path.
-        if (not is_quest_call
-                and self._worker is not None
-                and not self._worker._skip_extract
-                and kv_layer is not None
-                and kv_layer.numel() > 0
-                and attn_metadata is not None):
-            self._worker.extract_and_record(layer_name, kv_layer, attn_metadata)
 
         if quest_all_pages:
-            # Budget >= 1.0: transfer all pages. For icms this means "no
-            # sparse selection needed" — skip scoring entirely.
-            self._worker.on_layer_all_pages(next_layer_idx, budget, quest_stats)
+            # Budget >= 1.0: fetch every stored page via kFetchAll — server
+            # skips scoring and streams every page under the chain prefix
+            # into the sink.
+            self._worker.on_layer_all_pages(
+                next_layer_idx, budget, quest_stats,
+                connector_meta=self._connector_metadata,
+            )
             return
 
         if quest_reuse_selection:
@@ -528,28 +524,8 @@ class IcmsConnector(KVConnectorBase_V1):
             return
 
         if quest_query is not None and next_layer_idx is not None:
-            # With the V2 model runner, the standard save_kv_layer (with
-            # kv_layer data) doesn't fire — only Quest hooks do. So we
-            # extract K/V from the stashed GPU KV caches here instead.
-            if (self._worker is not None
-                    and not self._worker._prefill_done
-                    and self._worker._gpu_kv_caches
-                    and self._worker._attn_metadata is not None):
-                # Map quest hook's layer_name ("layer_N") to attention
-                # layer name ("model.layers.N.self_attn.attn") for the
-                # CURRENT layer (not next_layer_idx — we extract K/V
-                # for the layer that just completed, using its index
-                # from the layer_name).
-                parts = layer_name.split("_")
-                if len(parts) == 2 and parts[1].isdigit():
-                    cur_layer = int(parts[1])
-                    attn_name = f"model.layers.{cur_layer}.self_attn.attn"
-                    kv = self._worker._gpu_kv_caches.get(attn_name)
-                    am = self._worker._attn_metadata.get(attn_name) if isinstance(self._worker._attn_metadata, dict) else None
-                    if (kv is not None and kv.ndim == 5 and am is not None
-                            and not self._worker._skip_extract):
-                        self._worker.extract_and_record(attn_name, kv, am)
-
+            # Extraction is deferred to wait_for_pending_writes; save_kv
+            # only needs to drive scoring here.
             if not self._worker._prefill_done:
                 self._worker.on_layer_score(
                     next_layer_idx, quest_query, budget, quest_stats,
@@ -1042,6 +1018,8 @@ class _Worker:
         stored by a prior request with the same prefix.
         """
         best = 0
+        best_src_len = 0
+        best_src_n = 0
         for stored_chain, n_groups in self._stored_chain_groups:
             match_len = 0
             for a, b in zip(chain, stored_chain):
@@ -1049,8 +1027,22 @@ class _Worker:
                     match_len += 1
                 else:
                     break
-            if match_len > 0:
-                best = max(best, min(n_groups, match_len))
+            if match_len > 0 and match_len >= best:
+                candidate = min(n_groups, match_len)
+                if candidate > best:
+                    best = candidate
+                    best_src_len = len(stored_chain)
+                    best_src_n = n_groups
+        if not hasattr(self, "_diag_get_stored_count"):
+            self._diag_get_stored_count = 0
+        if self._diag_get_stored_count < 20:
+            logger.info(
+                "[diag-match] chain_len=%d stored_entries=%d match_best=%d "
+                "(from entry len=%d n_groups=%d)",
+                len(chain), len(self._stored_chain_groups),
+                best, best_src_len, best_src_n,
+            )
+            self._diag_get_stored_count += 1
         return best
 
     def _record_stored_groups(self, chain: list[int], n_groups: int):
@@ -1107,14 +1099,17 @@ class _Worker:
         if meta.new_chains:
             self._prefill_done = False
 
-        # Check if incoming requests have stored context in ICMS.
-        # If so, skip KV extraction during the forward pass (read-only mode)
-        # to keep the write path off the TTFT critical path.
+        # Dedup-aware extraction: skip blocks that already live in a
+        # group covered by a previously-stored chain prefix. Saves the
+        # GPU→CPU copy + summary cost for the stored portion, while
+        # still extracting the novel suffix. _skip_extract is kept for
+        # the (now rare) case where the caller wants to force fully
+        # off; default False.
         self._skip_extract = False
         for rid, chain in meta.new_chains.items():
-            if self._get_stored_context_groups(chain) > 0:
-                self._skip_extract = True
-                break
+            n_stored = self._get_stored_context_groups(chain)
+            rs = self._requests.setdefault(rid, _RequestState(request_id=rid))
+            rs.stored_groups = n_stored
         for rid, chain in meta.new_chains.items():
             rs = self._requests.setdefault(rid, _RequestState(request_id=rid))
             rs.chain = chain
@@ -1142,12 +1137,142 @@ class _Worker:
 
     # ─── layer hooks (from save_kv_layer kwargs) ─────────────────────────
 
-    def on_layer_all_pages(self, next_layer_idx, budget, stats):
-        """Budget >= 1.0: no sparse selection. Transfer all pages."""
-        # For icms this means: don't score, just ensure all pages are written.
-        # The actual transfer of all pages is handled by the standard offload
-        # path — icms is only involved when scoring is needed.
-        pass
+    def on_layer_all_pages(self, next_layer_idx, budget, stats,
+                            connector_meta=None):
+        """Budget >= 1.0: fetch every stored page via kFetchAll (no scoring)."""
+        try:
+            self._on_layer_all_pages_impl(
+                next_layer_idx, budget, stats, connector_meta)
+        except Exception:
+            logger.exception("on_layer_all_pages FAILED for layer %d",
+                             next_layer_idx)
+
+    def _on_layer_all_pages_impl(self, next_layer_idx, budget, stats,
+                                  connector_meta=None):
+        # Build request list in batch order (mirrors _on_layer_score_impl).
+        requests_to_fetch = []
+        if (connector_meta is not None
+                and isinstance(connector_meta, IcmsConnectorMetadata)
+                and connector_meta.requests):
+            for req_idx, step_req in enumerate(connector_meta.requests):
+                rid = step_req.request_id
+                rs = self._requests.get(rid)
+                if rs is None:
+                    chain = connector_meta.new_chains.get(rid, [])
+                    if not chain:
+                        chain = self._last_chain_for_rid.get(rid, [])
+                    if chain:
+                        rs = _RequestState(request_id=rid, chain=chain)
+                        self._requests[rid] = rs
+                if rs is not None and rs.chain:
+                    requests_to_fetch.append((req_idx, rid, rs))
+        if not requests_to_fetch:
+            for req_idx, (rid, rs) in enumerate(self._requests.items()):
+                if rs.chain:
+                    requests_to_fetch.append((req_idx, rid, rs))
+        if not requests_to_fetch:
+            return
+
+        for req_idx, rid, rs in requests_to_fetch:
+            self._fetch_all_one_request(
+                rid, rs, req_idx, next_layer_idx, budget, stats)
+
+    def _fetch_all_one_request(self, rid, rs, req_idx, next_layer_idx,
+                                budget, stats):
+        """FetchAll path: one RPC per request that covers ALL layers.
+
+        Budget=1.0 means the caller wants every page for every layer. No
+        scoring, no adaptive budget, no per-stride-group budget change —
+        so there's nothing to recompute at layer 6/12/18/… Issuing a
+        single FetchAll(reuse_through_layer=num_layers-1) lets the
+        server stream the full 48-layer KV in one job and eliminates
+        the 7 additional sync round-trips per forward pass.
+
+        Subsequent scoring-boundary calls for the same request promote
+        pre-populated _pending_reuse[layer] entries into _pending_scores
+        (same pattern as on_layer_reuse).
+        """
+        num_layers = self._geom.num_layers if self._geom else 48
+        attn_layer_name = f"model.layers.{next_layer_idx}.self_attn.attn"
+
+        # Fast path: earlier scoring boundary already issued the single
+        # full-request FetchAll. Just promote pre-populated reuse entry
+        # into pending_scores for this layer.
+        if getattr(rs, "_fetch_all_complete", False):
+            import copy
+            with self._score_lock:
+                reuse_entry = self._pending_reuse.get(
+                    attn_layer_name, {}).pop(rid, None)
+            if reuse_entry is None:
+                logger.debug(
+                    "fetch_all promote: no _pending_reuse for rid=%s layer=%d",
+                    rid, next_layer_idx)
+                return
+            reply, reuse_offsets = reuse_entry
+            promoted = copy.copy(reply)
+            promoted.sink_offsets = reuse_offsets
+            with self._score_lock:
+                self._pending_scores.setdefault(attn_layer_name, {})[rid] = (
+                    promoted, req_idx)
+            return
+
+        # Slow path: first scoring boundary for this request — issue
+        # the single full-request FetchAll covering every layer.
+        icms_rid = self._icms_request_id(rid, 0)
+        stored_groups = self._get_stored_context_groups(rs.chain)
+        effective_groups = max(rs.num_groups_written, stored_groups)
+        total_pages = effective_groups * _GROUP_BLOCKS
+
+        if not getattr(rs, "_budget_logged", False):
+            logger.info(
+                "icms_budget rid=%s layer=%d src=fetch_all budget=%.3f k=%d "
+                "total_pages=%d",
+                rid, next_layer_idx, budget, total_pages, total_pages,
+            )
+            rs._budget_logged = True
+
+        reuse_through = num_layers - 1
+
+        self._sink_pool.sink.clear_ready_flags()
+
+        t_start = time.perf_counter()
+        try:
+            reply = self._client.fetch_all(
+                request_id=icms_rid,
+                chain=rs.chain,
+                layer=next_layer_idx,
+                sink=self._sink_pool.sink,
+                reuse_through_layer=reuse_through,
+            )
+            t_end = time.perf_counter()
+            rs._last_storage_concurrent = getattr(
+                reply, 'concurrent_requests', 0)
+            self.stats.record_score(
+                (t_end - t_start) * 1e6,
+                reply.cache_hit,
+                list(reply.page_ids),
+                next_layer_idx,
+                scores=list(reply.scores),
+            )
+            with self._score_lock:
+                self._pending_scores.setdefault(attn_layer_name, {})[rid] = (
+                    reply, req_idx)
+            per_layer_bytes = self._sink_per_layer_bytes
+            for delta in range(1, reuse_through - next_layer_idx + 1):
+                reuse_layer = next_layer_idx + delta
+                reuse_attn = f"model.layers.{reuse_layer}.self_attn.attn"
+                reuse_offsets = [off + delta * per_layer_bytes
+                                 for off in reply.sink_offsets]
+                with self._score_lock:
+                    self._pending_reuse.setdefault(reuse_attn, {})[rid] = (
+                        reply, reuse_offsets)
+            rs._fetch_all_complete = True
+        except Exception as e:
+            t_end = time.perf_counter()
+            self.stats.record_score(
+                (t_end - t_start) * 1e6, False, [], next_layer_idx,
+            )
+            logger.debug("fetch_all failed layer %d: %s", next_layer_idx, e)
 
     def on_layer_reuse(self, next_layer_idx, budget, stats):
         """Reuse layer: KV already in sink from the stride group's Score call.
@@ -1266,6 +1391,7 @@ class _Worker:
 
         # Determine effective budget: adaptive allocator or static.
         effective_budget = budget
+        budget_source = "static"
         if self._adaptive_allocator is not None and total_pages > 0:
             # First layer of the request: register. Subsequent: recompute.
             if not hasattr(rs, '_adaptive_registered') or not rs._adaptive_registered:
@@ -1282,11 +1408,28 @@ class _Worker:
                     rid, new_tokens=new_tokens, cache_tokens=cache_tokens,
                     total_cache_pages=total_pages)
                 rs._adaptive_registered = True
+                budget_source = "adaptive-new"
             else:
                 effective_budget = self._adaptive_allocator.get_budget(rid)
+                budget_source = "adaptive-cached"
 
         k = max(1, int(total_pages * effective_budget)) if total_pages > 0 else 1
         k = min(k, self._k)
+        # Log the chosen budget on the first scoring call of each request
+        # so perf scripts can recover it without waiting for the
+        # end-of-run stats dump (which is only written on connector
+        # shutdown). Scoring fires every score_stride layers starting at
+        # layer score_stride, so the first trigger is next_layer_idx ==
+        # score_stride. We also always log an "adaptive-new" decision
+        # since that's the interesting per-request event.
+        if budget_source == "adaptive-new" or not getattr(rs, "_budget_logged", False):
+            logger.info(
+                "icms_budget rid=%s layer=%d src=%s budget=%.3f k=%d "
+                "total_pages=%d",
+                rid, next_layer_idx, budget_source, effective_budget,
+                k, total_pages,
+            )
+            rs._budget_logged = True
 
         # Marshal query to fp32 numpy, mean-pooling Q heads per KV-head
         # group for GQA (matching QuestPageSelector.compute_page_scores).
@@ -1586,34 +1729,66 @@ class _Worker:
         icms_fetch_state.clear()
 
     def wait_for_pending_writes(self):
-        """Block until all buffered WriteGroups are flushed.
+        """Drain the deferred-write path at the end of a forward pass.
 
-        Partial-group flushes during a running request would dedup-hit on
-        the server (the group's chain-prefix already exists from the first
-        partial flush), so any subsequently-recorded pages would be lost.
-        To get correct write-through of prefill + decode, we defer partial
-        flushes to ``on_request_finished`` — by then the partial group has
-        its final page count and the server's first write is correct.
+        All write-path work (extract_and_record + write_group flushes) is
+        deferred here from save_kv_layer so the forward pass itself
+        doesn't pay the GPU→CPU copy + RDMA round-trip cost inline per
+        layer. Flow:
 
-        Full groups auto-flush via ``record_page`` / ``is_complete``.
-        Also marks prefill as done — subsequent steps use dense decode.
+          1. For each active request, walk all layers we have a KV
+             cache reference for, extract new (non-stored) blocks into
+             the group buffers.
+          2. Flush any now-complete group buffers as full groups.
+          3. Push num_groups_written to the stored-prefix index so
+             future requests can skip extraction for this prefix.
+
+        Partial (last) groups are still flushed in on_request_finished
+        — that path runs after first-token emission and is off the TTFT
+        critical path.
         """
-        if logger.isEnabledFor(10):
-            n_reqs = len(self._requests)
-            n_bufs = sum(len(rs.active_group_buffers) for rs in self._requests.values())
-            logger.debug("wait_for_pending_writes: %d reqs, %d buffers", n_reqs, n_bufs)
+        # ─── 1. Batch extraction (moved off the save_kv_layer critical
+        #       path). Only runs if we have the per-layer refs and
+        #       attention metadata stashed by start_load_kv.
+        if (self._gpu_kv_caches and self._attn_metadata is not None
+                and self._requests and not self._skip_extract):
+            if logger.isEnabledFor(20):
+                logger.debug(
+                    "wait_for_pending_writes: batch-extracting %d layers",
+                    len(self._gpu_kv_caches))
+            for layer_name, kv in self._gpu_kv_caches.items():
+                if kv is None or kv.ndim != 5:
+                    continue
+                if isinstance(self._attn_metadata, dict):
+                    am = self._attn_metadata.get(layer_name)
+                else:
+                    am = self._attn_metadata
+                if am is None:
+                    continue
+                try:
+                    self.extract_and_record(layer_name, kv, am)
+                except Exception:
+                    logger.exception(
+                        "wait_for_pending_writes: extract_and_record "
+                        "failed for layer=%s", layer_name)
+
+        # ─── 2. Flush all now-complete group buffers as full groups.
         for rid, rs in self._requests.items():
-            # Record how many groups were written for this chain, so future
-            # requests with the same prefix can find the stored context.
+            for gidx in sorted(rs.active_group_buffers.keys()):
+                buf = rs.active_group_buffers.get(gidx)
+                if buf is None:
+                    continue
+                if buf.is_complete():
+                    self._flush_group(rid, gidx, partial=False)
+
+        # ─── 3. Push stored-prefix entries so subsequent requests can
+        #       skip extraction for the matched prefix.
+        for rid, rs in self._requests.items():
             if rs.chain and rs.num_groups_written > 0:
                 self._record_stored_groups(rs.chain, rs.num_groups_written)
-                # Queue notification for the scheduler's global prefix index.
                 _stored_chain_queue.append(
                     (list(rs.chain), rs.num_groups_written))
-                logger.debug(
-                    "Recorded %d stored groups for chain len=%d",
-                    rs.num_groups_written, len(rs.chain),
-                )
+
         if not self._prefill_done:
             self._prefill_done = True
             logger.info("Prefill done. Switching to dense decode.")
@@ -1698,10 +1873,24 @@ class _Worker:
         if not hasattr(rs, '_recorded_blocks'):
             rs._recorded_blocks = {}
         already_recorded = rs._recorded_blocks.get(recorded_key, 0)
-        if already_recorded >= len(req_block_ids):
-            return  # nothing new
 
-        new_ids = req_block_ids[already_recorded:]
+        # Dedup-aware skip: blocks in groups already stored under the
+        # request's chain prefix don't need re-extraction. The server
+        # would dedup the write anyway, but the GPU→CPU copy + summary
+        # compute are wasted client-side work on the critical path.
+        stored_blocks = rs.stored_groups * _GROUP_BLOCKS
+        effective_start = max(already_recorded, stored_blocks)
+        if effective_start > already_recorded:
+            # Advance num_groups_written so later _flush_group calls and
+            # the stored-prefix push correctly reflect "stored + new".
+            if rs.stored_groups > rs.num_groups_written:
+                rs.num_groups_written = rs.stored_groups
+
+        if effective_start >= len(req_block_ids):
+            rs._recorded_blocks[recorded_key] = len(req_block_ids)
+            return  # everything we'd process is already stored
+
+        new_ids = req_block_ids[effective_start:]
         valid_ids = [bid for bid in new_ids if 0 <= bid < k_cache.shape[0]]
         if not valid_ids:
             rs._recorded_blocks[recorded_key] = len(req_block_ids)
@@ -1712,7 +1901,7 @@ class _Worker:
         k_batch = k_cache[idx_tensor].cpu()  # [N, block_size, num_kv_heads, head_dim]
         v_batch = v_cache[idx_tensor].cpu()
 
-        for i, intra_idx in enumerate(range(already_recorded, already_recorded + len(valid_ids))):
+        for i, intra_idx in enumerate(range(effective_start, effective_start + len(valid_ids))):
             self.record_page(rid, intra_idx, layer_idx, k_batch[i], v_batch[i])
 
         rs._recorded_blocks[recorded_key] = len(req_block_ids)
@@ -1784,10 +1973,11 @@ class _Worker:
         buf.summary_blob[s_off:s_off + len(summary_bytes)] = summary_bytes
         buf.kv_blob[k_off:k_off + len(kv_bytes)] = kv_bytes
         buf.filled.add((layer_idx, page_in_group))
-
-        # Flush if complete.
-        if buf.is_complete():
-            self._flush_group(request_id, group_idx, partial=False)
+        # NOTE: no inline flush on completion. Flushing is deferred to
+        # wait_for_pending_writes (called at the end of each forward
+        # pass by vLLM) so that write_group RPCs and the extraction
+        # work don't stall per-layer save_kv_layer calls during the
+        # prefill forward pass.
 
     def _flush_group(self, request_id: str, group_idx: int, partial: bool = False):
         """Issue WriteGroup for a completed (or partial) group buffer."""
@@ -1802,8 +1992,10 @@ class _Worker:
             return
         pages = _GROUP_BLOCKS if not partial else len({p for (_, p) in buf.filled})
         phase = "decode" if self._prefill_done else "prefill"
-        logger.debug("flush_group: group=%d pages=%d partial=%s phase=%s",
-                     group_idx, pages, partial, phase)
+        logger.info("[diag-flush] group=%d pages=%d partial=%s phase=%s "
+                    "chain_len=%d num_groups_written(pre)=%d",
+                    group_idx, pages, partial, phase,
+                    len(chain_prefix), rs.num_groups_written)
         t0 = time.perf_counter()
         try:
             self._client.write_group(
@@ -1838,6 +2030,14 @@ class _Worker:
             self._record_stored_groups(rs.chain, rs.num_groups_written)
             _stored_chain_queue.append(
                 (list(rs.chain), rs.num_groups_written))
+            logger.info("[diag-finish] rid=%s chain_len=%d num_groups_written=%d "
+                        "pushed to stored-prefix index",
+                        request_id, len(rs.chain), rs.num_groups_written)
+        else:
+            logger.info("[diag-finish] rid=%s chain_len=%d num_groups_written=%d "
+                        "(NOT pushed — chain empty or no groups)",
+                        request_id, len(rs.chain) if rs.chain else 0,
+                        rs.num_groups_written)
         # Now pop the request state and reset prefill_done.
         self._requests.pop(request_id, None)
         self._prefill_done = False
