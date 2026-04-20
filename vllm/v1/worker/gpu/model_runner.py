@@ -273,7 +273,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
-        # Register Quest hooks if Quest offloading is active.
+        # Register Quest hooks if Quest offloading is active. Requires the
+        # V2 runner (this file) — VLLM_USE_V2_MODEL_RUNNER=1.
         self._maybe_register_quest_hooks()
 
         # Attention groups are not supported.

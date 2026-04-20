@@ -388,6 +388,20 @@ class IcmsConnector(KVConnectorBase_V1):
         self._gpu_direct: bool = bool(extra.get("icms_gpu_direct", False))
         self._gpu_device: str = extra.get("icms_gpu_device", "cuda:0")
 
+        # ICMS is designed as an external KV backing store: turn-end drop
+        # is the intended default, and cross-turn prefix hits are served
+        # by get_num_new_matched_tokens + Path B. If vLLM's in-process
+        # prefix caching is also on, it races ICMS for the same prefix
+        # match and wins by default (HBM hit before scheduler asks the
+        # connector), which means the ICMS fetch path never fires.
+        cache_cfg = getattr(vllm_config, "cache_config", None)
+        if cache_cfg is not None and getattr(cache_cfg, "enable_prefix_caching", False):
+            logger.warning(
+                "IcmsConnector: vLLM prefix caching is enabled. ICMS expects "
+                "drop-between-turns as the default; prefix caching will hide "
+                "cross-turn ICMS fetches. Pass enable_prefix_caching=False to "
+                "the LLM constructor when using ICMS.")
+
         self._sched: _Scheduler | None = None
         self._worker: _Worker | None = None
 
@@ -1334,6 +1348,12 @@ class _Worker:
                 next_layer_idx,
                 scores=list(reply.scores),
             )
+            if logger.isEnabledFor(10) and reply.page_ids:
+                logger.debug(
+                    "score layer=%d rid=%s chain_len=%d k=%d top_pages=%s",
+                    next_layer_idx, rid, len(rs.chain), k,
+                    list(reply.page_ids)[:8],
+                )
 
             # Store the score result keyed by (layer, request_id).
             attn_layer_name = f"model.layers.{next_layer_idx}.self_attn.attn"
@@ -1568,6 +1588,14 @@ class _Worker:
     def wait_for_pending_writes(self):
         """Block until all buffered WriteGroups are flushed.
 
+        Partial-group flushes during a running request would dedup-hit on
+        the server (the group's chain-prefix already exists from the first
+        partial flush), so any subsequently-recorded pages would be lost.
+        To get correct write-through of prefill + decode, we defer partial
+        flushes to ``on_request_finished`` — by then the partial group has
+        its final page count and the server's first write is correct.
+
+        Full groups auto-flush via ``record_page`` / ``is_complete``.
         Also marks prefill as done — subsequent steps use dense decode.
         """
         if logger.isEnabledFor(10):
@@ -1575,8 +1603,6 @@ class _Worker:
             n_bufs = sum(len(rs.active_group_buffers) for rs in self._requests.values())
             logger.debug("wait_for_pending_writes: %d reqs, %d buffers", n_reqs, n_bufs)
         for rid, rs in self._requests.items():
-            for gidx in list(rs.active_group_buffers.keys()):
-                self._flush_group(rid, gidx, partial=True)
             # Record how many groups were written for this chain, so future
             # requests with the same prefix can find the stored context.
             if rs.chain and rs.num_groups_written > 0:
@@ -1584,13 +1610,13 @@ class _Worker:
                 # Queue notification for the scheduler's global prefix index.
                 _stored_chain_queue.append(
                     (list(rs.chain), rs.num_groups_written))
-                logger.info(
+                logger.debug(
                     "Recorded %d stored groups for chain len=%d",
                     rs.num_groups_written, len(rs.chain),
                 )
         if not self._prefill_done:
             self._prefill_done = True
-            logger.info("Prefill done. Switching to dense decode (no fetch buffer).")
+            logger.info("Prefill done. Switching to dense decode.")
 
     # ─── KV extraction from GPU paged buffer (C2 write path) ────────────
 
@@ -1775,7 +1801,9 @@ class _Worker:
         if not chain_prefix:
             return
         pages = _GROUP_BLOCKS if not partial else len({p for (_, p) in buf.filled})
-        logger.debug("flush_group: group=%d pages=%d", group_idx, pages)
+        phase = "decode" if self._prefill_done else "prefill"
+        logger.debug("flush_group: group=%d pages=%d partial=%s phase=%s",
+                     group_idx, pages, partial, phase)
         t0 = time.perf_counter()
         try:
             self._client.write_group(
@@ -1794,14 +1822,25 @@ class _Worker:
     # ─── request lifecycle ───────────────────────────────────────────────
 
     def on_request_finished(self, request_id: str):
-        rs = self._requests.pop(request_id, None)
+        rs = self._requests.get(request_id)
         if rs is None:
             return
-        # Reset prefill_done for the next request.
-        self._prefill_done = False
-        # Flush any partial group buffers.
+        # Flush any partial group buffers first (must happen BEFORE we
+        # pop rs, since _flush_group re-reads self._requests[rid]).
         for gidx in list(rs.active_group_buffers.keys()):
             self._flush_group(request_id, gidx, partial=True)
+        # Push the final group-count to the scheduler's prefix index so
+        # a subsequent request with the same prefix can skip prefill.
+        # wait_for_pending_writes is NOT called after on_request_finished,
+        # so the last partial group's contribution to num_groups_written
+        # would otherwise be lost.
+        if rs.chain and rs.num_groups_written > 0:
+            self._record_stored_groups(rs.chain, rs.num_groups_written)
+            _stored_chain_queue.append(
+                (list(rs.chain), rs.num_groups_written))
+        # Now pop the request state and reset prefill_done.
+        self._requests.pop(request_id, None)
+        self._prefill_done = False
         # KV data is NOT evicted — it persists for prefix reuse by
         # subsequent requests. Eviction is managed by the server's LRU
         # when capacity is full.
