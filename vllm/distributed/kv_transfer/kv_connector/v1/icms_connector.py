@@ -70,8 +70,9 @@ _ensure_icms_client_on_path()
 
 from icms_client import IcmsClient                          # noqa: E402
 from icms_client.geometry import (                           # noqa: E402
-    GROUP_PAGES, PAGE_TOKENS, ModelGeometry, find_model,
+    GROUP_PAGES, PAGE_TOKENS, ModelGeometry, find_model, parse_scored_layers,
 )
+import dataclasses as _dataclasses                            # noqa: E402
 from icms_client.sink import Sink, allocate_sink             # noqa: E402
 
 # RDMA client (optional — pyverbs must be installed).
@@ -986,6 +987,15 @@ class _Worker:
             head_dim=ack.head_dim,
             elem_bytes=ack.elem_bytes,
         )
+        # Apply scored-layers mask from env. Must match the server's
+        # --scored-layers flag; when unset, mask=0 = "all layers scored".
+        _scored_spec = os.environ.get("ICMS_SCORED_LAYERS", "")
+        _scored_mask = parse_scored_layers(_scored_spec)
+        if _scored_mask != 0:
+            self._geom = _dataclasses.replace(self._geom,
+                                               scored_layers_mask=_scored_mask)
+            logger.info("[icms] scored_layers mask=0x%x popcount=%d",
+                         _scored_mask, self._geom.num_scored_layers)
         # Update allocator with actual kv_page_bytes from model geometry.
         if self._adaptive_allocator is not None:
             self._adaptive_allocator._kv_page_bytes = self._geom.kv_page_bytes
@@ -994,8 +1004,14 @@ class _Worker:
         # One stride group's worth of KV fits in the sink at a time.
         per_layer_bytes = self._k * self._geom.kv_page_bytes
         total_sink = self._score_stride * per_layer_bytes
+        # Allocate a per-layer ready-flag sink (one u32 per model layer)
+        # alongside the main KV sink. The server flips slots via small
+        # RDMA writes and the connector polls them to overlap compute
+        # with remaining layer transfers.
+        flag_slots = int(self._geom.num_layers)
         if self._gpu_direct and self._use_rdma:
-            sink = self._client.register_gpu_sink(total_sink, self._gpu_device)
+            sink = self._client.register_gpu_sink(
+                total_sink, self._gpu_device, flag_slots=flag_slots)
             sink_desc = f"gpu_direct({self._gpu_device})"
         else:
             sink = self._client.register_sink(total_sink)
@@ -1123,15 +1139,17 @@ class _Worker:
                 self._fire_preload(rid, chain)
 
     def _fire_preload(self, request_id: str, chain: list[int]):
-        """C9 speculative preload: Score with key_dim=0 → preload summaries."""
+        """Fire a one-way summary preload on the scheduler thread.
+
+        Sends a preload frame and returns immediately — no client-side
+        wait. The server populates its DRAM cache for this request_id
+        while the forward pass starts on the GPU. The first real Score
+        on the same connection is FIFO-ordered behind the preload on
+        the reactor, so it's guaranteed to hit the cache.
+        """
         try:
             icms_rid = self._icms_request_id(request_id, 0)
-            q_empty = np.zeros(0, dtype=np.float32)
-            # Score with key_dim=0 signals preload-only.
-            self._client.score(
-                request_id=icms_rid, chain=chain, layer=0,
-                query=q_empty, k=self._k, sink=self._sink_pool.sink,
-            )
+            self._client.preload(request_id=icms_rid, chain=chain)
         except Exception as e:
             logger.debug("preload failed for %s: %s", request_id, e)
 
@@ -1243,10 +1261,26 @@ class _Worker:
                 layer=next_layer_idx,
                 sink=self._sink_pool.sink,
                 reuse_through_layer=reuse_through,
+                # Force sync-mode so sink_write_ns / server_ingest_ns
+                # reflect the full Phase-2 cost (not reply-early 0s).
+                use_flags=False,
             )
             t_end = time.perf_counter()
             rs._last_storage_concurrent = getattr(
                 reply, 'concurrent_requests', 0)
+            # Diagnostic: surface the server-reported timing breakdown
+            # so we can see where time goes in the I/O path.
+            logger.info(
+                "[icms-fetch-timing] rid=%s layer=%d chain=%d k=%d "
+                "wall=%.1fms server_total=%.1fms sink_write=%.1fms "
+                "(data_per_fwd=%.1fMB)",
+                rid, next_layer_idx, len(rs.chain), len(reply.page_ids),
+                (t_end - t_start) * 1e3,
+                reply.server_ingest_to_ready_ns / 1e6,
+                reply.sink_write_ns / 1e6,
+                len(reply.page_ids) * self._geom.kv_page_bytes
+                * (reuse_through - next_layer_idx + 1) / (1 << 20),
+            )
             self.stats.record_score(
                 (t_end - t_start) * 1e6,
                 reply.cache_hit,
@@ -1257,7 +1291,12 @@ class _Worker:
             with self._score_lock:
                 self._pending_scores.setdefault(attn_layer_name, {})[rid] = (
                     reply, req_idx)
-            per_layer_bytes = self._sink_per_layer_bytes
+            # Reply-specific per-layer stride: server packs sink as
+            # k*kv_page_bytes per layer (NOT self._k — that's just the
+            # cap used to size the sink). Using self._k here would send
+            # reuse offsets past the server's actual layer-delta stride.
+            actual_k = len(reply.page_ids)
+            per_layer_bytes = actual_k * self._geom.kv_page_bytes
             for delta in range(1, reuse_through - next_layer_idx + 1):
                 reuse_layer = next_layer_idx + delta
                 reuse_attn = f"model.layers.{reuse_layer}.self_attn.attn"
@@ -1376,13 +1415,12 @@ class _Worker:
         # (first request), Score returns empty winners and no fetch
         # buffer is populated — attention falls back to full GPU KV.
 
-        # NOTE: The server's score cache is currently bypassed (adaptive
-        # bandwidth allocation requires fresh scoring per stride group since
-        # the budget may change).  The stride-group-based request_id is kept
-        # for when the cache is re-enabled; it ensures fresh scores at stride
-        # boundaries while allowing reuse within a group.
-        stride_group = next_layer_idx // self._score_stride
-        icms_rid = self._icms_request_id(rid, stride_group)
+        # All layers of a prefill share one icms request_id so the
+        # server-side per-request DRAM summary cache (populated by
+        # preload) is reused across every Score. The stride-group
+        # namespacing that previously lived here was for the bypassed
+        # score cache only.
+        icms_rid = self._icms_request_id(rid, 0)
         # Use stored context groups (from prior requests with same prefix)
         # if the current request hasn't written anything yet.
         stored_groups = self._get_stored_context_groups(rs.chain)
@@ -1479,8 +1517,21 @@ class _Worker:
                 k=k,
                 sink=self._sink_pool.sink,
                 reuse_through_layer=reuse_through,
+                # TODO(overlap): Score reply-early currently races with
+                # Phase-2 writes on the shared QP and crashes the server
+                # on the first Config C request. Force sync for now;
+                # re-enable once the reactor/worker send path is
+                # serialized.
+                use_flags=False,
             )
             t_score_end = time.perf_counter()
+            # Sync mode: by the time score() returns, all layers in
+            # [layer, reuse_through] have landed in the sink. Mark their
+            # flags ready so wait_for_layer's spin-wait is a no-op.
+            sink = self._sink_pool.sink
+            if getattr(sink, "flag_count", 0) > 0:
+                for L in range(next_layer_idx, reuse_through + 1):
+                    sink.set_layer_ready(L)
             # Stash storage-side concurrent request count for adaptive budget.
             rs._last_storage_concurrent = getattr(
                 reply, 'concurrent_requests', 0)
@@ -1504,8 +1555,12 @@ class _Worker:
                 self._pending_scores.setdefault(attn_layer_name, {})[rid] = (
                     reply, req_idx)
 
-            # Store references for reuse layers.
-            per_layer_bytes = self._sink_per_layer_bytes
+            # Store references for reuse layers. Server's per-layer
+            # stride is actual_k*kv_page_bytes (NOT self._k — that's
+            # the sink cap). Using self._k here would overshoot the
+            # server's layer-delta offsets by a large factor.
+            actual_k = len(reply.page_ids)
+            per_layer_bytes = actual_k * self._geom.kv_page_bytes
             for delta in range(1, reuse_through - next_layer_idx + 1):
                 reuse_layer = next_layer_idx + delta
                 reuse_attn = f"model.layers.{reuse_layer}.self_attn.attn"
@@ -1559,6 +1614,26 @@ class _Worker:
             return
 
         t_layer_start = time.perf_counter()
+
+        # Spin-wait for the layer's KV to land (reply-early overlap mode).
+        # If the sink doesn't expose ready flags, is_layer_ready returns
+        # True and this is a no-op.
+        abs_layer = self._extract_layer_idx(layer_name)
+        if (abs_layer is not None
+                and self._sink_pool is not None
+                and getattr(self._sink_pool.sink, "flag_count", 0) > 0):
+            sink = self._sink_pool.sink
+            if not sink.is_layer_ready(abs_layer):
+                # Poll with exponential backoff starting at 0 (pure spin)
+                # — writes land within ~100µs so spin is right. Cap total
+                # wait at 5s to avoid hangs if something goes wrong.
+                deadline = t_layer_start + 5.0
+                while not sink.is_layer_ready(abs_layer):
+                    if time.perf_counter() > deadline:
+                        logger.warning(
+                            "wait_for_layer: flag timeout for layer=%d", abs_layer)
+                        break
+
         total_k_pages = 0
         for rid, (reply, req_idx) in per_request.items():
             if reply is None or not reply.page_ids:
@@ -1943,8 +2018,10 @@ class _Worker:
         group_idx, page_in_group = divmod(intra_request_block_idx, _GROUP_BLOCKS)
         buf = rs.active_group_buffers.get(group_idx)
         if buf is None:
+            # Summary region is packed by scored_rank; size accordingly.
             buf = _GroupBuffer(
-                summary_blob=bytearray(geom.num_layers * geom.summary_group_bytes),
+                summary_blob=bytearray(
+                    geom.num_scored_layers * geom.summary_group_bytes),
                 kv_blob=bytearray(geom.num_layers * geom.kv_group_bytes),
                 filled=set(),
                 num_layers=geom.num_layers,
@@ -1952,26 +2029,29 @@ class _Worker:
             )
             rs.active_group_buffers[group_idx] = buf
 
-        # Summary: compute per-page channel-wise min/max from K (C2/C4).
-        keys = key_block.to(dtype=torch.float32, device="cpu")
-        if keys.ndim == 3:
-            keys = keys.reshape(keys.shape[0], -1)  # [block_size, key_dim]
-        kmin = keys.min(dim=0).values.to(torch.float16)
-        kmax = keys.max(dim=0).values.to(torch.float16)
-        summary_bytes = kmin.numpy().tobytes() + kmax.numpy().tobytes()
-
-        # KV: K || V byte concatenation (C4).
+        # KV: K || V byte concatenation (C4). Always stored (every layer).
         k_bytes = key_block.to(torch.float16).contiguous().numpy().tobytes()
         v_bytes = value_block.to(torch.float16).contiguous().numpy().tobytes()
         kv_bytes = k_bytes + v_bytes
 
-        # Write into buffer at the correct offset.
         spb = geom.summary_page_bytes
         kpb = geom.kv_page_bytes
-        s_off = layer_idx * geom.summary_group_bytes + page_in_group * spb
         k_off = layer_idx * geom.kv_group_bytes + page_in_group * kpb
-        buf.summary_blob[s_off:s_off + len(summary_bytes)] = summary_bytes
         buf.kv_blob[k_off:k_off + len(kv_bytes)] = kv_bytes
+
+        # Summary: only compute + store for scored layers. Non-scored layers
+        # have no on-disk summary slot.
+        if geom.is_scored(layer_idx):
+            keys = key_block.to(dtype=torch.float32, device="cpu")
+            if keys.ndim == 3:
+                keys = keys.reshape(keys.shape[0], -1)  # [block_size, key_dim]
+            kmin = keys.min(dim=0).values.to(torch.float16)
+            kmax = keys.max(dim=0).values.to(torch.float16)
+            summary_bytes = kmin.numpy().tobytes() + kmax.numpy().tobytes()
+            rank = geom.scored_rank(layer_idx)
+            s_off = rank * geom.summary_group_bytes + page_in_group * spb
+            buf.summary_blob[s_off:s_off + len(summary_bytes)] = summary_bytes
+
         buf.filled.add((layer_idx, page_in_group))
         # NOTE: no inline flush on completion. Flushing is deferred to
         # wait_for_pending_writes (called at the end of each forward

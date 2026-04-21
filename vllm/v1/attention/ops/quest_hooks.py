@@ -76,12 +76,15 @@ class QuestHookManager:
         self._layernorm_weights: dict[int, tuple[torch.Tensor, float]] = {}
         # layer_idx -> Q weight matrix [q_size, hidden_size]
         self._q_proj_weights: dict[int, torch.Tensor] = {}
+        # layer_idx -> rotary embedding module (for post-rope Q)
+        self._rotary_embs: dict[int, nn.Module] = {}
 
         # Per-step state: layer_idx -> selected page indices
         self._current_selections: dict[int, torch.Tensor] = {}
 
         self._active = False
         self._num_heads: int | None = None
+        self._num_kv_heads: int | None = None
         self._head_dim: int | None = None
 
     def register_hooks(
@@ -210,6 +213,7 @@ class QuestHookManager:
             # Determine Q size from attention config
             num_heads = getattr(self_attn, "num_heads", None)
             head_dim = getattr(self_attn, "head_dim", None)
+            num_kv_heads = getattr(self_attn, "num_kv_heads", None)
 
             if num_heads is None or head_dim is None:
                 continue
@@ -217,6 +221,7 @@ class QuestHookManager:
             if self._num_heads is None:
                 self._num_heads = num_heads
                 self._head_dim = head_dim
+                self._num_kv_heads = num_kv_heads
 
             q_size = num_heads * head_dim
             # Q portion is the first q_size rows of the fused QKV weight
@@ -224,13 +229,21 @@ class QuestHookManager:
                 qkv_weight.data[:q_size, :]
             )
 
+            # Cache rotary embedding module so captured Q is post-rope,
+            # matching the K cache the attention kernel scores against.
+            rotary_emb = getattr(self_attn, "rotary_emb", None)
+            if rotary_emb is not None:
+                self._rotary_embs[layer_idx] = rotary_emb
+
         logger.info(
             "Extracted Quest Q weights for %d/%d layers "
-            "(num_heads=%s, head_dim=%s)",
+            "(num_heads=%s, num_kv_heads=%s, head_dim=%s, rotary_embs=%d)",
             len(self._q_proj_weights),
             self.num_layers,
             self._num_heads,
+            self._num_kv_heads,
             self._head_dim,
+            len(self._rotary_embs),
         )
 
     # -- Core hook logic -----------------------------------------------------
@@ -280,6 +293,14 @@ class QuestHookManager:
 
         if residual is None:
             return
+
+        # Extract positions from the layer's forward input.
+        # LlamaDecoderLayer.forward(positions, hidden_states, residual).
+        positions: torch.Tensor | None = None
+        if isinstance(input, tuple) and len(input) >= 1:
+            first = input[0]
+            if isinstance(first, torch.Tensor):
+                positions = first
 
         # Compute budget for this layer
         budget = self.budget_computer.compute_budget(
@@ -332,7 +353,7 @@ class QuestHookManager:
         if self.stats is not None:
             self.stats.begin_q_compute(next_layer_idx)
 
-        query = self._compute_exact_q(residual, next_layer_idx)
+        query = self._compute_exact_q(residual, next_layer_idx, positions)
 
         if self.stats is not None:
             self.stats.end_q_compute(next_layer_idx)
@@ -389,18 +410,24 @@ class QuestHookManager:
         self,
         residual: torch.Tensor,
         next_layer_idx: int,
+        positions: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         """Compute exact Q_{L+1} from the residual stream.
 
         Steps:
         1. Apply RMSNorm using layer L+1's layernorm weights.
         2. Project through layer L+1's Q weight matrix.
-        3. Reshape to [B, num_heads, head_dim].
+        3. Apply rotary position embedding so Q matches the
+           post-rope K that the attention kernel scores against.
+        4. Reshape to [B, num_heads, head_dim].
 
         Args:
             residual: Post-layer residual, shape [B, hidden_size] or
                 [num_tokens, hidden_size].
             next_layer_idx: Index of the next layer.
+            positions: Per-token positions for rotary embedding
+                (shape [num_tokens]). If None, RoPE is skipped and the
+                returned Q is pre-rope (legacy behavior).
 
         Returns:
             Q tensor of shape [B, num_heads, head_dim], or None on error.
@@ -421,6 +448,25 @@ class QuestHookManager:
         # Q projection: [B, hidden_size] @ [q_size, hidden_size]^T
         # -> [B, q_size]
         q = h_normed @ q_w.t()
+
+        # Apply rotary embedding so the captured Q is post-rope, aligned
+        # with the K cache. The attention path does rope in-place on the
+        # flat [num_tokens, q_size] tensor; mirror that here.
+        rotary_emb = self._rotary_embs.get(next_layer_idx)
+        if (
+            rotary_emb is not None
+            and positions is not None
+            and self._num_kv_heads is not None
+            and self._head_dim is not None
+        ):
+            q = q.contiguous()
+            k_dummy = torch.empty(
+                q.shape[0],
+                self._num_kv_heads * self._head_dim,
+                dtype=q.dtype,
+                device=q.device,
+            )
+            q, _ = rotary_emb(positions, q, k_dummy)
 
         # Reshape to [B, num_heads, head_dim]
         if self._num_heads is not None and self._head_dim is not None:
