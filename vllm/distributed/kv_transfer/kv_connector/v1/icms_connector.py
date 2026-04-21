@@ -70,7 +70,8 @@ _ensure_icms_client_on_path()
 
 from icms_client import IcmsClient                          # noqa: E402
 from icms_client.geometry import (                           # noqa: E402
-    GROUP_PAGES, PAGE_TOKENS, ModelGeometry, find_model, parse_scored_layers,
+    GROUP_PAGES, PAGE_TOKENS, KvLayout, ModelGeometry, find_model,
+    parse_scored_layers,
 )
 import dataclasses as _dataclasses                            # noqa: E402
 from icms_client.sink import Sink, allocate_sink             # noqa: E402
@@ -996,6 +997,14 @@ class _Worker:
                                                scored_layers_mask=_scored_mask)
             logger.info("[icms] scored_layers mask=0x%x popcount=%d",
                          _scored_mask, self._geom.num_scored_layers)
+        # KV on-disk layout from env. Must match server --kv-layout.
+        _kv_layout_str = os.environ.get("ICMS_KV_LAYOUT", "layer-major").lower()
+        if _kv_layout_str in ("page-major", "page_major", "page"):
+            self._geom = _dataclasses.replace(self._geom,
+                                               kv_layout=KvLayout.PAGE_MAJOR)
+            logger.info("[icms] kv_layout=page-major")
+        else:
+            logger.info("[icms] kv_layout=layer-major")
         # Update allocator with actual kv_page_bytes from model geometry.
         if self._adaptive_allocator is not None:
             self._adaptive_allocator._kv_page_bytes = self._geom.kv_page_bytes
@@ -2036,7 +2045,14 @@ class _Worker:
 
         spb = geom.summary_page_bytes
         kpb = geom.kv_page_bytes
-        k_off = layer_idx * geom.kv_group_bytes + page_in_group * kpb
+        # Byte offset within buf.kv_blob for (layer_idx, page_in_group).
+        # Must mirror the server's kv_offset() — both sides agree via
+        # the kv_layout config. Offsets here are relative to the start
+        # of the KV region (buf.kv_blob does not include summaries).
+        if geom.kv_layout == KvLayout.LAYER_MAJOR:
+            k_off = layer_idx * geom.kv_group_bytes + page_in_group * kpb
+        else:  # PAGE_MAJOR
+            k_off = page_in_group * geom.num_layers * kpb + layer_idx * kpb
         buf.kv_blob[k_off:k_off + len(kv_bytes)] = kv_bytes
 
         # Summary: only compute + store for scored layers. Non-scored layers
