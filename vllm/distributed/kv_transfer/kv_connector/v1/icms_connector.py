@@ -30,6 +30,7 @@ from __future__ import annotations
 
 
 import os
+import queue as _queue
 import sys
 import threading
 import time
@@ -335,6 +336,84 @@ class _SinkSlotPool:
 
     def offset_for_slot(self, slot: int) -> int:
         return slot * self.slot_bytes
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Deferred write pipeline
+# ═══════════════════════════════════════════════════════════════════════════
+
+class _WritePipeline:
+    """Background worker that runs extract + flush off the TTFT critical path.
+
+    wait_for_pending_writes used to do the GPU→CPU copies, numpy
+    conversion, summary min/max, bytearray fills, and WriteGroup RPCs
+    all synchronously — which land inside vLLM's wait_for_save, which
+    is on the TTFT critical path. This class offloads all of that to a
+    single worker thread. The main thread enqueues a task and returns
+    immediately; the drain is done in on_request_finished (off TTFT).
+
+    Single worker thread (not a pool) because:
+      * ICMS client is NOT thread-safe (one lock to serialize with main-
+        thread Score/FetchAll RPCs is sufficient; no additional worker-
+        vs-worker racing).
+      * Work ordering matters (later WriteGroups depend on earlier ones
+        for the same request).
+    """
+
+    def __init__(self, name: str = "icms-writes"):
+        self._q: "_queue.Queue" = _queue.Queue()
+        self._pending = 0
+        self._cv = threading.Condition()
+        self._stop = False
+        self._t = threading.Thread(
+            target=self._loop, name=name, daemon=True)
+        self._t.start()
+
+    def submit(self, fn, tag: str = ""):
+        with self._cv:
+            self._pending += 1
+        self._q.put((fn, tag))
+
+    def _loop(self):
+        while True:
+            item = self._q.get()
+            if item is None:  # poison
+                return
+            fn, tag = item
+            try:
+                fn()
+            except Exception:
+                logger.exception("WritePipeline[%s]: task failed", tag)
+            finally:
+                with self._cv:
+                    self._pending -= 1
+                    if self._pending == 0:
+                        self._cv.notify_all()
+
+    def pending(self) -> int:
+        with self._cv:
+            return self._pending
+
+    def drain(self, timeout: float | None = None) -> bool:
+        """Block until pending == 0. Returns True on drain complete,
+        False on timeout."""
+        with self._cv:
+            if timeout is None:
+                while self._pending > 0:
+                    self._cv.wait()
+                return True
+            deadline = time.monotonic() + timeout
+            while self._pending > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cv.wait(timeout=remaining)
+            return True
+
+    def shutdown(self, timeout: float = 5.0):
+        self._stop = True
+        self._q.put(None)
+        self._t.join(timeout=timeout)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -959,6 +1038,21 @@ class _Worker:
         # Drained into IcmsConnectorMetadata by the facade.
         self._pending_stored_notifications: list[tuple[list[int], int]] = []
 
+        # Deferred write pipeline: extract (GPU→CPU, summary compute) +
+        # flush (WriteGroup RPCs) moved off the vLLM wait_for_save critical
+        # path. Worker thread runs tasks after wait_for_save returns. Drain
+        # happens in on_request_finished (after first-token emission, off
+        # TTFT). Reuses self._score_lock for client-call serialization so
+        # main-thread Score/FetchAll don't race with background WriteGroup.
+        self._write_pipeline = _WritePipeline()
+
+        # TTFT-breakdown instrumentation. Per-request phase timestamps +
+        # per-hook accumulators collected across the prefill critical path
+        # (on_step_start → wait_for_layer × 48 → wait_for_pending_writes).
+        # Enabled when ICMS_TTFT_BREAKDOWN=1.
+        self._ttft_enabled = os.environ.get("ICMS_TTFT_BREAKDOWN", "1") != "0"
+        self._ttft: dict[str, dict] = {}
+
         self._connect()
 
     def _connect(self):
@@ -1099,6 +1193,13 @@ class _Worker:
                                  sel_path, len(self.stats.selections))
             except Exception as e:
                 logger.warning("Failed to dump connector stats: %s", e)
+        # Drain + stop the write pipeline before we tear down the
+        # client (pending WriteGroup RPCs would fail otherwise).
+        try:
+            self._write_pipeline.drain(timeout=10.0)
+            self._write_pipeline.shutdown(timeout=5.0)
+        except Exception:
+            logger.exception("shutdown: write-pipeline drain/stop failed")
         # Evict all active requests.
         for rid, rs in list(self._requests.items()):
             if rs.chain:
@@ -1115,14 +1216,93 @@ class _Worker:
             self._client.close()
             self._client = None
 
+    # ─── TTFT-breakdown helpers ──────────────────────────────────────────
+
+    def _ttft_reset(self, rid: str, t_start: float):
+        if not self._ttft_enabled:
+            return
+        self._ttft[rid] = {
+            "t_step_start": t_start,
+            "t_first_wait_layer": None,
+            "t_last_fetch_done": None,
+            "num_waits": 0,
+            "wait_spin_us_total": 0.0,
+            "wait_apply_us_total": 0.0,
+            "num_scores": 0,
+            "score_rpc_us_total": 0.0,
+            "num_fetch_alls": 0,
+            "fetch_all_rpc_us_total": 0.0,
+        }
+
+    def _ttft_add(self, rid: str, **deltas):
+        if not self._ttft_enabled:
+            return
+        entry = self._ttft.get(rid)
+        if entry is None:
+            return
+        for k, v in deltas.items():
+            # Fields prefixed with "t_" are timestamps: overwrite.
+            # Everything else is a numeric accumulator.
+            if k.startswith("t_"):
+                entry[k] = v
+            elif k in entry and isinstance(entry[k], (int, float)):
+                entry[k] = entry[k] + v
+            else:
+                entry[k] = v
+
+    def _ttft_stamp_once(self, rid: str, field: str, t: float):
+        if not self._ttft_enabled:
+            return
+        entry = self._ttft.get(rid)
+        if entry is None:
+            return
+        if entry.get(field) is None:
+            entry[field] = t
+
+    def _ttft_emit(self, t_save_enter: float):
+        if not self._ttft_enabled or not self._ttft:
+            return
+        for rid, e in list(self._ttft.items()):
+            t_step = e.get("t_step_start")
+            if t_step is None:
+                continue
+            t_first = e.get("t_first_wait_layer") or t_save_enter
+            t_fetch = e.get("t_last_fetch_done") or t_first
+            step_to_first_ms = (t_first - t_step) * 1e3
+            first_to_fetch_ms = (t_fetch - t_first) * 1e3
+            fetch_to_save_ms = (t_save_enter - t_fetch) * 1e3
+            total_ms = (t_save_enter - t_step) * 1e3
+            logger.info(
+                "[ttft-breakdown] rid=%s total=%.1fms "
+                "step_to_first_layer=%.1fms first_to_fetch_done=%.1fms "
+                "fetch_to_wait_for_save=%.1fms | "
+                "waits=%d wait_spin=%.1fms wait_apply=%.1fms | "
+                "scores=%d score_rpc=%.1fms | "
+                "fetch_alls=%d fetch_all_rpc=%.1fms",
+                rid, total_ms,
+                step_to_first_ms, first_to_fetch_ms, fetch_to_save_ms,
+                e["num_waits"],
+                e["wait_spin_us_total"] / 1e3,
+                e["wait_apply_us_total"] / 1e3,
+                e["num_scores"],
+                e["score_rpc_us_total"] / 1e3,
+                e["num_fetch_alls"],
+                e["fetch_all_rpc_us_total"] / 1e3,
+            )
+            # Clear after emit so next step doesn't double-log.
+            self._ttft.pop(rid, None)
+
     # ─── metadata drain (C1) ─────────────────────────────────────────────
 
     def on_step_start(self, meta: IcmsConnectorMetadata):
         """Called from start_load_kv. Drains scheduler metadata into caches."""
+        t_step = time.perf_counter()
         self.stats.advance_step()
         # Reset prefill_done when a new request arrives (new chain delivered).
         if meta.new_chains:
             self._prefill_done = False
+            for rid in meta.new_chains.keys():
+                self._ttft_reset(rid, t_step)
 
         # Dedup-aware extraction: skip blocks that already live in a
         # group covered by a previously-stored chain prefix. Saves the
@@ -1297,6 +1477,21 @@ class _Worker:
                 next_layer_idx,
                 scores=list(reply.scores),
             )
+            self._ttft_add(
+                rid,
+                num_fetch_alls=1,
+                fetch_all_rpc_us_total=(t_end - t_start) * 1e6,
+                t_last_fetch_done=t_end,
+            )
+            # Sync mode (use_flags=False): by the time fetch_all returns,
+            # all layers in [next_layer_idx, reuse_through] have landed
+            # in the sink. Mark their flags ready so wait_for_layer's
+            # spin-wait is a no-op. Without this, wait_for_layer polls
+            # un-set flags and eats the 5s timeout per layer.
+            sink = self._sink_pool.sink
+            if getattr(sink, "flag_count", 0) > 0:
+                for L in range(next_layer_idx, reuse_through + 1):
+                    sink.set_layer_ready(L)
             with self._score_lock:
                 self._pending_scores.setdefault(attn_layer_name, {})[rid] = (
                     reply, req_idx)
@@ -1551,6 +1746,12 @@ class _Worker:
                 next_layer_idx,
                 scores=list(reply.scores),
             )
+            self._ttft_add(
+                rid,
+                num_scores=1,
+                score_rpc_us_total=(t_score_end - t_score_start) * 1e6,
+                t_last_fetch_done=t_score_end,
+            )
             if logger.isEnabledFor(10) and reply.page_ids:
                 logger.debug(
                     "score layer=%d rid=%s chain_len=%d k=%d top_pages=%s",
@@ -1623,6 +1824,8 @@ class _Worker:
             return
 
         t_layer_start = time.perf_counter()
+        for rid in per_request.keys():
+            self._ttft_stamp_once(rid, "t_first_wait_layer", t_layer_start)
 
         # Spin-wait for the layer's KV to land (reply-early overlap mode).
         # If the sink doesn't expose ready flags, is_layer_ready returns
@@ -1642,14 +1845,24 @@ class _Worker:
                         logger.warning(
                             "wait_for_layer: flag timeout for layer=%d", abs_layer)
                         break
+        t_after_spin = time.perf_counter()
+        spin_us = (t_after_spin - t_layer_start) * 1e6
 
         total_k_pages = 0
         for rid, (reply, req_idx) in per_request.items():
             if reply is None or not reply.page_ids:
                 continue
             try:
+                t_apply_start = time.perf_counter()
                 self._apply_selective_attention(
                     layer_name, reply, req_idx, rid)
+                apply_us = (time.perf_counter() - t_apply_start) * 1e6
+                self._ttft_add(
+                    rid,
+                    num_waits=1,
+                    wait_spin_us_total=spin_us,
+                    wait_apply_us_total=apply_us,
+                )
                 total_k_pages += len(reply.page_ids)
             except Exception as e:
                 logger.error("Path B: apply_selective FAILED for %s req=%s: %s",
@@ -1734,53 +1947,117 @@ class _Worker:
         page_shape = (PAGE_TOKENS, geom.num_kv_heads, geom.head_dim)
         gpu_direct = getattr(sink, 'is_gpu_direct', False)
 
-        filled_blocks = []
+        # CPU-side filter: drop pids that lack a sink offset or overflow
+        # the block-table row. This loop touches Python lists only, no GPU.
+        valid_pids: list[int] = []
+        valid_sink_offs: list[int] = []
+        bt_row_max = int(bt.shape[1])
         for pid in selected:
-            sink_off = pid_to_sink_off.get(pid)
-            if sink_off is None or pid >= bt.shape[1]:
+            off = pid_to_sink_off.get(pid)
+            if off is None or pid >= bt_row_max:
                 continue
-            phys_block = int(bt[req_idx, pid])
-            if phys_block >= main_key.shape[0]:
-                continue
-            if gpu_direct:
-                # GPUDirect: data already in GPU HBM — zero-copy view.
-                raw = sink.gpu_view(sink_off, kv_page_bytes)
-                k_t = raw[:half_bytes].view(torch.float16).reshape(
-                    page_shape).to(dtype=model_dtype)
-                v_t = raw[half_bytes:].view(torch.float16).reshape(
-                    page_shape).to(dtype=model_dtype)
+            valid_pids.append(pid)
+            valid_sink_offs.append(off)
+        if not valid_pids:
+            return None
+
+        if gpu_direct:
+            # ── Batched GPU-direct path: one gather + one dtype convert + ──
+            # ── one scatter per layer, instead of 4 kernels + 1 host-sync ──
+            # ── per page (old path ran ~48k kernels + ~12k syncs per req). ──
+            sink_base = sink.gpu_view(0, sink.size)          # [sink_bytes] u8
+            sink_pages = sink_base.view(-1, kv_page_bytes)   # [N, page_bytes]
+
+            # One host→device copy for the index tensors.
+            page_idx_py = [off // kv_page_bytes
+                            for off in valid_sink_offs]
+            page_idx_dev = torch.tensor(
+                page_idx_py, dtype=torch.int64, device=device)
+            valid_pids_dev = torch.tensor(
+                valid_pids, dtype=torch.int64, device=device)
+
+            # phys_blocks via on-device gather (no sync).
+            phys_blocks_dev = bt[req_idx].index_select(
+                0, valid_pids_dev).to(torch.int64)
+
+            # Bound check: phys_block < main_key.shape[0]. One sync per
+            # layer (vs 256 syncs in the old loop).
+            max_blocks_hbm = main_key.shape[0]
+            if bool((phys_blocks_dev >= max_blocks_hbm).any().item()):
+                bounds_mask = phys_blocks_dev < max_blocks_hbm
+                phys_blocks_dev = phys_blocks_dev[bounds_mask]
+                page_idx_dev = page_idx_dev[bounds_mask]
+                if phys_blocks_dev.numel() == 0:
+                    return None
+
+            # One gather kernel: [k, page_bytes] u8.
+            pages_u8 = sink_pages.index_select(0, page_idx_dev)
+            k_bytes = pages_u8[:, :half_bytes].contiguous()
+            v_bytes = pages_u8[:, half_bytes:].contiguous()
+            k_pages = k_bytes.view(torch.float16).reshape(
+                -1, *page_shape).to(dtype=model_dtype)
+            v_pages = v_bytes.view(torch.float16).reshape(
+                -1, *page_shape).to(dtype=model_dtype)
+
+            # Scatter: two kernels total for this layer.
+            main_key.index_copy_(0, phys_blocks_dev, k_pages)
+            main_value.index_copy_(0, phys_blocks_dev, v_pages)
+
+            filled_blocks_count = int(phys_blocks_dev.numel())
+
+            # Build trimmed block table entirely on device — avoids a
+            # per-continuation-block int(bt[...]) sync.
+            cont_end = min(total_blocks, bt.shape[1])
+            if cont_end > context_pages:
+                cont_idx = torch.arange(
+                    context_pages, cont_end,
+                    dtype=torch.int64, device=device)
+                cont_blocks = bt[req_idx].index_select(
+                    0, cont_idx).to(torch.int32)
+                new_bt_row = torch.cat(
+                    [phys_blocks_dev.to(torch.int32), cont_blocks])
             else:
-                # Host sink: copy via numpy → torch → GPU.
+                new_bt_row = phys_blocks_dev.to(torch.int32)
+            if new_bt_row.numel() == 0:
+                return None
+            new_bt = new_bt_row.unsqueeze(0)
+        else:
+            # Fallback per-page loop for host-sink path (unchanged).
+            filled_blocks = []
+            for pid, sink_off in zip(valid_pids, valid_sink_offs):
+                phys_block = int(bt[req_idx, pid])
+                if phys_block >= main_key.shape[0]:
+                    continue
                 sink_view = sink.view()
                 raw = bytes(sink_view[sink_off:sink_off + kv_page_bytes])
                 k_np = np.frombuffer(raw[:half_bytes], dtype=np.float16).reshape(page_shape)
                 v_np = np.frombuffer(raw[half_bytes:], dtype=np.float16).reshape(page_shape)
                 k_t = torch.from_numpy(k_np.copy()).to(dtype=model_dtype, device=device)
                 v_t = torch.from_numpy(v_np.copy()).to(dtype=model_dtype, device=device)
-            main_key[phys_block].copy_(k_t)
-            main_value[phys_block].copy_(v_t)
-            filled_blocks.append(phys_block)
-
-        # ── Build trimmed block table ──
-        # [filled context blocks | continuation blocks]
-        new_entries = list(filled_blocks)
-        for blk_idx in range(context_pages, total_blocks):
-            if blk_idx < bt.shape[1]:
-                new_entries.append(int(bt[req_idx, blk_idx]))
-        if not new_entries:
-            return None
+                main_key[phys_block].copy_(k_t)
+                main_value[phys_block].copy_(v_t)
+                filled_blocks.append(phys_block)
+            if not filled_blocks:
+                return None
+            new_entries = list(filled_blocks)
+            for blk_idx in range(context_pages, total_blocks):
+                if blk_idx < bt.shape[1]:
+                    new_entries.append(int(bt[req_idx, blk_idx]))
+            if not new_entries:
+                return None
+            new_bt = torch.tensor(
+                [new_entries], dtype=torch.int32, device=device)
+            filled_blocks_count = len(filled_blocks)
 
         continuation_tokens = max(0, seq_len - context_tokens)
-        new_seq_len = len(filled_blocks) * PAGE_TOKENS + continuation_tokens
-
-        bt_device = bt.device
-        new_bt = torch.tensor([new_entries], dtype=torch.int32, device=bt_device)
-        new_sl = torch.tensor([new_seq_len], dtype=torch.int32, device=bt_device)
+        new_seq_len = filled_blocks_count * PAGE_TOKENS + continuation_tokens
+        new_sl = torch.tensor(
+            [new_seq_len], dtype=torch.int32, device=device)
 
         logger.debug(
             "Path B: layer=%s req_idx=%d fetched %d/%d pages, "
             "seq_len %d→%d",
-            layer_name, req_idx, len(filled_blocks), context_pages,
+            layer_name, req_idx, filled_blocks_count, context_pages,
             seq_len, new_seq_len,
         )
 
@@ -1813,69 +2090,103 @@ class _Worker:
         icms_fetch_state.clear()
 
     def wait_for_pending_writes(self):
-        """Drain the deferred-write path at the end of a forward pass.
+        """Kick off deferred write work; DO NOT block on it.
 
-        All write-path work (extract_and_record + write_group flushes) is
-        deferred here from save_kv_layer so the forward pass itself
-        doesn't pay the GPU→CPU copy + RDMA round-trip cost inline per
-        layer. Flow:
+        vLLM calls this at the end of a forward pass via wait_for_save;
+        that call sits on the TTFT critical path. We must return fast:
+        snapshot what the extract + flush work needs, submit a single
+        closure to the background pipeline, and return.
 
-          1. For each active request, walk all layers we have a KV
-             cache reference for, extract new (non-stored) blocks into
-             the group buffers.
-          2. Flush any now-complete group buffers as full groups.
-          3. Push num_groups_written to the stored-prefix index so
-             future requests can skip extraction for this prefix.
+        The drain (i.e., synchronous wait for the pipeline to finish
+        this request's writes) happens in on_request_finished, which
+        runs AFTER first-token emission and is off the TTFT critical
+        path.
 
-        Partial (last) groups are still flushed in on_request_finished
-        — that path runs after first-token emission and is off the TTFT
-        critical path.
+        Legacy inline behavior is still invoked when pipeline is absent
+        (shouldn't happen in normal operation).
         """
-        # ─── 1. Batch extraction (moved off the save_kv_layer critical
-        #       path). Only runs if we have the per-layer refs and
-        #       attention metadata stashed by start_load_kv.
-        if (self._gpu_kv_caches and self._attn_metadata is not None
+        t_save_enter = time.perf_counter()
+        self._ttft_emit(t_save_enter)
+        if not (self._gpu_kv_caches and self._attn_metadata is not None
                 and self._requests and not self._skip_extract):
-            if logger.isEnabledFor(20):
-                logger.debug(
-                    "wait_for_pending_writes: batch-extracting %d layers",
-                    len(self._gpu_kv_caches))
-            for layer_name, kv in self._gpu_kv_caches.items():
-                if kv is None or kv.ndim != 5:
-                    continue
-                if isinstance(self._attn_metadata, dict):
-                    am = self._attn_metadata.get(layer_name)
-                else:
-                    am = self._attn_metadata
-                if am is None:
-                    continue
-                try:
-                    self.extract_and_record(layer_name, kv, am)
-                except Exception:
-                    logger.exception(
-                        "wait_for_pending_writes: extract_and_record "
-                        "failed for layer=%s", layer_name)
+            # Nothing to extract — still flip the prefill_done flag.
+            if not self._prefill_done:
+                self._prefill_done = True
+                logger.info("Prefill done. Switching to dense decode.")
+            return
 
-        # ─── 2. Flush all now-complete group buffers as full groups.
-        for rid, rs in self._requests.items():
+        # Snapshot references that the background task needs. The KV
+        # cache tensors and request state are expected to remain valid
+        # until on_request_finished drains the pipeline.
+        snap_caches = dict(self._gpu_kv_caches)
+        snap_meta   = self._attn_metadata
+        snap_rids   = list(self._requests.keys())
+
+        def _task():
+            self._do_deferred_extract_and_flush(
+                snap_caches, snap_meta, snap_rids)
+
+        self._write_pipeline.submit(_task, tag="wait_for_save")
+
+        if not self._prefill_done:
+            self._prefill_done = True
+            logger.info("Prefill done. Switching to dense decode.")
+
+    def _do_deferred_extract_and_flush(
+        self,
+        caches: dict,
+        meta,
+        rids: list[str],
+    ):
+        """Runs on the write-pipeline worker thread.
+
+        Does the heavy lifting (GPU→CPU copies inside extract_and_record,
+        summary compute, bytearray fills, and WriteGroup RPCs) without
+        holding up the vLLM forward-pass return. Touches shared client
+        state under self._score_lock to serialize with main-thread
+        Score/FetchAll RPCs."""
+        # ─── 1. Batch extraction
+        for layer_name, kv in caches.items():
+            if kv is None or kv.ndim != 5:
+                continue
+            if isinstance(meta, dict):
+                am = meta.get(layer_name)
+            else:
+                am = meta
+            if am is None:
+                continue
+            try:
+                self.extract_and_record(layer_name, kv, am)
+            except Exception:
+                logger.exception(
+                    "deferred-extract: extract_and_record failed "
+                    "for layer=%s", layer_name)
+
+        # ─── 2. Flush complete group buffers via WriteGroup RPCs.
+        # Hold the client lock so background WriteGroups don't race
+        # with main-thread Score/FetchAll on the same QP/client.
+        for rid in rids:
+            rs = self._requests.get(rid)
+            if rs is None:
+                continue
             for gidx in sorted(rs.active_group_buffers.keys()):
                 buf = rs.active_group_buffers.get(gidx)
                 if buf is None:
                     continue
                 if buf.is_complete():
-                    self._flush_group(rid, gidx, partial=False)
+                    with self._score_lock:
+                        self._flush_group(rid, gidx, partial=False)
 
         # ─── 3. Push stored-prefix entries so subsequent requests can
         #       skip extraction for the matched prefix.
-        for rid, rs in self._requests.items():
+        for rid in rids:
+            rs = self._requests.get(rid)
+            if rs is None:
+                continue
             if rs.chain and rs.num_groups_written > 0:
                 self._record_stored_groups(rs.chain, rs.num_groups_written)
                 _stored_chain_queue.append(
                     (list(rs.chain), rs.num_groups_written))
-
-        if not self._prefill_done:
-            self._prefill_done = True
-            logger.info("Prefill done. Switching to dense decode.")
 
     # ─── KV extraction from GPU paged buffer (C2 write path) ────────────
 
@@ -2110,13 +2421,34 @@ class _Worker:
     # ─── request lifecycle ───────────────────────────────────────────────
 
     def on_request_finished(self, request_id: str):
+        # Drain the deferred-write pipeline before touching this
+        # request's state. The pipeline's extract + flush tasks for
+        # this request may still be running from the last wait_for_save;
+        # they need rs.active_group_buffers etc. to still exist.
+        # This drain is off the TTFT critical path (runs after vLLM
+        # has already returned first-token).
+        t0 = time.perf_counter()
+        ok = self._write_pipeline.drain(timeout=30.0)
+        drain_us = (time.perf_counter() - t0) * 1e6
+        if not ok:
+            logger.warning(
+                "on_request_finished: write-pipeline drain TIMED OUT "
+                "(>30s, %d tasks pending); request-finish proceeding — "
+                "some writes may be lost.",
+                self._write_pipeline.pending())
+        elif drain_us > 1000:
+            logger.info(
+                "on_request_finished: write-pipeline drain took %.1f ms",
+                drain_us / 1000.0)
+
         rs = self._requests.get(request_id)
         if rs is None:
             return
         # Flush any partial group buffers first (must happen BEFORE we
         # pop rs, since _flush_group re-reads self._requests[rid]).
         for gidx in list(rs.active_group_buffers.keys()):
-            self._flush_group(request_id, gidx, partial=True)
+            with self._score_lock:
+                self._flush_group(request_id, gidx, partial=True)
         # Push the final group-count to the scheduler's prefix index so
         # a subsequent request with the same prefix can skip prefill.
         # wait_for_pending_writes is NOT called after on_request_finished,
