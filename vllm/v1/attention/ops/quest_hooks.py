@@ -283,9 +283,24 @@ class QuestHookManager:
         if next_layer_idx not in self._layernorm_weights:
             return
 
-        # Extract residual from output
+        # Reconstruct the full residual stream that layer L+1's
+        # input_layernorm will see.  vLLM's decoder layer returns
+        # (hidden_states, residual) where `residual` is the stream
+        # BEFORE the MLP add — the next layer's fused-add-norm does
+        # `x = hidden_states + residual` inside input_layernorm and
+        # then applies RMSNorm to that sum.  Using just `output[1]`
+        # here drops the layer-L MLP output from the input to Q_{L+1}.
         if isinstance(output, tuple) and len(output) >= 2:
-            residual = output[1]
+            hidden_states_out = output[0]
+            residual_out = output[1]
+            if hidden_states_out is not None and residual_out is not None:
+                residual = hidden_states_out + residual_out
+            elif residual_out is not None:
+                residual = residual_out
+            elif hidden_states_out is not None:
+                residual = hidden_states_out
+            else:
+                return
         elif isinstance(output, torch.Tensor):
             residual = output
         else:
