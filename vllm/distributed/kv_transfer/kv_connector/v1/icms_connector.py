@@ -1721,21 +1721,23 @@ class _Worker:
                 k=k,
                 sink=self._sink_pool.sink,
                 reuse_through_layer=reuse_through,
-                # TODO(overlap): Score reply-early currently races with
-                # Phase-2 writes on the shared QP and crashes the server
-                # on the first Config C request. Force sync for now;
-                # re-enable once the reactor/worker send path is
-                # serialized.
-                use_flags=False,
+                # Reply-early: server ships the ScoreReply as soon as
+                # Phase 1 (scoring) finishes; Phase 2 KV writes and
+                # per-layer flag flips continue in the background. The
+                # reactor and worker share a single QP per connection,
+                # so the server takes a per-conn mutex around each
+                # ibv_post_send (RdmaTransport::send() +
+                # RdmaSinkRegistry::submit_write/submit_flag_write).
+                use_flags=True,
             )
             t_score_end = time.perf_counter()
-            # Sync mode: by the time score() returns, all layers in
-            # [layer, reuse_through] have landed in the sink. Mark their
-            # flags ready so wait_for_layer's spin-wait is a no-op.
+            # Reply-early (use_flags=True): server flips per-layer
+            # flags over RDMA as Phase 2 writes complete — do NOT
+            # force them ready locally or wait_for_layer will skip
+            # the flag spin and read KV before it lands.
+            # (Legacy sync mode kept the force-ready here.)
             sink = self._sink_pool.sink
-            if getattr(sink, "flag_count", 0) > 0:
-                for L in range(next_layer_idx, reuse_through + 1):
-                    sink.set_layer_ready(L)
+            _ = sink
             # Stash storage-side concurrent request count for adaptive budget.
             rs._last_storage_concurrent = getattr(
                 reply, 'concurrent_requests', 0)
