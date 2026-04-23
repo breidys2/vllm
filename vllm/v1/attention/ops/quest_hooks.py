@@ -67,6 +67,17 @@ class QuestHookManager:
         self.stats = stats
         self.cpu_scoring = cpu_scoring
         self.single_layer_scoring = False  # set after __init__ if needed
+        # Stride gating — fresh Q is only needed at stride-aligned layers
+        # (next_layer_idx ∈ {1, 1+stride, 1+2*stride, ...}); non-stride
+        # layers reuse the prior stride group's selection and never read
+        # Q. Set by the callsite from the connector's icms_score_stride.
+        # Default 1 = every layer scored (no stride gating).
+        self.score_stride = 1
+        # When True, budget >= 1.0 shortcuts to the FetchAll path (kFetchAll
+        # on the ICMS server). Set to False for adaptive allocators whose
+        # "1.0 on idle" output should still exercise the stride-gated Score
+        # path — the callsite (model_runner) flips this per config.
+        self.allow_all_pages_shortcut = True
 
         # Registered hook handles (for cleanup)
         self._hook_handles: list[torch.utils.hooks.RemovableHook] = []
@@ -324,7 +335,7 @@ class QuestHookManager:
             num_layers=self.num_layers,
         )
 
-        if budget >= 1.0:
+        if budget >= 1.0 and self.allow_all_pages_shortcut:
             # Baseline pipelined path: transfer ALL pages for the next
             # layer without computing Q or scoring.  This gives the
             # baseline full compute/IO overlap (layer-pipelined) without
@@ -336,6 +347,32 @@ class QuestHookManager:
                         kv_layer=torch.empty(0),
                         attn_metadata=None,
                         quest_all_pages=True,
+                        next_layer_idx=next_layer_idx,
+                        budget=budget,
+                        quest_stats=self.stats,
+                    )
+                except Exception:
+                    pass
+            return
+
+        # Stride gating: only stride-aligned layers need a fresh Q.
+        # Non-stride layers reuse the prior stride group's Score result —
+        # route them through the connector's reuse path without computing
+        # Q. Saves (stride-1)/stride of the Q-projection work (40 of 48
+        # layers at stride=6). Independent of budget: non-stride layers
+        # never consult Q regardless of what the adaptive allocator picks.
+        is_stride_layer = (
+            self.score_stride <= 1
+            or ((next_layer_idx - 1) % self.score_stride) == 0
+        )
+        if not is_stride_layer:
+            if self.kv_connector is not None:
+                try:
+                    self.kv_connector.save_kv_layer(
+                        layer_name=f"layer_{layer_idx}",
+                        kv_layer=torch.empty(0),
+                        attn_metadata=None,
+                        quest_reuse_selection=True,
                         next_layer_idx=next_layer_idx,
                         budget=budget,
                         quest_stats=self.stats,

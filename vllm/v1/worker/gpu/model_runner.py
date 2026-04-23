@@ -371,6 +371,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 cpu_scoring=True,
             )
             hook_manager.single_layer_scoring = single_layer_scoring
+            # Adaptive allocators return 1.0 on idle (single-request bench),
+            # which would silently collapse the Score path into FetchAll.
+            # Disable the shortcut so adaptive always hits the stride-gated
+            # Score path. Static ConstantBudget keeps the shortcut so
+            # budget=1.0 still routes through the kFetchAll fast path.
+            hook_manager.allow_all_pages_shortcut = not extra.get(
+                "adaptive_bandwidth", False
+            )
+            # Stride gating — mirror the connector's icms_score_stride so
+            # the hook skips Q compute on non-stride layers.
+            hook_manager.score_stride = max(
+                1, int(extra.get("icms_score_stride", 1))
+            )
 
             num_registered = hook_manager.register_hooks(self.model)
             if num_registered > 0:
