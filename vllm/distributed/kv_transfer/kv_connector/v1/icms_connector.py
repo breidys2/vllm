@@ -1103,10 +1103,16 @@ class _Worker:
         if self._adaptive_allocator is not None:
             self._adaptive_allocator._kv_page_bytes = self._geom.kv_page_bytes
 
-        # Sink sizing: stride layers × k pages × kv_page_bytes.
-        # One stride group's worth of KV fits in the sink at a time.
+        # Sink sizing: needs to hold one server Phase-2 dump at a time.
+        # - Score path (stride-gated): score_stride layers × k pages.
+        # - FetchAll path (B, budget=1.0): num_layers × k pages (one call
+        #   covers every reuse layer, not just score_stride).
+        # Size for the worst case so B doesn't overflow → server's sink-
+        # bounds check rejects writes → GPU-direct index_select trips a
+        # CUDA OOB assertion.
         per_layer_bytes = self._k * self._geom.kv_page_bytes
-        total_sink = self._score_stride * per_layer_bytes
+        sink_layers = max(self._score_stride, int(self._geom.num_layers))
+        total_sink = sink_layers * per_layer_bytes
         # Allocate a per-layer ready-flag sink (one u32 per model layer)
         # alongside the main KV sink. The server flips slots via small
         # RDMA writes and the connector polls them to overlap compute
@@ -1322,10 +1328,15 @@ class _Worker:
         for rid, bids in meta.block_id_maps.items():
             rs = self._requests.setdefault(rid, _RequestState(request_id=rid))
             rs.block_ids = bids
-        # C9: fire speculative summary preloads for new requests.
-        for rid, chain in meta.new_chains.items():
-            if chain:
-                self._fire_preload(rid, chain)
+        # Client-side preload DISABLED by default — the server now kicks off
+        # the same async preload internally on first Score (see
+        # kick_off_summary_preload in handlers.cc), which avoids the
+        # client-side cold-frame penalty entirely. Set
+        # ICMS_DISABLE_PRELOAD=0 to re-enable the client-fired path.
+        if int(os.environ.get("ICMS_DISABLE_PRELOAD", "1")) == 0:
+            for rid, chain in meta.new_chains.items():
+                if chain:
+                    self._fire_preload(rid, chain)
 
     def _fire_preload(self, request_id: str, chain: list[int]):
         """Fire a one-way summary preload on the scheduler thread.
@@ -1450,25 +1461,36 @@ class _Worker:
                 layer=next_layer_idx,
                 sink=self._sink_pool.sink,
                 reuse_through_layer=reuse_through,
-                # Force sync-mode so sink_write_ns / server_ingest_ns
-                # reflect the full Phase-2 cost (not reply-early 0s).
-                use_flags=False,
+                # Reply-early: server ships the FetchAll reply as soon as
+                # page_ids are known; Phase-2 KV writes + per-layer flag
+                # flips run in background so the GPU forward pass overlaps
+                # with the transfer. Note: reply's sink_write_ns /
+                # server_ingest_to_ready_ns are reported as 0 in this
+                # mode — the transfer wall-time shows up as the sum of
+                # per-layer wait_spin on the client side.
+                use_flags=True,
             )
             t_end = time.perf_counter()
             rs._last_storage_concurrent = getattr(
                 reply, 'concurrent_requests', 0)
-            # Diagnostic: surface the server-reported timing breakdown
-            # so we can see where time goes in the I/O path.
+            rpc_ms = (t_end - t_start) * 1e3
+            slow_tag = " SLOW" if rpc_ms > 5.0 else ""
             logger.info(
-                "[icms-fetch-timing] rid=%s layer=%d chain=%d k=%d "
-                "wall=%.1fms server_total=%.1fms sink_write=%.1fms "
-                "(data_per_fwd=%.1fMB)",
-                rid, next_layer_idx, len(rs.chain), len(reply.page_ids),
-                (t_end - t_start) * 1e3,
-                reply.server_ingest_to_ready_ns / 1e6,
+                "[rpc] src=fetch_all mode=sync rid=%s layers=%d..%d k=%d "
+                "rpc=%.2fms score=%.2fms summary_read=%.2fms "
+                "sink_write=%.2fms server=%.2fms hit=%d concurrent=%d "
+                "data=%.1fMB%s",
+                rid, next_layer_idx, reuse_through, len(reply.page_ids),
+                rpc_ms,
+                reply.score_ns / 1e6,
+                reply.summary_read_ns / 1e6,
                 reply.sink_write_ns / 1e6,
+                reply.server_ingest_to_ready_ns / 1e6,
+                int(getattr(reply, 'cache_hit', 0)),
+                int(getattr(reply, 'concurrent_requests', 0)),
                 len(reply.page_ids) * self._geom.kv_page_bytes
                 * (reuse_through - next_layer_idx + 1) / (1 << 20),
+                slow_tag,
             )
             self.stats.record_score(
                 (t_end - t_start) * 1e6,
@@ -1483,15 +1505,12 @@ class _Worker:
                 fetch_all_rpc_us_total=(t_end - t_start) * 1e6,
                 t_last_fetch_done=t_end,
             )
-            # Sync mode (use_flags=False): by the time fetch_all returns,
-            # all layers in [next_layer_idx, reuse_through] have landed
-            # in the sink. Mark their flags ready so wait_for_layer's
-            # spin-wait is a no-op. Without this, wait_for_layer polls
-            # un-set flags and eats the 5s timeout per layer.
+            # Reply-early (use_flags=True): server flips per-layer
+            # flags via RDMA as Phase-2 writes complete — don't force
+            # them ready locally or wait_for_layer will skip the flag
+            # spin and read KV before it lands.
             sink = self._sink_pool.sink
-            if getattr(sink, "flag_count", 0) > 0:
-                for L in range(next_layer_idx, reuse_through + 1):
-                    sink.set_layer_ready(L)
+            _ = sink
             with self._score_lock:
                 self._pending_scores.setdefault(attn_layer_name, {})[rid] = (
                     reply, req_idx)
@@ -1544,8 +1563,18 @@ class _Worker:
 
     def on_layer_score(self, next_layer_idx, quest_query, budget, stats,
                         connector_meta=None):
-        """CPU-scoring path: Q arrived, fire Score against icms (C9 State 2/3)."""
+        """CPU-scoring path: Q arrived, fire Score against icms (C9 State 2/3).
+
+        Stride-gated: we only fire a fresh Score at stride boundaries
+        (next_layer_idx = 1, 1+stride, 1+2*stride, ...). In between, the
+        prior Score's Phase-2 KV writes already cover this layer — we
+        just route to ``on_layer_reuse`` which promotes the pre-stashed
+        reuse entry into _pending_scores so wait_for_layer can consume it.
+        """
         try:
+            if ((next_layer_idx - 1) % self._score_stride) != 0:
+                self.on_layer_reuse(next_layer_idx, budget, stats)
+                return
             self._on_layer_score_impl(
                 next_layer_idx, quest_query, budget, stats, connector_meta)
         except Exception:
@@ -1741,6 +1770,25 @@ class _Worker:
             # Stash storage-side concurrent request count for adaptive budget.
             rs._last_storage_concurrent = getattr(
                 reply, 'concurrent_requests', 0)
+            rpc_ms = (t_score_end - t_score_start) * 1e3
+            # Target Score reply-early latency at 16k context is ~2 ms;
+            # flag anything noticeably above so we can grep spurious slow
+            # calls out of sweep logs.
+            slow_tag = " SLOW" if rpc_ms > 3.0 else ""
+            logger.info(
+                "[rpc] src=score mode=reply-early rid=%s layers=%d..%d k=%d "
+                "rpc=%.2fms score=%.2fms summary_read=%.2fms "
+                "sink_write=%.2fms server=%.2fms hit=%d concurrent=%d%s",
+                rid, next_layer_idx, reuse_through, len(reply.page_ids),
+                rpc_ms,
+                reply.score_ns / 1e6,
+                reply.summary_read_ns / 1e6,
+                reply.sink_write_ns / 1e6,
+                reply.server_ingest_to_ready_ns / 1e6,
+                int(getattr(reply, 'cache_hit', 0)),
+                int(getattr(reply, 'concurrent_requests', 0)),
+                slow_tag,
+            )
             self.stats.record_score(
                 (t_score_end - t_score_start) * 1e6,
                 reply.cache_hit,
