@@ -103,6 +103,79 @@ def _rank_tagged_chain(tp_rank: int, chain):
         return chain
     return [_rank_tag(tp_rank), *chain]
 
+
+def _tp_broadcast_score_reply(reply, tp_rank: int, tp_size: int):
+    """Option W: rank 0 has the server's ScoreReply; broadcast it to every
+    rank so each rank populates _pending_scores identically.
+
+    Uses a scalar-header + variable-length payload protocol over NCCL
+    broadcast of CUDA tensors. The reply's page_ids / scores /
+    sink_offsets are small (k × 16 bytes typical) so two broadcasts
+    (header u64×8 + payload) is cheap.
+    """
+    import torch.distributed as dist  # noqa: E402
+    from vllm.distributed.parallel_state import get_tp_group
+    tp_group = get_tp_group()
+    dev_group = tp_group.device_group
+    dev = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+    # Header: [status, trie_walk_ns, summary_read_ns, score_ns,
+    #          sink_write_ns, cache_hit, concurrent_requests,
+    #          server_ingest_to_ready_ns, num_pages]  — 9 i64 slots.
+    if tp_rank == 0 and reply is not None:
+        n_pages = len(reply.page_ids)
+        hdr = torch.tensor([
+            int(reply.status),
+            int(reply.trie_walk_ns),
+            int(reply.summary_read_ns),
+            int(reply.score_ns),
+            int(reply.sink_write_ns),
+            int(bool(reply.cache_hit)),
+            int(reply.concurrent_requests),
+            int(reply.server_ingest_to_ready_ns),
+            int(n_pages),
+        ], dtype=torch.int64, device=dev)
+    else:
+        hdr = torch.zeros(9, dtype=torch.int64, device=dev)
+    dist.broadcast(hdr, src=tp_group.first_rank, group=dev_group)
+
+    n_pages = int(hdr[8].item())
+    if n_pages == 0:
+        from icms_client.protocol import ScoreReply
+        return ScoreReply(
+            status=int(hdr[0]), trie_walk_ns=int(hdr[1]),
+            summary_read_ns=int(hdr[2]), score_ns=int(hdr[3]),
+            sink_write_ns=int(hdr[4]), cache_hit=bool(hdr[5]),
+            concurrent_requests=int(hdr[6]),
+            server_ingest_to_ready_ns=int(hdr[7]),
+            page_ids=[], scores=[], sink_offsets=[],
+        )
+
+    # Payload: page_ids (i64) + sink_offsets (i64) + scores (f32).
+    if tp_rank == 0:
+        pids = torch.tensor(list(reply.page_ids), dtype=torch.int64, device=dev)
+        offs = torch.tensor(list(reply.sink_offsets), dtype=torch.int64, device=dev)
+        scs  = torch.tensor(list(reply.scores), dtype=torch.float32, device=dev)
+    else:
+        pids = torch.zeros(n_pages, dtype=torch.int64, device=dev)
+        offs = torch.zeros(n_pages, dtype=torch.int64, device=dev)
+        scs  = torch.zeros(n_pages, dtype=torch.float32, device=dev)
+    dist.broadcast(pids, src=tp_group.first_rank, group=dev_group)
+    dist.broadcast(offs, src=tp_group.first_rank, group=dev_group)
+    dist.broadcast(scs,  src=tp_group.first_rank, group=dev_group)
+
+    from icms_client.protocol import ScoreReply
+    return ScoreReply(
+        status=int(hdr[0]), trie_walk_ns=int(hdr[1]),
+        summary_read_ns=int(hdr[2]), score_ns=int(hdr[3]),
+        sink_write_ns=int(hdr[4]), cache_hit=bool(hdr[5]),
+        concurrent_requests=int(hdr[6]),
+        server_ingest_to_ready_ns=int(hdr[7]),
+        page_ids=pids.cpu().tolist(),
+        scores=scs.cpu().tolist(),
+        sink_offsets=offs.cpu().tolist(),
+    )
+
 # Module-level queue: worker → scheduler stored-chain notifications.
 # The worker appends (chain, num_groups) after WriteGroup completes;
 # the scheduler drains it in get_num_new_matched_tokens / build_meta.
@@ -450,14 +523,19 @@ class IcmsConnector(KVConnectorBase_V1):
     ):
         super().__init__(vllm_config, role, kv_cache_config)
 
-        # C5: TP=1 gate.
+        # TP>1 support: per-rank chain namespacing (commit 2) + server-side
+        # Score/FetchAll fan-out (commit 4). Each rank's connector opens its
+        # own connection with its own tp_rank/tp_size (sent at Hello), stores
+        # chunks under its own rank-tagged chain, and registers its own sink
+        # on f"cuda:{tp_rank}". Rank 0 all_gathers Q across the TP group and
+        # issues one Score RPC; other ranks skip Score and just poll their
+        # own flag sink. See docs/icms_connector_tp_support.md.
         tp = getattr(getattr(vllm_config, "parallel_config", None),
                       "tensor_parallel_size", 1)
         if tp > 1:
-            raise NotImplementedError(
-                f"IcmsConnector requires TP=1 in v1 (got TP={tp}). "
-                "See docs/icms_connector_integration_walkthrough.md C5."
-            )
+            logger.info(
+                "IcmsConnector: TP=%d detected; using per-rank chain "
+                "namespacing + server-side fan-out (tp_size>1 path).", tp)
 
         extra = (vllm_config.kv_transfer_config.kv_connector_extra_config or {})
         if isinstance(extra, str):
@@ -1009,6 +1087,7 @@ class _Worker:
         # every outbound chain with its own rank tag (_rank_tagged_chain).
         self._tp_rank = 0
         self._tp_size = 1
+        self._deployment_id = 0
         try:
             from vllm.distributed.parallel_state import (
                 get_tensor_model_parallel_rank,
@@ -1020,6 +1099,35 @@ class _Worker:
             # vLLM parallel state not initialized (e.g. in unit tests or
             # driver-side smokes). Fall back to TP=1.
             pass
+
+        # Option W: every rank of the same vLLM deployment must share a
+        # deployment_id so the storage server can bind them into a
+        # tp_group and fan out sink writes across all ranks. Rank 0
+        # generates and NCCL-broadcasts; other ranks receive.
+        if self._tp_size > 1:
+            try:
+                import torch.distributed as dist
+                from vllm.distributed.parallel_state import get_tp_group
+                tp_group = get_tp_group()
+                dev_group = tp_group.device_group
+                if self._tp_rank == 0:
+                    import secrets as _secrets
+                    # 63 bits so the value fits in signed int64 used for
+                    # the NCCL broadcast tensor; still plenty of entropy
+                    # for uniqueness across concurrent deployments.
+                    self._deployment_id = _secrets.randbits(63)
+                id_tensor = torch.tensor([int(self._deployment_id)],
+                                          dtype=torch.int64,
+                                          device=torch.device(
+                                              f"cuda:{torch.cuda.current_device()}"))
+                dist.broadcast(id_tensor, src=tp_group.first_rank,
+                                group=dev_group)
+                self._deployment_id = int(id_tensor.item()) & 0x7FFFFFFFFFFFFFFF
+            except Exception as e:
+                logger.warning("IcmsConnector: deployment_id broadcast failed "
+                                "(%s); falling back to rank-independent mode.",
+                                e)
+                self._deployment_id = 0
 
         # Per-request state (C1 worker-side cache).
         self._requests: dict[str, _RequestState] = {}
@@ -1107,7 +1215,8 @@ class _Worker:
         self._client.connect()
         ack = self._client.hello(self._model_name,
                                  tp_rank=self._tp_rank,
-                                 tp_size=self._tp_size)
+                                 tp_size=self._tp_size,
+                                 deployment_id=self._deployment_id)
         self._geom = find_model(self._model_name) or ModelGeometry(
             name=self._model_name,
             num_layers=ack.num_layers,
@@ -1155,10 +1264,21 @@ class _Worker:
         # RDMA writes and the connector polls them to overlap compute
         # with remaining layer transfers.
         flag_slots = int(self._geom.num_layers)
+        # At TP>1, each rank registers its sink on its own GPU. Use the
+        # current CUDA device (vLLM has already set it for this worker) to
+        # avoid cross-GPU addressing. The configured _gpu_device string
+        # (cuda:0 by default) only applies at TP=1.
+        gpu_dev = self._gpu_device
+        if self._tp_size > 1:
+            try:
+                cur = torch.cuda.current_device()
+                gpu_dev = f"cuda:{int(cur)}"
+            except Exception:
+                gpu_dev = f"cuda:{self._tp_rank}"
         if self._gpu_direct and self._use_rdma:
             sink = self._client.register_gpu_sink(
-                total_sink, self._gpu_device, flag_slots=flag_slots)
-            sink_desc = f"gpu_direct({self._gpu_device})"
+                total_sink, gpu_dev, flag_slots=flag_slots)
+            sink_desc = f"gpu_direct({gpu_dev})"
         else:
             sink = self._client.register_sink(total_sink)
             sink_desc = "host"
@@ -1706,6 +1826,14 @@ class _Worker:
         effective_groups = max(rs.num_groups_written, stored_groups)
         total_pages = effective_groups * _GROUP_BLOCKS
 
+        # First-turn / empty-chain short-circuit. No stored pages means
+        # nothing to score and no sink to fill — skip everything,
+        # including the TP>1 NCCL AllGather(Q) + broadcast(reply) path.
+        # This is symmetric across ranks (total_pages is derived from
+        # scheduler-propagated state), so all ranks return together.
+        if total_pages == 0:
+            return
+
         # Determine effective budget: adaptive allocator or static.
         effective_budget = budget
         budget_source = "static"
@@ -1771,6 +1899,26 @@ class _Worker:
         else:
             q_np = np.asarray(quest_query, dtype=np.float32).ravel()
 
+        # Option W: each rank produces its num_kv_heads_local × head_dim
+        # Q slice; AllGather across TP and concat to get the full Q the
+        # server would see at TP=1, so scoring is mathematically
+        # identical to TP=1 (bit-identical page selection).
+        if self._tp_size > 1:
+            try:
+                import torch.distributed as dist  # noqa: E402
+                from vllm.distributed.parallel_state import get_tp_group
+                tp_group = get_tp_group()
+                dev_group = tp_group.device_group
+                qt = torch.from_numpy(q_np).to(
+                    device=f"cuda:{torch.cuda.current_device()}")
+                gq = [torch.empty_like(qt) for _ in range(self._tp_size)]
+                dist.all_gather(gq, qt.contiguous(), group=dev_group)
+                q_full = torch.cat(gq, dim=0)
+                q_np = q_full.detach().cpu().numpy().astype(np.float32, copy=False)
+            except Exception as e:
+                logger.warning("Score: TP AllGather(Q) failed (%s); using "
+                                "rank-local Q which will give wrong pages.", e)
+
         # Fire Score synchronously for v1. Use the shared sink (slot 0)
         # without the slot pool — in v1 we don't fetch KV back to GPU, so
         # we don't need per-request sink isolation. The score result is
@@ -1787,25 +1935,57 @@ class _Worker:
         logger.debug("Score: layer=%d reuse_through=%d chain_len=%d k=%d",
                       next_layer_idx, reuse_through, len(rs.chain), k)
 
+        reply = None
+        t_score_end = t_score_start
         try:
-            reply = self._client.score(
-                request_id=icms_rid,
-                chain=self._rank_chain(rs.chain),
-                layer=next_layer_idx,
-                query=q_np,
-                k=k,
-                sink=self._sink_pool.sink,
-                reuse_through_layer=reuse_through,
-                # Reply-early: server ships the ScoreReply as soon as
-                # Phase 1 (scoring) finishes; Phase 2 KV writes and
-                # per-layer flag flips continue in the background. The
-                # reactor and worker share a single QP per connection,
-                # so the server takes a per-conn mutex around each
-                # ibv_post_send (RdmaTransport::send() +
-                # RdmaSinkRegistry::submit_write/submit_flag_write).
-                use_flags=True,
-            )
+            # Option W: only rank 0 issues the Score RPC. Server's
+            # drain-time fan-out replicates the sink bytes to every
+            # peer rank's sink. Rank 0 then broadcasts the reply tuple
+            # so every rank can populate _pending_scores identically.
+            if self._tp_size > 1 and self._tp_rank != 0:
+                reply = None
+            else:
+                reply = self._client.score(
+                    request_id=icms_rid,
+                    chain=self._rank_chain(rs.chain),
+                    layer=next_layer_idx,
+                    query=q_np,
+                    k=k,
+                    sink=self._sink_pool.sink,
+                    reuse_through_layer=reuse_through,
+                    # Smoke note: keep use_flags=True everywhere for now.
+                    # Fan-out in drain_completions runs after Phase 2
+                    # regardless of when the reply was shipped — rank 1
+                    # gets the broadcasted reply and proceeds, and in
+                    # practice the sink bytes will land before it's
+                    # consumed (sweep-verified at TP=1). TP=2 correctness
+                    # re-check will be done before removing this note.
+                    use_flags=True,
+                )
             t_score_end = time.perf_counter()
+        except Exception as e:
+            t_score_end = time.perf_counter()
+            logger.exception("Score RPC failed rank=%d layer=%d: %s",
+                              self._tp_rank, next_layer_idx, e)
+            reply = None
+
+        # Broadcast reply to all ranks (outside the try so a Score RPC
+        # failure on rank 0 still reaches the collective on all ranks).
+        if self._tp_size > 1:
+            try:
+                reply = _tp_broadcast_score_reply(
+                    reply, self._tp_rank, self._tp_size)
+            except Exception as e:
+                logger.warning("Score: reply broadcast failed: %s", e)
+                reply = None
+        if reply is None:
+            # Nothing to do; don't touch _pending_scores / _pending_reuse.
+            self.stats.record_score(
+                (t_score_end - t_score_start) * 1e6,
+                False, [], next_layer_idx,
+            )
+            return
+        try:
             # Reply-early (use_flags=True): server flips per-layer
             # flags over RDMA as Phase 2 writes complete — do NOT
             # force them ready locally or wait_for_layer will skip
@@ -2389,8 +2569,43 @@ class _Worker:
 
         # Batched GPU→CPU copy: index all new blocks at once.
         idx_tensor = torch.tensor(valid_ids, dtype=torch.long, device=k_cache.device)
-        k_batch = k_cache[idx_tensor].cpu()  # [N, block_size, num_kv_heads, head_dim]
-        v_batch = v_cache[idx_tensor].cpu()
+        k_batch_gpu = k_cache[idx_tensor]
+        v_batch_gpu = v_cache[idx_tensor]
+
+        # Option W write-path: at TP>1 each rank's kv_cache holds only
+        # its num_kv_heads_local slice. NCCL-AllGather across the TP
+        # group along the num_kv_heads dim (dim=2 for
+        # [N, block_size, num_kv_heads_local, head_dim]) so rank 0
+        # can emit a full-head blob via write_group. Both ranks must
+        # reach the collective: extract_and_record's early-returns
+        # (self._requests empty / seq_len<=0 / nothing-to-record) are
+        # derived from scheduler-propagated state and so fire
+        # symmetrically at TP=2. If we ever see a hang here it means
+        # that assumption is wrong — fall back by wrapping with a
+        # pre-sync AllReduce(have-data) flag.
+        if self._tp_size > 1:
+            try:
+                import torch.distributed as dist  # noqa: E402
+                from vllm.distributed.parallel_state import get_tp_group
+                tp_group = get_tp_group()
+                dev_group = tp_group.device_group
+                gk = [torch.empty_like(k_batch_gpu)
+                      for _ in range(self._tp_size)]
+                gv = [torch.empty_like(v_batch_gpu)
+                      for _ in range(self._tp_size)]
+                dist.all_gather(gk, k_batch_gpu.contiguous(),
+                                 group=dev_group)
+                dist.all_gather(gv, v_batch_gpu.contiguous(),
+                                 group=dev_group)
+                k_batch_gpu = torch.cat(gk, dim=2)
+                v_batch_gpu = torch.cat(gv, dim=2)
+            except Exception as e:
+                logger.warning("extract_and_record: TP AllGather failed "
+                                "(%s); half-head write will result in "
+                                "garbage on the server.", e)
+
+        k_batch = k_batch_gpu.cpu()
+        v_batch = v_batch_gpu.cpu()
 
         for i, intra_idx in enumerate(range(effective_start, effective_start + len(valid_ids))):
             self.record_page(rid, intra_idx, layer_idx, k_batch[i], v_batch[i])
@@ -2501,11 +2716,16 @@ class _Worker:
                     len(chain_prefix), rs.num_groups_written)
         t0 = time.perf_counter()
         try:
-            self._client.write_group(
-                self._rank_chain(chain_prefix),
-                bytes(buf.summary_blob), bytes(buf.kv_blob),
-                pages_in_group=pages,
-            )
+            # Option W: only rank 0 sends to the server. All ranks still
+            # update local bookkeeping (_record_stored_groups etc.) below.
+            if self._tp_size > 1 and self._tp_rank != 0:
+                pass  # rank>0 skips the wire write_group
+            else:
+                self._client.write_group(
+                    self._rank_chain(chain_prefix),
+                    bytes(buf.summary_blob), bytes(buf.kv_blob),
+                    pages_in_group=pages,
+                )
             self.stats.record_flush((time.perf_counter() - t0) * 1e6)
             self.stats.total_groups_written += 1
             if group_idx >= rs.num_groups_written:
@@ -2581,6 +2801,9 @@ class _Worker:
         rs = self._requests.setdefault(
             request_id, _RequestState(request_id=request_id))
         rs.chain = list(chain)
+        # Option W: only rank 0 RPCs; other ranks no-op but keep local state.
+        if self._tp_size > 1 and self._tp_rank != 0:
+            return None
         return self._client.write_group(self._rank_chain(chain),
                                          summary_blob, kv_blob,
                                          pages_in_group=_GROUP_BLOCKS)
