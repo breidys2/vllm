@@ -89,6 +89,20 @@ except ImportError:
 _SINK_SLOTS = 4           # C8: number of pre-allocated sink slots
 _GROUP_BLOCKS = GROUP_PAGES  # blocks per group (= pages per group = 32)
 
+# TP sharding: each rank prefixes its chain with a rank-tagged sentinel so
+# server-side trie entries never collide across ranks. At TP=1 this adds
+# one no-op level to the trie; wire and scoring behavior are unchanged.
+# See docs/icms_connector_tp_support.md.
+_RANK_TAG_MAGIC = 0xE1C5A4EE00000000
+
+def _rank_tag(tp_rank: int) -> int:
+    return _RANK_TAG_MAGIC | int(tp_rank)
+
+def _rank_tagged_chain(tp_rank: int, chain):
+    if chain is None:
+        return chain
+    return [_rank_tag(tp_rank), *chain]
+
 # Module-level queue: worker → scheduler stored-chain notifications.
 # The worker appends (chain, num_groups) after WriteGroup completes;
 # the scheduler drains it in get_num_new_matched_tokens / build_meta.
@@ -990,6 +1004,23 @@ class _Worker:
         self._geom: ModelGeometry | None = None
         self._sink_pool: _SinkSlotPool | None = None
 
+        # Tensor-parallel identity. At TP=1 this is {0, 1} and the rank-tag
+        # prefix is a no-op level in the trie. At TP>1 each rank prefixes
+        # every outbound chain with its own rank tag (_rank_tagged_chain).
+        self._tp_rank = 0
+        self._tp_size = 1
+        try:
+            from vllm.distributed.parallel_state import (
+                get_tensor_model_parallel_rank,
+                get_tensor_model_parallel_world_size,
+            )
+            self._tp_rank = int(get_tensor_model_parallel_rank())
+            self._tp_size = int(get_tensor_model_parallel_world_size())
+        except Exception:
+            # vLLM parallel state not initialized (e.g. in unit tests or
+            # driver-side smokes). Fall back to TP=1.
+            pass
+
         # Per-request state (C1 worker-side cache).
         self._requests: dict[str, _RequestState] = {}
 
@@ -1074,7 +1105,9 @@ class _Worker:
             transport_desc = self._socket_path
 
         self._client.connect()
-        ack = self._client.hello(self._model_name)
+        ack = self._client.hello(self._model_name,
+                                 tp_rank=self._tp_rank,
+                                 tp_size=self._tp_size)
         self._geom = find_model(self._model_name) or ModelGeometry(
             name=self._model_name,
             num_layers=ack.num_layers,
@@ -1099,9 +1132,13 @@ class _Worker:
             logger.info("[icms] kv_layout=page-major")
         else:
             logger.info("[icms] kv_layout=layer-major")
-        # Update allocator with actual kv_page_bytes from model geometry.
+        # Update allocator with actual kv_page_bytes and num_layers from
+        # model geometry. The allocator pairs end-to-end slack with total
+        # KV bytes (all layers × pages × kv_page_bytes), so num_layers is
+        # required for a well-defined demand number.
         if self._adaptive_allocator is not None:
             self._adaptive_allocator._kv_page_bytes = self._geom.kv_page_bytes
+            self._adaptive_allocator._num_layers = int(self._geom.num_layers)
 
         # Sink sizing: needs to hold one server Phase-2 dump at a time.
         # - Score path (stride-gated): score_stride layers × k pages.
@@ -1134,6 +1171,10 @@ class _Worker:
             self._score_stride, per_layer_bytes, total_sink,
             self._score_stride,
         )
+
+    def _rank_chain(self, chain):
+        """Apply this worker's rank tag to an outbound chain (TP sharding)."""
+        return _rank_tagged_chain(self._tp_rank, chain)
 
     def _get_stored_context_groups(self, chain: list[int]) -> int:
         """Find the longest stored chain prefix matching the given chain.
@@ -1210,7 +1251,7 @@ class _Worker:
         for rid, rs in list(self._requests.items()):
             if rs.chain:
                 try:
-                    self._client.evict(rs.chain)
+                    self._client.evict(self._rank_chain(rs.chain))
                 except Exception:
                     pass
         self._requests.clear()
@@ -1349,7 +1390,8 @@ class _Worker:
         """
         try:
             icms_rid = self._icms_request_id(request_id, 0)
-            self._client.preload(request_id=icms_rid, chain=chain)
+            self._client.preload(request_id=icms_rid,
+                                 chain=self._rank_chain(chain))
         except Exception as e:
             logger.debug("preload failed for %s: %s", request_id, e)
 
@@ -1457,7 +1499,7 @@ class _Worker:
         try:
             reply = self._client.fetch_all(
                 request_id=icms_rid,
-                chain=rs.chain,
+                chain=self._rank_chain(rs.chain),
                 layer=next_layer_idx,
                 sink=self._sink_pool.sink,
                 reuse_through_layer=reuse_through,
@@ -1566,13 +1608,17 @@ class _Worker:
         """CPU-scoring path: Q arrived, fire Score against icms (C9 State 2/3).
 
         Stride-gated: we only fire a fresh Score at stride boundaries
-        (next_layer_idx = 1, 1+stride, 1+2*stride, ...). In between, the
+        (next_layer_idx ∈ {0, stride, 2*stride, ...}). In between, the
         prior Score's Phase-2 KV writes already cover this layer — we
         just route to ``on_layer_reuse`` which promotes the pre-stashed
         reuse entry into _pending_scores so wait_for_layer can consume it.
+
+        Layer 0 is delivered by quest_hooks' forward-pre-hook (Q_0 is
+        not reachable from a post-hook since there's no layer −1). The
+        pattern covers layers 0..num_layers−1 uniformly.
         """
         try:
-            if ((next_layer_idx - 1) % self._score_stride) != 0:
+            if (next_layer_idx % self._score_stride) != 0:
                 self.on_layer_reuse(next_layer_idx, budget, stats)
                 return
             self._on_layer_score_impl(
@@ -1744,7 +1790,7 @@ class _Worker:
         try:
             reply = self._client.score(
                 request_id=icms_rid,
-                chain=rs.chain,
+                chain=self._rank_chain(rs.chain),
                 layer=next_layer_idx,
                 query=q_np,
                 k=k,
@@ -2456,7 +2502,8 @@ class _Worker:
         t0 = time.perf_counter()
         try:
             self._client.write_group(
-                chain_prefix, bytes(buf.summary_blob), bytes(buf.kv_blob),
+                self._rank_chain(chain_prefix),
+                bytes(buf.summary_blob), bytes(buf.kv_blob),
                 pages_in_group=pages,
             )
             self.stats.record_flush((time.perf_counter() - t0) * 1e6)
@@ -2534,7 +2581,8 @@ class _Worker:
         rs = self._requests.setdefault(
             request_id, _RequestState(request_id=request_id))
         rs.chain = list(chain)
-        return self._client.write_group(chain, summary_blob, kv_blob,
+        return self._client.write_group(self._rank_chain(chain),
+                                         summary_blob, kv_blob,
                                          pages_in_group=_GROUP_BLOCKS)
 
     def direct_score(self, request_id: str, chain: list[int],
@@ -2549,7 +2597,7 @@ class _Worker:
         # call sequence share a single icms request_id (cross-layer reuse).
         icms_rid = self._icms_request_id(request_id, 0)
         return self._client.score(
-            request_id=icms_rid, chain=chain, layer=layer,
+            request_id=icms_rid, chain=self._rank_chain(chain), layer=layer,
             query=q_np, k=k, sink=self._sink_pool.sink,
         )
 

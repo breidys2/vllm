@@ -133,6 +133,7 @@ class QuestHookManager:
         self._extract_layer_weights(model)
 
         count = 0
+        pre_hook_layer0 = 0
         for name, module in model.named_modules():
             if isinstance(module, decoder_layer_cls):
                 layer_idx = self._extract_layer_idx(name)
@@ -144,6 +145,21 @@ class QuestHookManager:
                 )
                 self._hook_handles.append(handle)
                 count += 1
+
+                # Additional pre-hook on layer 0 ONLY — post-hooks on
+                # layer L-1 can only reconstruct Q_L for L>=1, so layer
+                # 0 has no Q source otherwise. Pre-hook runs before
+                # layer 0's forward with the embedding output as input
+                # and recovers Q_0 using the already-cached layer-0
+                # LayerNorm + Q-proj + RoPE weights. Keeping the rest
+                # on post-hooks minimises surface area across decoder
+                # variants (MLA etc.) that share the post-hook path.
+                if layer_idx == 0:
+                    pre_handle = module.register_forward_pre_hook(
+                        self._make_pre_layer0_hook()
+                    )
+                    self._hook_handles.append(pre_handle)
+                    pre_hook_layer0 += 1
 
         self._active = True
         logger.info(
@@ -271,6 +287,26 @@ class QuestHookManager:
 
         return hook
 
+    def _make_pre_layer0_hook(self):
+        """Pre-hook for layer 0 so Q_0 can be captured.
+
+        Post-hooks on layer L-1 can only reconstruct Q_L for L>=1 (there
+        is no layer -1 whose output feeds layer 0). Without this pre-hook
+        layer 0 falls through to vLLM's default block table and attends
+        to whatever KV the scheduler had reserved, instead of the
+        stride-group-0 selected pages. A pre-hook on layer 0's decoder
+        module fires with the embedding output in `input`, lets us
+        apply layer 0's cached LayerNorm + Q-proj + RoPE weights to
+        compute Q_0, and dispatches via save_kv_layer with
+        next_layer_idx=0 — the stride check fires for layer 0 under
+        the {0, stride, 2*stride, …} pattern.
+        """
+
+        def pre_hook(module: nn.Module, input: tuple) -> None:
+            self._on_layer0_pre(module, input)
+
+        return pre_hook
+
     def _on_layer_complete(
         self,
         layer_idx: int,
@@ -356,14 +392,14 @@ class QuestHookManager:
             return
 
         # Stride gating: only stride-aligned layers need a fresh Q.
-        # Non-stride layers reuse the prior stride group's Score result —
-        # route them through the connector's reuse path without computing
-        # Q. Saves (stride-1)/stride of the Q-projection work (40 of 48
-        # layers at stride=6). Independent of budget: non-stride layers
-        # never consult Q regardless of what the adaptive allocator picks.
+        # Scored set = {0, stride, 2*stride, …}. Layer 0 is handled by a
+        # dedicated pre-hook (see _make_pre_layer0_hook); non-stride
+        # layers reuse the prior stride group's Score result and route
+        # through the connector's reuse path without computing Q.
+        # Independent of budget — non-stride layers never consult Q.
         is_stride_layer = (
             self.score_stride <= 1
-            or ((next_layer_idx - 1) % self.score_stride) == 0
+            or (next_layer_idx % self.score_stride) == 0
         )
         if not is_stride_layer:
             if self.kv_connector is not None:
@@ -450,6 +486,119 @@ class QuestHookManager:
                         attn_metadata=None,
                         hidden_states=residual,
                         next_layer_idx=next_layer_idx,
+                        budget=budget,
+                        quest_selected_pages=selected,
+                        quest_stats=self.stats,
+                    )
+                except Exception:
+                    pass
+
+    def _on_layer0_pre(
+        self,
+        module: nn.Module,
+        input: tuple,
+    ) -> None:
+        """Pre-hook for layer 0.
+
+        Mirrors _on_layer_complete's control flow (budget gating, stride
+        check, FetchAll shortcut, Score dispatch) but reads the residual
+        stream directly from `input` instead of reconstructing it from a
+        post-hook output. vLLM's decoder layer takes
+        (positions, hidden_states, residual); for layer 0 residual is
+        typically None so the layer's input_layernorm operates on
+        hidden_states alone.
+        """
+        if 0 not in self._q_proj_weights or 0 not in self._layernorm_weights:
+            return
+
+        if not isinstance(input, tuple) or len(input) < 2:
+            return
+
+        positions: torch.Tensor | None = None
+        if isinstance(input[0], torch.Tensor):
+            positions = input[0]
+
+        hidden_states = input[1]
+        if not isinstance(hidden_states, torch.Tensor):
+            return
+
+        residual_in = input[2] if len(input) >= 3 else None
+        if isinstance(residual_in, torch.Tensor):
+            stream = hidden_states + residual_in
+        else:
+            stream = hidden_states
+
+        # Budget for layer 0.
+        budget = self.budget_computer.compute_budget(
+            approximate_scores=torch.empty(0),
+            layer_idx=0,
+            num_layers=self.num_layers,
+        )
+
+        # FetchAll shortcut (Config B's path): fire once; subsequent
+        # layers' post-hook shortcut also fires, which is harmless under
+        # quest_all_pages=True. Matches _on_layer_complete semantics.
+        if budget >= 1.0 and self.allow_all_pages_shortcut:
+            if self.kv_connector is not None:
+                try:
+                    self.kv_connector.save_kv_layer(
+                        layer_name="layer_pre_0",
+                        kv_layer=torch.empty(0),
+                        attn_metadata=None,
+                        quest_all_pages=True,
+                        next_layer_idx=0,
+                        budget=budget,
+                        quest_stats=self.stats,
+                    )
+                except Exception:
+                    pass
+            return
+
+        # Layer 0 is always a stride-aligned layer under the
+        # {0, stride, 2*stride, …} pattern, so always compute Q here.
+        if self.stats is not None:
+            self.stats.begin_q_compute(0)
+
+        query = self._compute_exact_q(stream, 0, positions)
+
+        if self.stats is not None:
+            self.stats.end_q_compute(0)
+
+        if query is None:
+            return
+
+        if self.cpu_scoring:
+            if self.kv_connector is not None:
+                try:
+                    self.kv_connector.save_kv_layer(
+                        layer_name="layer_pre_0",
+                        kv_layer=torch.empty(0),
+                        attn_metadata=None,
+                        quest_query=query,
+                        next_layer_idx=0,
+                        budget=budget,
+                        quest_stats=self.stats,
+                    )
+                except Exception:
+                    pass
+        else:
+            if self.page_selector is None:
+                return
+            selected = self.page_selector.select_pages(
+                query=query,
+                layer_idx=0,
+                budget=budget,
+                stats=self.stats,
+            )
+            self._current_selections[0] = selected
+            if self.kv_connector is not None:
+                try:
+                    self.kv_connector.save_kv_layer(
+                        layer_name="layer_pre_0",
+                        kv_layer=torch.empty(0),
+                        attn_metadata=None,
+                        hidden_states=stream,
+                        next_layer_idx=0,
                         budget=budget,
                         quest_selected_pages=selected,
                         quest_stats=self.stats,

@@ -27,13 +27,21 @@ class RequestDemand:
 
 
 class ComputeSlackTable:
-    """Lookup table for per-layer compute time (from offline profiling).
+    """Lookup table for end-to-end forward-pass time (from offline profiling).
 
-    Interpolates between profiled (new_tokens, cache_tokens) pairs.
+    Returns total_forward_ms for a (new_tokens, cache_tokens) pair. Paired
+    with total-KV-bytes (pages × kv_page_bytes × num_layers) in the
+    allocator — end-to-end slack × total KV avoids the noise of dividing
+    through by num_layers on both sides.
     """
 
+    # Fallback when no table is loaded or a lookup misses. ~720 ms was the
+    # old HF-profile default; the new vLLM profile puts most points near
+    # 35-50 ms, so we bias low to avoid overestimating slack on miss.
+    _DEFAULT_MS = 50.0
+
     def __init__(self, table_path: str | Path | None = None):
-        self._entries: dict[tuple[int, int], float] = {}  # (new, cache) → ms
+        self._entries: dict[tuple[int, int], float] = {}  # (new, cache) → total_forward_ms
         self._new_tokens_sorted: list[int] = []
         self._cache_tokens_sorted: list[int] = []
         if table_path:
@@ -44,7 +52,14 @@ class ComputeSlackTable:
             data = json.load(f)
         for entry in data.get("table", {}).values():
             key = (entry["new_tokens"], entry["cache_tokens"])
-            self._entries[key] = entry["per_layer_ms"]
+            # Prefer end-to-end time; fall back to per_layer × num_layers
+            # for backward-compat with the pre-2026-04-23 profiles.
+            if "total_forward_ms" in entry:
+                self._entries[key] = entry["total_forward_ms"]
+            elif "per_layer_ms" in entry and "num_layers" in entry:
+                self._entries[key] = entry["per_layer_ms"] * entry["num_layers"]
+            else:
+                continue
         new_set = sorted(set(k[0] for k in self._entries))
         cache_set = sorted(set(k[1] for k in self._entries))
         self._new_tokens_sorted = new_set
@@ -53,14 +68,13 @@ class ComputeSlackTable:
                     len(self._entries), path)
 
     def lookup(self, new_tokens: int, cache_tokens: int) -> float:
-        """Return per-layer compute time in ms, interpolating if needed."""
+        """Return end-to-end forward time in ms (nearest-neighbor on both axes)."""
         if not self._entries:
-            return 15.0  # reasonable default (ms)
+            return self._DEFAULT_MS
 
-        # Find nearest profiled values.
         nt = self._nearest(self._new_tokens_sorted, new_tokens)
         ct = self._nearest(self._cache_tokens_sorted, cache_tokens)
-        return self._entries.get((nt, ct), 15.0)
+        return self._entries.get((nt, ct), self._DEFAULT_MS)
 
     @staticmethod
     def _nearest(sorted_list: list[int], value: int) -> int:
@@ -85,10 +99,16 @@ class AdaptiveBandwidthAllocator:
         link_bandwidth_bps: float,
         kv_page_bytes: int,
         slack_table: ComputeSlackTable | None = None,
+        num_layers: int = 1,
     ):
         self._link_bw = link_bandwidth_bps
         self._kv_page_bytes = kv_page_bytes
         self._slack_table = slack_table or ComputeSlackTable()
+        # num_layers scales the KV byte count to total cache transfer (all
+        # layers × pages × kv_page_bytes). Paired with end-to-end slack
+        # from the slack table so the ratio is well-defined. Default 1 is
+        # backward-compat for callers that haven't wired model geometry.
+        self._num_layers = max(1, int(num_layers))
         self._active: dict[str, RequestDemand] = {}
         self._lock = threading.Lock()
 
@@ -107,16 +127,19 @@ class AdaptiveBandwidthAllocator:
         Returns:
             budget: fraction of cache pages to fetch (0.0-1.0)
         """
-        # Compute per-layer slack from profiling table.
-        per_layer_ms = self._slack_table.lookup(new_tokens, cache_tokens)
+        # End-to-end forward time from the slack table (ms). Paired below
+        # with total-KV (all layers) — the ratio is the sustained rate
+        # needed to land every cached page during the prefill.
+        total_forward_ms = self._slack_table.lookup(new_tokens, cache_tokens)
 
-        # Full KV demand: bytes needed per layer at 100% budget.
-        full_kv_bytes = total_cache_pages * self._kv_page_bytes
+        # Full KV demand: total bytes across all layers at 100% budget.
+        full_kv_bytes = (
+            total_cache_pages * self._kv_page_bytes * self._num_layers
+        )
 
-        # Demand: bytes/sec needed to transfer full KV within the compute slack.
-        per_layer_sec = per_layer_ms / 1000.0
-        if per_layer_sec > 0:
-            demand_bps = full_kv_bytes / per_layer_sec
+        total_forward_sec = total_forward_ms / 1000.0
+        if total_forward_sec > 0:
+            demand_bps = full_kv_bytes / total_forward_sec
         else:
             demand_bps = float("inf")
 
@@ -135,7 +158,7 @@ class AdaptiveBandwidthAllocator:
             "register_request %s: new=%d cache=%d pages=%d "
             "slack=%.2fms demand=%.1f MB/s budget=%.3f",
             request_id, new_tokens, cache_tokens, total_cache_pages,
-            per_layer_ms, demand_bps / 1e6, budget,
+            total_forward_ms, demand_bps / 1e6, budget,
         )
         return budget
 
