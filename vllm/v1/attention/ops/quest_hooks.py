@@ -97,6 +97,9 @@ class QuestHookManager:
         self._num_heads: int | None = None
         self._num_kv_heads: int | None = None
         self._head_dim: int | None = None
+        # Set by register_callbacks(); None when using the legacy
+        # register_hooks() path.
+        self._registry: Any | None = None
 
     def register_hooks(
         self,
@@ -176,8 +179,134 @@ class QuestHookManager:
         for handle in self._hook_handles:
             handle.remove()
         self._hook_handles.clear()
+        if self._registry is not None:
+            self._registry.clear()
         self._active = False
         self._current_selections.clear()
+
+    # ------------------------------------------------------------------
+    # New registry-based path (torch.compile / PIECEWISE-CUDAGraph compatible).
+    #
+    # Instead of register_forward_hook (which Dynamo strips during
+    # compilation), we attach a QuestLayerCallbackRegistry on the model
+    # and register two callbacks: pre-layer-0 and post-every-layer. The
+    # patched model.forward calls fire_pre_layer / fire_post_layer (both
+    # @torch._dynamo.disable'd) between consecutive layer(...) calls, so
+    # Python runs in eager between captured per-layer pieces.
+    # ------------------------------------------------------------------
+    def register_callbacks(
+        self,
+        model: nn.Module,
+        decoder_layer_cls: type | None = None,
+    ) -> int:
+        """Register Quest callbacks via the layer-callback registry.
+
+        Equivalent to ``register_hooks`` but routes via the new registry
+        path so callbacks survive ``torch.compile`` (PIECEWISE CUDAGraphs).
+
+        Returns the number of decoder layers detected (0 if disabled).
+        """
+        from vllm.v1.attention.ops.quest_layer_callbacks import (
+            QuestLayerCallbackRegistry,
+            attach_registry,
+        )
+
+        if self._active:
+            logger.warning(
+                "Quest callbacks already registered, skipping")
+            return 0
+
+        if decoder_layer_cls is None:
+            decoder_layer_cls = self._detect_decoder_layer_cls(model)
+        if decoder_layer_cls is None:
+            logger.warning(
+                "Could not auto-detect decoder layer class. "
+                "Quest callbacks not registered.")
+            return 0
+
+        # Cache LayerNorm + Q-proj + rotary weights for every layer.
+        self._extract_layer_weights(model)
+
+        # Attach the registry to the module that owns the for-layer loop.
+        # The patched forward calls torch.ops.vllm.quest_fire_*_layer with
+        # self.quest_layer_callbacks_marker (set by attach_registry); the
+        # custom-op impl looks up the registry from a process-global table
+        # using that marker. We attach to the *inner* model (Qwen3MoeModel,
+        # LlamaModel, ...) since that's where the for-layer loop lives.
+        target_module = self._find_layers_parent(model)
+        if target_module is None:
+            target_module = model
+        registry = getattr(target_module, "quest_layer_callbacks", None)
+        if registry is None:
+            registry = QuestLayerCallbackRegistry()
+        else:
+            registry.clear()
+        attach_registry(target_module, registry)
+        self._registry = registry
+
+        # Count layers (matches the old register_hooks return semantics).
+        count = 0
+        for _name, module in model.named_modules():
+            if isinstance(module, decoder_layer_cls):
+                count += 1
+
+        # Register two adapters that reuse the existing hook bodies.
+        registry.register_pre(self._registry_pre_callback)
+        registry.register_post(self._registry_post_callback)
+
+        self._active = True
+        logger.info(
+            "Registered Quest callbacks via registry on %s "
+            "(%d layers detected, Q weights cached for %d)",
+            decoder_layer_cls.__name__, count, len(self._q_proj_weights))
+        return count
+
+    @staticmethod
+    def _find_layers_parent(model: nn.Module) -> nn.Module | None:
+        """Locate the inner module whose ``self.layers`` is the decoder
+        ModuleList. Mirrors ``_extract_layer_weights``'s walk."""
+        for _name, mod in model.named_modules():
+            layers = getattr(mod, "layers", None)
+            if layers is None:
+                continue
+            # Heuristic: the layers attr should be a ModuleList of
+            # decoder layers, not a single layer or some other module.
+            if isinstance(layers, (nn.ModuleList, nn.Sequential)) and len(layers) > 0:
+                return mod
+        return None
+
+    def _registry_pre_callback(self, layer_idx, positions, hidden_states,
+                                residual, model):
+        """Adapter from registry signature → existing pre-hook logic.
+
+        Only layer 0 fires the actual pre-hook body; for L>=1 the
+        post-hook on L-1 already covers the next-layer Q computation.
+        """
+        if layer_idx != 0:
+            return
+        # Reuse existing _on_layer0_pre body by synthesizing the input
+        # tuple it expects: (positions, hidden_states, residual).
+        synthetic_input = (positions, hidden_states, residual)
+        self._on_layer0_pre(module=None, input=synthetic_input)
+
+    def _registry_post_callback(self, layer_idx, positions, hidden_states,
+                                 residual, model):
+        """Adapter from registry signature → existing post-hook logic.
+
+        Synthesizes the (input, output) tuple that ``_on_layer_complete``
+        expects: input=(positions, ...), output=(hidden_states, residual).
+        Since the post-hook reconstructs the residual stream from
+        ``output[0] + output[1]``, passing the layer's true (h, r)
+        return tuple is sufficient.
+        """
+        synthetic_input = (positions,)
+        synthetic_output = (hidden_states, residual)
+        self._on_layer_complete(
+            layer_idx=layer_idx,
+            module=None,
+            input=synthetic_input,
+            output=synthetic_output,
+        )
 
     def get_selection(self, layer_idx: int) -> torch.Tensor | None:
         """Get the computed page selection for a layer (if available)."""

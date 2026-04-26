@@ -35,6 +35,7 @@ import sys
 import threading
 import time
 from collections import defaultdict
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -751,7 +752,18 @@ class IcmsConnector(KVConnectorBase_V1):
     def request_finished(
         self, request: Request, block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
+        # Cross-process bridge for the prefix index. The worker writes the
+        # chain to its process-local `_stored_chain_queue` when iter-1 saves
+        # to ICMS, but at TP>1 with multiproc_executor the scheduler runs in
+        # a different Python process and never sees that queue. Without
+        # this, get_num_new_matched_tokens returns 0 at TP>1 → vLLM never
+        # elides the prefill → TP=2 ICMS C runs the full 16k forward
+        # (~890 ms) instead of the intended 16-token short-circuit
+        # (~130 ms). The scheduler already has rid→chain from
+        # get_num_new_matched_tokens, and n_groups is deterministic from
+        # the prompt length, so we record it here directly without IPC.
         if self._sched is not None:
+            self._sched.on_finished_record_stored(request)
             self._sched.on_finished(request.request_id)
         if self._worker is not None:
             self._worker.on_request_finished(request.request_id)
@@ -1023,6 +1035,41 @@ class _Scheduler:
         # the forward pass via wait_for_layer_load.
         return ext_tokens, False
 
+    def on_finished_record_stored(self, request: Request) -> None:
+        """Record this request's chain into the scheduler-side prefix index
+        so subsequent iter-2 lookups via get_num_new_matched_tokens find it.
+
+        Required at TP>1 with multiproc_executor where the worker's save
+        notifications never reach the scheduler process (the
+        ``_stored_chain_queue`` global is per-process). The chain was
+        already computed in get_num_new_matched_tokens for this rid;
+        n_groups is deterministic from prompt length.
+
+        Idempotent: record_stored_chain merges duplicates by chain key.
+        """
+        rid = request.request_id
+        chain = self._chains.get(rid)
+        if not chain:
+            return
+        token_ids = getattr(request, "all_token_ids", None)
+        if token_ids is None or len(token_ids) == 0:
+            token_ids = getattr(request, "prompt_token_ids", [])
+        if not token_ids:
+            return
+        # n_groups = number of COMPLETE groups written. The worker only
+        # saves complete groups, so floor-divide is correct (matches the
+        # match_best=32 behavior we see at TP=1 for prompt_len=16448:
+        # 16448 // 512 = 32).
+        group_tokens = _GROUP_BLOCKS * PAGE_TOKENS  # 32 * 16 = 512
+        n_groups = len(token_ids) // group_tokens
+        if n_groups <= 0:
+            return
+        self.record_stored_chain(chain, n_groups)
+        logger.debug(
+            "on_finished_record_stored: rid=%s chain_len=%d n_groups=%d "
+            "prompt_len=%d",
+            rid, len(chain), n_groups, len(token_ids))
+
     def on_finished(self, request_id: str):
         self._chains.pop(request_id, None)
         self._block_ids.pop(request_id, None)
@@ -1212,11 +1259,50 @@ class _Worker:
             self._client = IcmsClient(self._socket_path)
             transport_desc = self._socket_path
 
-        self._client.connect()
-        ack = self._client.hello(self._model_name,
-                                 tp_rank=self._tp_rank,
-                                 tp_size=self._tp_size,
-                                 deployment_id=self._deployment_id)
+        # Stagger worker connects so multiple TP ranks don't all hit BF2's
+        # accept queue in the same millisecond — RDMA Hello races have
+        # been observed at TP>1 (TP1 timed out while TP0's hello was
+        # still in-flight, even though BF2 was healthy).
+        import time as _t
+        if self._tp_size > 1 and self._tp_rank > 0:
+            _t.sleep(0.5 * self._tp_rank)
+
+        # BF2 occasionally dies between the main-process restart and when
+        # individual workers try to connect. Retry with auto-restart on
+        # connect/hello failure. Catch is broad on purpose: ConnectionError,
+        # OSError, IcmsError (Hello failed), TimeoutError. Disabled via
+        # ICMS_BF2_AUTORESTART=0.
+        _max_attempts = 4
+        for _attempt in range(_max_attempts):
+            try:
+                self._client.connect()
+                ack = self._client.hello(self._model_name,
+                                         tp_rank=self._tp_rank,
+                                         tp_size=self._tp_size,
+                                         deployment_id=self._deployment_id)
+                break  # success
+            except Exception as _e:  # broad: any connect/hello failure
+                if _attempt == _max_attempts - 1:
+                    raise
+                logger.warning(
+                    "[icms-connect] attempt %d/%d failed: %s; trying "
+                    "BF2 auto-restart and retrying (tp_rank=%d)",
+                    _attempt + 1, _max_attempts, _e, self._tp_rank)
+                try:
+                    from lib.bf2_runner import ensure_bf2_running  # type: ignore
+                    ensure_bf2_running(probe_host=self._rdma_server_host,
+                                        probe_port=self._rdma_port,
+                                        timeout=30.0)
+                except Exception:
+                    pass  # auto-restart helper unavailable; just retry
+                # Re-create the client object — the previous one may have
+                # left dangling RDMA state after a failed connect.
+                if self._use_rdma:
+                    self._client = RdmaIcmsClient(cfg)
+                else:
+                    self._client = IcmsClient(self._socket_path)
+                # Backoff with jitter on tp_rank so retries don't re-collide.
+                _t.sleep(2.0 + 0.5 * _attempt + 0.3 * self._tp_rank)
         self._geom = find_model(self._model_name) or ModelGeometry(
             name=self._model_name,
             num_layers=ack.num_layers,
@@ -1880,20 +1966,38 @@ class _Worker:
         # group for GQA (matching QuestPageSelector.compute_page_scores).
         geom = self._geom
         if isinstance(quest_query, torch.Tensor):
+            # ── DIAGNOSTIC: log forward batch size at the first scored layer.
+            # quest_query.shape[0] is the actual number of forward tokens
+            # vLLM ran through this layer. If vLLM honored the connector's
+            # ext_tokens=16384, this would be 64 (just the new prompt tail);
+            # if vLLM ran the full prefill anyway, it would be 16448.
+            # Fires once per request via the _budget_logged flag pattern.
+            if not getattr(rs, "_q_shape_logged", False):
+                logger.warning(
+                    "[diag-fwd-shape] rid=%s layer=%s q.shape=%s tp_rank=%d",
+                    rid, getattr(rs, "current_layer", "?"),
+                    tuple(quest_query.shape), self._tp_rank)
+                rs._q_shape_logged = True
             q = quest_query.detach().to(dtype=torch.float32, device="cpu")
             if q.ndim == 3:
                 q = q.squeeze(0) if q.shape[0] == 1 else q.mean(dim=0)
-            # q is now [num_heads, head_dim]. Mean-pool for GQA:
-            # [num_heads, head_dim] → [num_kv_heads, heads_per_group, head_dim]
-            # → mean → [num_kv_heads, head_dim] → [key_dim]
+            # q is now [num_heads, head_dim]. Mean-pool for GQA against the
+            # rank-local KV-head count: at TP=1 that's geom.num_kv_heads;
+            # at TP>1 each rank holds only num_kv_heads/tp_size kv-heads
+            # and the same fraction of Q-heads. The downstream AllGather
+            # concatenates per-rank slices into the full Q the server's
+            # scoring kernel expects.
             if q.ndim == 2 and geom is not None:
                 num_heads = q.shape[0]
-                num_kv_heads = geom.num_kv_heads
                 head_dim = geom.head_dim
-                if num_heads > num_kv_heads and num_heads % num_kv_heads == 0:
-                    heads_per_group = num_heads // num_kv_heads
-                    q = (q.reshape(num_kv_heads, heads_per_group, head_dim)
-                          .mean(dim=1))  # [num_kv_heads, head_dim]
+                full_kv_heads = geom.num_kv_heads
+                local_kv_heads = (full_kv_heads // self._tp_size
+                                   if self._tp_size > 1 else full_kv_heads)
+                if (local_kv_heads >= 1 and num_heads >= local_kv_heads
+                        and num_heads % local_kv_heads == 0):
+                    heads_per_group = num_heads // local_kv_heads
+                    q = (q.reshape(local_kv_heads, heads_per_group, head_dim)
+                          .mean(dim=1))  # [local_kv_heads, head_dim]
             q = q.reshape(-1)
             q_np = q.contiguous().numpy()
         else:
@@ -1903,6 +2007,7 @@ class _Worker:
         # Q slice; AllGather across TP and concat to get the full Q the
         # server would see at TP=1, so scoring is mathematically
         # identical to TP=1 (bit-identical page selection).
+        nccl_q_us = 0.0
         if self._tp_size > 1:
             try:
                 import torch.distributed as dist  # noqa: E402
@@ -1912,9 +2017,22 @@ class _Worker:
                 qt = torch.from_numpy(q_np).to(
                     device=f"cuda:{torch.cuda.current_device()}")
                 gq = [torch.empty_like(qt) for _ in range(self._tp_size)]
+                _trace = os.environ.get("ICMS_NCCL_TRACE", "0") == "1"
+                if _trace:
+                    torch.cuda.synchronize()
+                _t0 = time.perf_counter()
                 dist.all_gather(gq, qt.contiguous(), group=dev_group)
+                if _trace:
+                    torch.cuda.synchronize()
+                nccl_q_us = (time.perf_counter() - _t0) * 1e6
                 q_full = torch.cat(gq, dim=0)
                 q_np = q_full.detach().cpu().numpy().astype(np.float32, copy=False)
+                if _trace:
+                    logger.info("[nccl-trace] phase=score_q_allgather "
+                                 "rank=%d layer=%d q_bytes=%d us=%.1f",
+                                 self._tp_rank, next_layer_idx,
+                                 int(qt.numel() * qt.element_size()),
+                                 nccl_q_us)
             except Exception as e:
                 logger.warning("Score: TP AllGather(Q) failed (%s); using "
                                 "rank-local Q which will give wrong pages.", e)
@@ -1971,10 +2089,22 @@ class _Worker:
 
         # Broadcast reply to all ranks (outside the try so a Score RPC
         # failure on rank 0 still reaches the collective on all ranks).
+        nccl_bcast_us = 0.0
         if self._tp_size > 1:
             try:
+                _trace = os.environ.get("ICMS_NCCL_TRACE", "0") == "1"
+                if _trace:
+                    torch.cuda.synchronize()
+                _t0 = time.perf_counter()
                 reply = _tp_broadcast_score_reply(
                     reply, self._tp_rank, self._tp_size)
+                if _trace:
+                    torch.cuda.synchronize()
+                nccl_bcast_us = (time.perf_counter() - _t0) * 1e6
+                if _trace:
+                    logger.info("[nccl-trace] phase=score_reply_broadcast "
+                                 "rank=%d layer=%d us=%.1f",
+                                 self._tp_rank, next_layer_idx, nccl_bcast_us)
             except Exception as e:
                 logger.warning("Score: reply broadcast failed: %s", e)
                 reply = None
@@ -2155,9 +2285,42 @@ class _Worker:
                 total_us=(t_layer_end - t_layer_start) * 1e6,
                 k_pages=total_k_pages,
             )
+        # Per-layer per-rank trace, gated by ICMS_LAYER_TRACE=1. Emits one
+        # line per layer per rank with phase timings + a request-relative
+        # timestamp so a TP=2 timeline can be diff'd between ranks.
+        if os.environ.get("ICMS_LAYER_TRACE", "0") == "1":
+            apply_total_us = 0.0
+            entry = next((self._ttft.get(rid) for rid in per_request.keys()
+                          if rid in self._ttft), None)
+            t_rel_ms = 0.0
+            if entry is not None and entry.get("t_step_start") is not None:
+                t_rel_ms = (t_layer_start - entry["t_step_start"]) * 1e3
+            for rid, (reply, _req_idx) in per_request.items():
+                if reply is None or not reply.page_ids:
+                    continue
+                logger.info(
+                    "[layer-trace] rank=%d rid=%s layer=%s t_rel=%.2fms "
+                    "spin_us=%.1f apply_total_us=%.1f end_t_rel=%.2fms "
+                    "k_pages=%d",
+                    self._tp_rank, rid, str(layer_idx), t_rel_ms,
+                    spin_us, (t_layer_end - t_after_spin) * 1e6,
+                    (t_layer_end - (entry["t_step_start"] if entry else t_layer_start)) * 1e3,
+                    len(reply.page_ids))
 
     def _apply_selective_attention(self, layer_name: str, reply,
                                    req_idx: int, rid: str = ""):
+        # Per-line wall-time instrumentation, gated by ICMS_LINE_TIMING=1.
+        # Captures the Python-side wall time of every step including
+        # H2D tensor creations, dict/list ops, and tensor casts. Used
+        # to localize the ~3.6 ms/layer Python overhead at TP=2 that
+        # remains after seq_len caching. NOT for production.
+        import os as _os_lt
+        _line_dbg = _os_lt.environ.get("ICMS_LINE_TIMING", "0") == "1"
+        _LT = []  # list of (label, t_perf_counter)
+        def _lt(label):
+            if _line_dbg:
+                _LT.append((label, time.perf_counter()))
+        _lt("entry")
         """Modify block_table row for one request: fill selected KV + trim.
 
         Fetches selected pages' KV from the ICMS sink into GPU blocks,
@@ -2182,10 +2345,34 @@ class _Worker:
         if req_idx >= bt.shape[0]:
             return None
 
-        seq_len = int(am.seq_lens[req_idx])
-
-        # Look up request state by request_id.
+        # PERF: int(am.seq_lens[req_idx]) is a CPU↔GPU host sync (single-
+        # element tensor read). Per layer × 48 layers, at TP=2 this
+        # serializes against in-flight NCCL collectives and adds ~4 ms
+        # per layer ≈ ~190 ms of "wait_apply" — the dominant cost we
+        # couldn't explain via slicing / apply-stream / bound check.
+        # Cache per-request: seq_lens is invariant within a single
+        # forward pass, so we read it once on the first layer's apply
+        # and reuse on subsequent layers. ICMS_NO_SEQLEN_CACHE=1
+        # disables the cache for A/B testing.
         rs = self._requests.get(rid)
+        import os as _os_sl
+        _no_seqlen_cache = _os_sl.environ.get("ICMS_NO_SEQLEN_CACHE", "0") == "1"
+        if (rs is not None
+                and not _no_seqlen_cache
+                and getattr(rs, "_apply_cached_seq_len", None) is not None
+                and getattr(rs, "_apply_cached_attn_md", None) is am):
+            seq_len = rs._apply_cached_seq_len
+        else:
+            seq_len = int(am.seq_lens[req_idx])
+            if rs is not None and not _no_seqlen_cache:
+                # Cache keyed on the attn_metadata identity; vLLM creates
+                # a new attn_metadata per forward, so this naturally
+                # invalidates between forwards.
+                rs._apply_cached_seq_len = seq_len
+                rs._apply_cached_attn_md = am
+        _lt("after_seq_len")
+
+
         if rs is None:
             # Fallback: try last known chain.
             chain = self._last_chain_for_rid.get(rid, [])
@@ -2216,11 +2403,34 @@ class _Worker:
 
         geom = self._geom
         sink = self._sink_pool.sink
-        kv_page_bytes = geom.kv_page_bytes
-        half_bytes = kv_page_bytes // 2
+        # ICMS_PER_RANK_SLICE=1 (server-side Option Y): the server has
+        # already gathered THIS rank's nkv_local heads and packed them
+        # at the start of each page slot in the sink. The remote-page
+        # layout becomes (PAGE_TOKENS, nkv_local, head_dim) per K and V,
+        # halving wire bandwidth + GPU memcpy. Skip the read-time slice
+        # below in that mode.
+        import os as _os
+        per_rank_slice = (
+            self._tp_size > 1
+            and _os.environ.get("ICMS_PER_RANK_SLICE", "0") == "1")
+        nkv_local_runtime = (geom.num_kv_heads // self._tp_size
+                              if self._tp_size > 1 else geom.num_kv_heads)
+        if per_rank_slice:
+            # Per-page bytes effectively used = full bytes / tp_size.
+            # We keep kv_page_bytes (used to step into the sink) at the
+            # FULL value because the sink slot is still allocated full-
+            # size; only the first half holds valid data.  half_bytes
+            # also halves so the K/V split lands at the correct boundary.
+            kv_page_bytes_eff = geom.kv_page_bytes // self._tp_size
+            kv_page_bytes = geom.kv_page_bytes  # sink stride unchanged
+            half_bytes = kv_page_bytes_eff // 2
+            page_shape = (PAGE_TOKENS, nkv_local_runtime, geom.head_dim)
+        else:
+            kv_page_bytes = geom.kv_page_bytes
+            half_bytes = kv_page_bytes // 2
+            page_shape = (PAGE_TOKENS, geom.num_kv_heads, geom.head_dim)
         model_dtype = main_key.dtype
         device = main_key.device
-        page_shape = (PAGE_TOKENS, geom.num_kv_heads, geom.head_dim)
         gpu_direct = getattr(sink, 'is_gpu_direct', False)
 
         # CPU-side filter: drop pids that lack a sink offset or overflow
@@ -2236,6 +2446,7 @@ class _Worker:
             valid_sink_offs.append(off)
         if not valid_pids:
             return None
+        _lt("after_python_filter")
 
         if gpu_direct:
             # ── Batched GPU-direct path: one gather + one dtype convert + ──
@@ -2244,50 +2455,146 @@ class _Worker:
             sink_base = sink.gpu_view(0, sink.size)          # [sink_bytes] u8
             sink_pages = sink_base.view(-1, kv_page_bytes)   # [N, page_bytes]
 
-            # One host→device copy for the index tensors.
+            # One host→device copy for the index tensors. The naive
+            # `torch.tensor(list, device=cuda)` path takes ~3.5 ms/layer
+            # at TP=2 (vs ~30 µs for subsequent H2Ds in the same call) —
+            # PyTorch builds an unpinned CPU tensor under the hood, and
+            # the driver's pageable→pinned staging stalls the stream.
+            # Build a pinned CPU tensor explicitly and do a non-blocking
+            # async copy: amortizes to ~30 µs/layer.
             page_idx_py = [off // kv_page_bytes
                             for off in valid_sink_offs]
-            page_idx_dev = torch.tensor(
-                page_idx_py, dtype=torch.int64, device=device)
-            valid_pids_dev = torch.tensor(
-                valid_pids, dtype=torch.int64, device=device)
+            _lt("before_h2d_tensors")
+            _page_idx_cpu = torch.tensor(
+                page_idx_py, dtype=torch.int64, pin_memory=True)
+            page_idx_dev = _page_idx_cpu.to(device, non_blocking=True)
+            _lt("after_page_idx_dev")
+            _valid_pids_cpu = torch.tensor(
+                valid_pids, dtype=torch.int64, pin_memory=True)
+            valid_pids_dev = _valid_pids_cpu.to(device, non_blocking=True)
+            _lt("after_valid_pids_dev")
 
             # phys_blocks via on-device gather (no sync).
             phys_blocks_dev = bt[req_idx].index_select(
                 0, valid_pids_dev).to(torch.int64)
+            _lt("after_phys_blocks")
 
-            # Bound check: phys_block < main_key.shape[0]. One sync per
-            # layer (vs 256 syncs in the old loop).
-            max_blocks_hbm = main_key.shape[0]
-            if bool((phys_blocks_dev >= max_blocks_hbm).any().item()):
-                bounds_mask = phys_blocks_dev < max_blocks_hbm
-                phys_blocks_dev = phys_blocks_dev[bounds_mask]
-                page_idx_dev = page_idx_dev[bounds_mask]
-                if phys_blocks_dev.numel() == 0:
-                    return None
+            # Bound check: phys_block < main_key.shape[0]. ICMS_SKIP_BOUNDS=1
+            # disables this — the .item() forced a CPU↔GPU sync per layer
+            # (48× per request). At TP=2 it appears to serialize against
+            # in-flight NCCL collectives, dominating wait_apply (200 ms vs
+            # ~17 ms at TP=1, despite TP=2 doing half the data). We've
+            # never hit the out-of-bounds branch in practice.
+            import os as _os_bc
+            if _os_bc.environ.get("ICMS_SKIP_BOUNDS", "0") != "1":
+                max_blocks_hbm = main_key.shape[0]
+                if bool((phys_blocks_dev >= max_blocks_hbm).any().item()):
+                    bounds_mask = phys_blocks_dev < max_blocks_hbm
+                    phys_blocks_dev = phys_blocks_dev[bounds_mask]
+                    page_idx_dev = page_idx_dev[bounds_mask]
+                    if phys_blocks_dev.numel() == 0:
+                        return None
 
-            # One gather kernel: [k, page_bytes] u8.
-            pages_u8 = sink_pages.index_select(0, page_idx_dev)
-            k_bytes = pages_u8[:, :half_bytes].contiguous()
-            v_bytes = pages_u8[:, half_bytes:].contiguous()
-            k_pages = k_bytes.view(torch.float16).reshape(
-                -1, *page_shape).to(dtype=model_dtype)
-            v_pages = v_bytes.view(torch.float16).reshape(
-                -1, *page_shape).to(dtype=model_dtype)
+            # ─── Dedicated apply stream (ICMS_APPLY_STREAM=1) ─────────
+            # Apply work has only ~5 ms of GPU compute total (across 48
+            # layers, measured with explicit syncs) but Python sees
+            # ~200 ms because the kernels queue behind in-flight TP
+            # AllReduces on the default CUDA stream at TP=2. Running
+            # them on a separate stream lets them overlap with NCCL.
+            #
+            # Correctness: bracket the apply with two events —
+            #   - in_event: apply stream waits for default stream's
+            #     prior writes (block_table mods, sink data, etc.).
+            #   - out_event: default stream waits for apply's writes
+            #     before the NEXT layer's attention reads main_key/_value.
+            import os as _os_at
+            _apply_dbg = _os_at.environ.get("ICMS_APPLY_TIMING", "0") == "1"
+            _use_apply_stream = (
+                _os_at.environ.get("ICMS_APPLY_STREAM", "0") == "1")
+            if _use_apply_stream and not hasattr(self, "_apply_stream"):
+                self._apply_stream = torch.cuda.Stream(device=device)
+            apply_stream = (self._apply_stream
+                             if _use_apply_stream else None)
+            default_stream = torch.cuda.current_stream(device)
+            if apply_stream is not None:
+                in_event = torch.cuda.Event()
+                in_event.record(default_stream)
+                apply_stream.wait_event(in_event)
+            stream_ctx = (torch.cuda.stream(apply_stream)
+                          if apply_stream is not None
+                          else nullcontext())
 
-            # Scatter: two kernels total for this layer.
-            main_key.index_copy_(0, phys_blocks_dev, k_pages)
-            main_value.index_copy_(0, phys_blocks_dev, v_pages)
+            def _t():
+                if _apply_dbg:
+                    torch.cuda.synchronize(device)
+                return time.perf_counter()
+            _t0 = _t()
+
+            with stream_ctx:
+                # One gather kernel: [k, page_bytes] u8.
+                pages_u8 = sink_pages.index_select(0, page_idx_dev)
+                _t1 = _t()
+                if per_rank_slice:
+                    # Sink slot is full-size but only the first
+                    # kv_page_bytes_eff bytes hold valid data (this
+                    # rank's slice). K/V split is at half of effective.
+                    pages_u8 = pages_u8[:, :kv_page_bytes_eff].contiguous()
+                # PERF: skip the legacy fp16->bf16 round-trip; server
+                # bytes are already in model_dtype.
+                k_bytes = pages_u8[:, :half_bytes].contiguous()
+                v_bytes = pages_u8[:, half_bytes:].contiguous()
+                _t2 = _t()
+                k_pages = k_bytes.view(model_dtype).reshape(-1, *page_shape)
+                v_pages = v_bytes.view(model_dtype).reshape(-1, *page_shape)
+                _t3 = _t()
+
+                # Option W broadcast path: when server didn't slice,
+                # each rank still extracts its head range here.
+                if self._tp_size > 1 and not per_rank_slice:
+                    nkv_local = geom.num_kv_heads // self._tp_size
+                    start = self._tp_rank * nkv_local
+                    k_pages = k_pages[:, :, start:start + nkv_local, :].contiguous()
+                    v_pages = v_pages[:, :, start:start + nkv_local, :].contiguous()
+
+                # Scatter: two kernels total for this layer.
+                main_key.index_copy_(0, phys_blocks_dev, k_pages)
+                main_value.index_copy_(0, phys_blocks_dev, v_pages)
+                _t4 = _t()
+            _lt("after_scatter")
+
+            if apply_stream is not None:
+                # Make default stream's next ops (the next layer's
+                # attention) wait for apply to finish.
+                out_event = torch.cuda.Event()
+                out_event.record(apply_stream)
+                default_stream.wait_event(out_event)
+
+            if _apply_dbg:
+                # One-shot per-layer log; aggregate by hand from log lines.
+                logger.warning(
+                    "[apply-timing] layer=%s gather=%.0fus split=%.0fus "
+                    "view=%.0fus scatter=%.0fus k=%d nkv=%d stream=%s",
+                    layer_name,
+                    (_t1 - _t0) * 1e6, (_t2 - _t1) * 1e6,
+                    (_t3 - _t2) * 1e6, (_t4 - _t3) * 1e6,
+                    int(phys_blocks_dev.numel()), nkv_local_runtime,
+                    "apply" if apply_stream else "default")
 
             filled_blocks_count = int(phys_blocks_dev.numel())
+            _lt("after_filled_count")
 
             # Build trimmed block table entirely on device — avoids a
             # per-continuation-block int(bt[...]) sync.
             cont_end = min(total_blocks, bt.shape[1])
             if cont_end > context_pages:
-                cont_idx = torch.arange(
+                # Build cont_idx on CPU (pinned) and async-copy to GPU.
+                # `torch.arange(..., device=cuda)` issues a kernel that
+                # serializes against in-flight model work, repeating the
+                # pageable-staging stall pattern.
+                _cont_idx_cpu = torch.arange(
                     context_pages, cont_end,
-                    dtype=torch.int64, device=device)
+                    dtype=torch.int64, pin_memory=True)
+                cont_idx = _cont_idx_cpu.to(device, non_blocking=True)
                 cont_blocks = bt[req_idx].index_select(
                     0, cont_idx).to(torch.int32)
                 new_bt_row = torch.cat(
@@ -2297,6 +2604,7 @@ class _Worker:
             if new_bt_row.numel() == 0:
                 return None
             new_bt = new_bt_row.unsqueeze(0)
+            _lt("after_bt_build")
         else:
             # Fallback per-page loop for host-sink path (unchanged).
             filled_blocks = []
@@ -2327,8 +2635,13 @@ class _Worker:
 
         continuation_tokens = max(0, seq_len - context_tokens)
         new_seq_len = filled_blocks_count * PAGE_TOKENS + continuation_tokens
-        new_sl = torch.tensor(
-            [new_seq_len], dtype=torch.int32, device=device)
+        # Pin + async-copy: same pattern as the page_idx_dev fix above.
+        # Without pinning, this last H2D inherits the implicit pageable-
+        # staging sync that `cuda.synchronize`-equivalent stalls the
+        # apply path's wall time at the LAST tensor() call.
+        _new_sl_cpu = torch.tensor(
+            [new_seq_len], dtype=torch.int32, pin_memory=True)
+        new_sl = _new_sl_cpu.to(device, non_blocking=True)
 
         logger.debug(
             "Path B: layer=%s req_idx=%d fetched %d/%d pages, "
@@ -2346,6 +2659,17 @@ class _Worker:
             seq_lens=new_sl,
             max_seq_len=new_seq_len,
         ))
+        _lt("after_set_active")
+        if _line_dbg and len(_LT) >= 2:
+            parts = []
+            for i in range(1, len(_LT)):
+                label, t = _LT[i]
+                d_us = (t - _LT[i-1][1]) * 1e6
+                parts.append(f"{label}={d_us:.0f}us")
+            total_us = (_LT[-1][1] - _LT[0][1]) * 1e6
+            logger.warning(
+                "[apply-line] layer=%s total=%.0fus %s",
+                layer_name, total_us, " ".join(parts))
         return True  # signal that fetch state was set
 
     @staticmethod
@@ -2475,6 +2799,15 @@ class _Worker:
         kv_layer shape: [2 (K+V), num_blocks, block_size, num_kv_heads, head_dim]
         attn_metadata: FlashAttentionMetadata with block_table, seq_lens, etc.
         """
+        # Diagnostic short-circuit: ICMS_SKIP_EXTRACT=1 makes this a no-op.
+        # Used to verify whether extract_and_record's deferred GPU work
+        # (AllGather K/V at TP>1, GPU->CPU memcpy) is silently serializing
+        # with the model's forward via shared CUDA stream. If TTFT drops
+        # noticeably with this set, those ops are on the critical path
+        # despite running in a "background" thread.
+        import os as _os
+        if _os.environ.get("ICMS_SKIP_EXTRACT", "0") == "1":
+            return
         t0 = time.perf_counter()
         logger.debug("extract_and_record: layer=%s kv_shape=%s", layer_name,
                       tuple(kv_layer.shape) if hasattr(kv_layer, 'shape') else '?')
@@ -2593,12 +2926,28 @@ class _Worker:
                       for _ in range(self._tp_size)]
                 gv = [torch.empty_like(v_batch_gpu)
                       for _ in range(self._tp_size)]
+                _trace = os.environ.get("ICMS_NCCL_TRACE", "0") == "1"
+                if _trace:
+                    torch.cuda.synchronize()
+                _t0 = time.perf_counter()
                 dist.all_gather(gk, k_batch_gpu.contiguous(),
                                  group=dev_group)
                 dist.all_gather(gv, v_batch_gpu.contiguous(),
                                  group=dev_group)
+                if _trace:
+                    torch.cuda.synchronize()
+                _us = (time.perf_counter() - _t0) * 1e6
                 k_batch_gpu = torch.cat(gk, dim=2)
                 v_batch_gpu = torch.cat(gv, dim=2)
+                if _trace:
+                    bytes_per_rank = int(
+                        k_batch_gpu.numel() * k_batch_gpu.element_size()
+                        + v_batch_gpu.numel() * v_batch_gpu.element_size())
+                    logger.info("[nccl-trace] phase=extract_kv_allgather "
+                                 "rank=%d layer=%d kv_bytes_per_rank=%d "
+                                 "us=%.1f",
+                                 self._tp_rank, layer_idx,
+                                 bytes_per_rank, _us)
             except Exception as e:
                 logger.warning("extract_and_record: TP AllGather failed "
                                 "(%s); half-head write will result in "

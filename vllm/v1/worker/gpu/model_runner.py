@@ -385,14 +385,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 1, int(extra.get("icms_score_stride", 1))
             )
 
-            num_registered = hook_manager.register_hooks(self.model)
+            # Prefer the registry path (PIECEWISE-CUDAGraph compatible).
+            # ICMS_LEGACY_FORWARD_HOOKS=1 forces the old register_forward_hook
+            # path for emergency rollback.
+            import os as _os  # local import to avoid widening top-level imports
+            use_registry = (
+                _os.environ.get("ICMS_LEGACY_FORWARD_HOOKS", "0") != "1")
+            if use_registry:
+                num_registered = hook_manager.register_callbacks(self.model)
+                hook_path = "registry"
+            else:
+                num_registered = hook_manager.register_hooks(self.model)
+                hook_path = "forward_hook"
             if num_registered > 0:
                 self._quest_hook_manager = hook_manager
                 logger.info(
-                    "Quest hooks registered on %d decoder layers "
+                    "Quest hooks registered on %d decoder layers via %s "
                     "(cpu_scoring=True, budget=%.2f, single_layer_scoring=%s, "
                     "adaptive=%s)",
                     num_registered,
+                    hook_path,
                     quest_budget,
                     single_layer_scoring,
                     extra.get("adaptive_bandwidth", False),

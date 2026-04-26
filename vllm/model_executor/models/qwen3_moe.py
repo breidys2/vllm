@@ -487,6 +487,14 @@ class Qwen3MoeModel(nn.Module):
             residual = intermediate_tensors["residual"]
 
         aux_hidden_states = []
+        # Quest layer-callback dispatchers. Implemented as proper custom
+        # torch ops (vllm::quest_fire_*_layer) so Dynamo can trace through
+        # them under aot_compile_fullgraph; mutates_args=["hidden_states"]
+        # forces Inductor to keep them in the partitioned graph.
+        from vllm.v1.attention.ops.quest_layer_callbacks import (  # noqa: E402
+            fire_post_layer,
+            fire_pre_layer,
+        )
         for layer_idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
@@ -497,7 +505,9 @@ class Qwen3MoeModel(nn.Module):
                     hidden_states + residual if residual is not None else hidden_states
                 )
                 aux_hidden_states.append(aux_hidden_state)
+            fire_pre_layer(self, layer_idx, positions, hidden_states, residual)
             hidden_states, residual = layer(positions, hidden_states, residual)
+            fire_post_layer(self, layer_idx, positions, hidden_states, residual)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
