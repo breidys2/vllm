@@ -418,14 +418,27 @@ class LlamaModel(nn.Module):
             residual = intermediate_tensors["residual"]
 
         aux_hidden_states = []
-        for idx, layer in enumerate(
-            islice(self.layers, self.start_layer, self.end_layer)
+        # Quest layer-callback dispatchers — same pattern as qwen3_moe.py.
+        # Without these calls the Quest hook registry is attached to the
+        # model but is never invoked, so on_layer_score never fires for
+        # llama-3 / mistral-nemo (mistral inherits LlamaForCausalLM).
+        # Symptom before this patch: scores=0 in [ttft-breakdown] and
+        # C ≡ B for both models. (2026-04-26 mistral chain-reuse dive.)
+        from vllm.v1.attention.ops.quest_layer_callbacks import (  # noqa: E402
+            fire_post_layer,
+            fire_pre_layer,
+        )
+        for layer_idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
         ):
-            if idx in self.aux_hidden_state_layers:
+            if layer_idx in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states + residual)
+            fire_pre_layer(self, layer_idx, positions, hidden_states, residual)
             hidden_states, residual = layer(
                 positions, hidden_states, residual, **extra_layer_kwargs
             )
+            fire_post_layer(self, layer_idx, positions, hidden_states, residual)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(

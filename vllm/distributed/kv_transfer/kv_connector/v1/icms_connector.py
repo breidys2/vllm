@@ -87,6 +87,12 @@ except ImportError:
     _HAVE_RDMA = False
 
 # ─── constants ───────────────────────────────────────────────────────────
+# TODO(batching): _SINK_SLOTS=4 caps in-flight Score/FetchAll RPCs at 4
+# concurrent operations. Fine for batch=1 perf-sweep workloads, but blocks
+# under heavy batching when more than 4 requests in a step want a fresh
+# Score/Fetch (acquire() will spin-wait on slot release). Should be
+# parameterised (env or kv_connector_extra_config) before serving traffic
+# with max_num_seqs > 4. (Audit 2026-04-26.)
 _SINK_SLOTS = 4           # C8: number of pre-allocated sink slots
 _GROUP_BLOCKS = GROUP_PAGES  # blocks per group (= pages per group = 32)
 
@@ -208,6 +214,14 @@ class IcmsConnectorMetadata(KVConnectorMetadata):
     # Worker→scheduler: chains that were stored in ICMS.
     # List of (chain, num_groups) tuples, drained by the scheduler.
     stored_chain_notifications: list[tuple[list[int], int]] = field(default_factory=list)
+    # BUG-N2: rids for which the scheduler determined no new complete
+    # group will be formed by this step (stored prefix already covers
+    # the prompt's complete-group count). Worker uses this to short-
+    # circuit `extract_and_record`'s GPU→CPU copy + (at TP>1)
+    # AllGather × num_layers. Computed scheduler-side from the
+    # authoritative `_stored_chains` so both worker ranks see the
+    # same flag — symmetric across TP, no AllGather risk.
+    skip_extract_rids: set[str] = field(default_factory=set)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -870,16 +884,29 @@ class _Scheduler:
         group_tokens = _GROUP_BLOCKS * PAGE_TOKENS  # 512 tokens per group
         chain: list[int] = []
         if token_ids and len(token_ids) >= PAGE_TOKENS:
-            for g in range(64):
+            # Cover the entire prompt. Earlier hardcoded `range(64)` cap
+            # silently truncated chains to the first 32k tokens, capping
+            # cross-turn elision at 32k (qwen3 ≥64k C TTFT regressed
+            # badly because vLLM had to forward the un-chained tail).
+            #
+            # Incremental hashing: each group's hash chains from the
+            # previous group's digest + new group's tokens. Keeps the
+            # whole chain at O(n) total work instead of O(n²) — at 128k
+            # the old per-group "hash all tokens up to here" pattern
+            # would do ~150 MB of repr+SHA per request.
+            num_groups = (len(token_ids) + group_tokens - 1) // group_tokens
+            prev_digest = b""
+            for g in range(num_groups):
                 end = min((g + 1) * group_tokens, len(token_ids))
                 start = g * group_tokens
                 if end <= start:
                     break
-                # Chained: hash all tokens up to this group boundary.
-                h = hashlib.sha256(
-                    repr(tuple(token_ids[:end])).encode()
-                ).digest()[:8]
-                chain.append(int.from_bytes(h, "little"))
+                h = hashlib.sha256()
+                h.update(prev_digest)
+                h.update(repr(tuple(token_ids[start:end])).encode())
+                d = h.digest()
+                chain.append(int.from_bytes(d[:8], "little"))
+                prev_digest = d
         if not chain:
             h = hashlib.sha256(repr(tuple(token_ids or [])).encode()).digest()[:8]
             chain.append(int.from_bytes(h, "little"))
@@ -932,6 +959,41 @@ class _Scheduler:
             if rid in self._chains:
                 meta.new_chains[rid] = self._chains[rid]
             self._pending_chain_sends.discard(rid)
+
+        # BUG-N2: per-rid skip-extract decision. We compute this on the
+        # scheduler so both TP worker ranks observe the same flag (no
+        # rank-local race that would lead to AllGather asymmetry). For
+        # each scheduled request, skip extract iff the stored prefix
+        # already covers every COMPLETE group the prompt will have
+        # after this step. Requests whose new tokens form a partial
+        # trailing group still skip (group never flushes anyway).
+        #
+        # BUG-N13 fix (2026-04-26): the first scheduler tick for a new
+        # request sometimes arrives BEFORE vLLM populates
+        # scheduled_num_tokens, so n_step = 0 and end = 0. With end=0
+        # and stored_groups=0 (fresh chain), the predicate `0 >= 0`
+        # was vacuously true and we'd add the rid to skip_set. The
+        # subsequent forward (which used THIS metadata) then skipped
+        # extract entirely → iter 0 never stored → scheduler bridge
+        # then claimed phantom storage → iter 1+ silently elided
+        # against missing KV. Require complete_groups_after > 0 so
+        # the metadata-only first tick doesn't poison the decision.
+        _GROUP_TOKENS = PAGE_TOKENS * _GROUP_BLOCKS  # 16 * 32 = 512
+        for prs in meta.requests:
+            chain = self._chains.get(prs.request_id, [])
+            if not chain:
+                continue
+            complete_groups_after = (
+                prs.num_computed_tokens_end // _GROUP_TOKENS)
+            if complete_groups_after == 0:
+                # First-tick metadata or tiny prompt — extract path
+                # has nothing to flush either way. Don't poison the
+                # skip decision when we don't actually have visibility
+                # into the upcoming forward yet.
+                continue
+            stored_groups = self._lookup_stored_prefix(chain)
+            if stored_groups >= complete_groups_after:
+                meta.skip_extract_rids.add(prs.request_id)
         return meta
 
     # ── Global prefix index operations ──────────────────────────────
@@ -987,15 +1049,22 @@ class _Scheduler:
             group_tokens = _GROUP_BLOCKS * PAGE_TOKENS
             chain: list[int] = []
             if token_ids and len(token_ids) >= PAGE_TOKENS:
-                for g in range(64):
+                # Mirrors the chain-construction in on_alloc — full prompt
+                # coverage with incremental hashing. Both call sites must
+                # produce identical hashes to match across requests.
+                num_groups = (len(token_ids) + group_tokens - 1) // group_tokens
+                prev_digest = b""
+                for g in range(num_groups):
                     end = min((g + 1) * group_tokens, len(token_ids))
                     start = g * group_tokens
                     if end <= start:
                         break
-                    h = hashlib.sha256(
-                        repr(tuple(token_ids[:end])).encode()
-                    ).digest()[:8]
-                    chain.append(int.from_bytes(h, "little"))
+                    h = hashlib.sha256()
+                    h.update(prev_digest)
+                    h.update(repr(tuple(token_ids[start:end])).encode())
+                    d = h.digest()
+                    chain.append(int.from_bytes(d[:8], "little"))
+                    prev_digest = d
             if not chain:
                 return 0, False
             self._chains[rid] = chain
@@ -1408,7 +1477,7 @@ class _Worker:
         if not hasattr(self, "_diag_get_stored_count"):
             self._diag_get_stored_count = 0
         if self._diag_get_stored_count < 20:
-            logger.info(
+            logger.debug(
                 "[diag-match] chain_len=%d stored_entries=%d match_best=%d "
                 "(from entry len=%d n_groups=%d)",
                 len(chain), len(self._stored_chain_groups),
@@ -1525,7 +1594,7 @@ class _Worker:
             first_to_fetch_ms = (t_fetch - t_first) * 1e3
             fetch_to_save_ms = (t_save_enter - t_fetch) * 1e3
             total_ms = (t_save_enter - t_step) * 1e3
-            logger.info(
+            logger.debug(
                 "[ttft-breakdown] rid=%s total=%.1fms "
                 "step_to_first_layer=%.1fms first_to_fetch_done=%.1fms "
                 "fetch_to_wait_for_save=%.1fms | "
@@ -1545,6 +1614,57 @@ class _Worker:
             # Clear after emit so next step doesn't double-log.
             self._ttft.pop(rid, None)
 
+        # ICMS_DIAG_SLACK: stop poller, format per-layer slack table.
+        # slack[L] = t_called[L] − t_arrived[L] (sign convention: positive
+        # = data ready before compute end of L−1, "could have transferred
+        # more"; negative = data not ready by L−1's compute end, "stall").
+        if getattr(self, "_slack_stop_evt", None) is not None:
+            self._slack_stop_evt.set()
+            try:
+                self._slack_thread.join(timeout=1.0)
+            except Exception:
+                pass
+            t_step = getattr(self, "_slack_t_step", None)
+            t_arrived = self._slack_t_arrived
+            t_called = self._slack_t_called
+            n = len(t_arrived)
+            if t_step is not None and n > 0:
+                rows = []
+                slacks_pos = 0.0   # sum of positive slack (idle ms)
+                slacks_neg = 0.0   # sum of negative slack (stall ms)
+                n_stalls = 0
+                for L in range(n):
+                    ta = t_arrived[L]
+                    tc = t_called[L]
+                    if ta is None or tc is None:
+                        rows.append((L, None, None, None))
+                        continue
+                    s_ms = (tc - ta) * 1e3
+                    rows.append((L,
+                                 (ta - t_step) * 1e3,
+                                 (tc - t_step) * 1e3,
+                                 s_ms))
+                    if s_ms > 0:
+                        slacks_pos += s_ms
+                    else:
+                        slacks_neg += -s_ms
+                        n_stalls += 1
+                # Compact per-layer line: "L:slack_ms" only for layers
+                # where both timestamps were captured.
+                per_layer = " ".join(
+                    f"{L}:{s:.2f}" for (L, _a, _c, s) in rows if s is not None)
+                logger.info(
+                    "[diag-slack] n=%d n_stalls=%d total_idle_ms=%.2f "
+                    "total_stall_ms=%.2f per_layer=[%s]",
+                    n, n_stalls, slacks_pos, slacks_neg, per_layer,
+                )
+            # Reset for next step.
+            self._slack_stop_evt = None
+            self._slack_thread = None
+            self._slack_t_arrived = None
+            self._slack_t_called = None
+            self._slack_t_step = None
+
     # ─── metadata drain (C1) ─────────────────────────────────────────────
 
     def on_step_start(self, meta: IcmsConnectorMetadata):
@@ -1557,17 +1677,79 @@ class _Worker:
             for rid in meta.new_chains.keys():
                 self._ttft_reset(rid, t_step)
 
+        # ICMS_DIAG_SLACK=1: spawn a per-step polling thread that records
+        # the first-observed-true timestamp for every layer's ready flag.
+        # Combined with each layer's wait_for_layer entry time, lets us
+        # answer per-layer "could we have transferred more?" — slack[L] =
+        # t_compute_end[L-1] - t_arrived[L]. Sub-µs resolution because
+        # is_layer_ready is a numpy item-read (releases GIL) and the
+        # poll loop is just a memory load + flag check.
+        if (os.environ.get("ICMS_DIAG_SLACK") == "1"
+                and self._sink_pool is not None):
+            sink = self._sink_pool.sink
+            flag_count = int(getattr(sink, "flag_count", 0) or 0)
+            if flag_count > 0:
+                self._slack_t_step = t_step
+                self._slack_t_arrived: list = [None] * flag_count
+                self._slack_t_called: list = [None] * flag_count
+                self._slack_stop_evt = threading.Event()
+                t_arrived = self._slack_t_arrived
+                stop_evt = self._slack_stop_evt
+                def _poll(s=sink, n=flag_count, ta=t_arrived, ev=stop_evt):
+                    seen = [False] * n
+                    while not ev.is_set():
+                        for L in range(n):
+                            if not seen[L] and s.is_layer_ready(L):
+                                seen[L] = True
+                                ta[L] = time.perf_counter()
+                self._slack_thread = threading.Thread(
+                    target=_poll, daemon=True, name="icms-slack-poller")
+                self._slack_thread.start()
+
         # Dedup-aware extraction: skip blocks that already live in a
         # group covered by a previously-stored chain prefix. Saves the
         # GPU→CPU copy + summary cost for the stored portion, while
-        # still extracting the novel suffix. _skip_extract is kept for
-        # the (now rare) case where the caller wants to force fully
-        # off; default False.
-        self._skip_extract = False
+        # still extracting the novel suffix.
+        #
+        # BUG-N2: scheduler tells us per-rid whether the upcoming step
+        # will form any new complete group. We skip extract (entire
+        # GPU→CPU copy + AllGather × num_layers) iff EVERY active rid
+        # in this step is in skip_extract_rids — conservative: a single
+        # non-skipping rid in the batch makes the whole step extract
+        # normally. Decision is metadata-driven (broadcast identically
+        # to both TP ranks) so no AllGather asymmetry.
+        active_rids = set(meta.new_chains) | set(self._requests)
+        self._skip_extract = bool(active_rids) and active_rids.issubset(
+            meta.skip_extract_rids)
+        # BUG-N13 Phase 1 diag: per-step skip_extract decision trace.
+        # Toggle with ICMS_DIAG_N13=1.
+        if os.environ.get("ICMS_DIAG_N13", "0") == "1":
+            req_summaries = []
+            for prs in meta.requests:
+                req_summaries.append(
+                    f"rid={prs.request_id} "
+                    f"computed=[{prs.num_computed_tokens_start},"
+                    f"{prs.num_computed_tokens_end}] "
+                    f"complete_grp_after={prs.num_computed_tokens_end // (PAGE_TOKENS * _GROUP_BLOCKS)}"
+                )
+            logger.info(
+                "[diag-step] rank=%d new_chains=%d active_rids=%d "
+                "skip_extract=%s skip_set=%s requests=[%s]",
+                self._tp_rank,
+                len(meta.new_chains),
+                len(active_rids),
+                self._skip_extract,
+                sorted(meta.skip_extract_rids),
+                "; ".join(req_summaries))
         for rid, chain in meta.new_chains.items():
             n_stored = self._get_stored_context_groups(chain)
             rs = self._requests.setdefault(rid, _RequestState(request_id=rid))
             rs.stored_groups = n_stored
+            if os.environ.get("ICMS_DIAG_N13", "0") == "1":
+                logger.info(
+                    "[diag-step] rank=%d new_chain rid=%s chain_len=%d "
+                    "stored_groups=%d", self._tp_rank, rid, len(chain),
+                    n_stored)
         for rid, chain in meta.new_chains.items():
             rs = self._requests.setdefault(rid, _RequestState(request_id=rid))
             rs.chain = chain
@@ -1685,12 +1867,15 @@ class _Worker:
         # Slow path: first scoring boundary for this request — issue
         # the single full-request FetchAll covering every layer.
         icms_rid = self._icms_request_id(rid, 0)
-        stored_groups = self._get_stored_context_groups(rs.chain)
+        # BUG-N7: read the cached per-request value populated by
+        # on_step_start instead of rescanning _stored_chain_groups
+        # (O(N stored × chain_len)) on every layer in the hot path.
+        stored_groups = rs.stored_groups
         effective_groups = max(rs.num_groups_written, stored_groups)
         total_pages = effective_groups * _GROUP_BLOCKS
 
         if not getattr(rs, "_budget_logged", False):
-            logger.info(
+            logger.debug(
                 "icms_budget rid=%s layer=%d src=fetch_all budget=%.3f k=%d "
                 "total_pages=%d",
                 rid, next_layer_idx, budget, total_pages, total_pages,
@@ -1723,7 +1908,7 @@ class _Worker:
                 reply, 'concurrent_requests', 0)
             rpc_ms = (t_end - t_start) * 1e3
             slow_tag = " SLOW" if rpc_ms > 5.0 else ""
-            logger.info(
+            logger.debug(
                 "[rpc] src=fetch_all mode=sync rid=%s layers=%d..%d k=%d "
                 "rpc=%.2fms score=%.2fms summary_read=%.2fms "
                 "sink_write=%.2fms server=%.2fms hit=%d concurrent=%d "
@@ -1823,12 +2008,46 @@ class _Worker:
         not reachable from a post-hook since there's no layer −1). The
         pattern covers layers 0..num_layers−1 uniformly.
         """
+        # ICMS_DIAG_LAYER_ARRIVAL=1: log on_layer_score entry/exit timing
+        # relative to step start so we can see where the per-stride
+        # ~1050ms gap goes (Score RPC vs other work).
+        _diag = os.environ.get("ICMS_DIAG_LAYER_ARRIVAL") == "1"
+        if _diag:
+            t_entry = time.perf_counter()
+            is_boundary = (next_layer_idx % self._score_stride) == 0
+            t_step = None
+            if (connector_meta is not None
+                    and isinstance(connector_meta, IcmsConnectorMetadata)
+                    and connector_meta.requests):
+                rid0 = connector_meta.requests[0].request_id
+                e = self._ttft.get(rid0)
+                if e is not None:
+                    t_step = e.get("t_step_start")
+            entry_rel_ms = ((t_entry - t_step) * 1e3) if t_step else -1.0
         try:
             if (next_layer_idx % self._score_stride) != 0:
                 self.on_layer_reuse(next_layer_idx, budget, stats)
+                if _diag:
+                    t_exit = time.perf_counter()
+                    exit_rel_ms = ((t_exit - t_step) * 1e3) if t_step else -1.0
+                    logger.info(
+                        "[diag-ols] layer=%d boundary=0 entry=%.2fms exit=%.2fms "
+                        "duration=%.2fms",
+                        next_layer_idx, entry_rel_ms, exit_rel_ms,
+                        (t_exit - t_entry) * 1e3,
+                    )
                 return
             self._on_layer_score_impl(
                 next_layer_idx, quest_query, budget, stats, connector_meta)
+            if _diag:
+                t_exit = time.perf_counter()
+                exit_rel_ms = ((t_exit - t_step) * 1e3) if t_step else -1.0
+                logger.info(
+                    "[diag-ols] layer=%d boundary=1 entry=%.2fms exit=%.2fms "
+                    "duration=%.2fms",
+                    next_layer_idx, entry_rel_ms, exit_rel_ms,
+                    (t_exit - t_entry) * 1e3,
+                )
         except Exception:
             logger.exception("on_layer_score FAILED for layer %d", next_layer_idx)
 
@@ -1908,7 +2127,8 @@ class _Worker:
         icms_rid = self._icms_request_id(rid, 0)
         # Use stored context groups (from prior requests with same prefix)
         # if the current request hasn't written anything yet.
-        stored_groups = self._get_stored_context_groups(rs.chain)
+        # BUG-N7: cached on rs by on_step_start; avoids per-layer rescan.
+        stored_groups = rs.stored_groups
         effective_groups = max(rs.num_groups_written, stored_groups)
         total_pages = effective_groups * _GROUP_BLOCKS
 
@@ -1954,7 +2174,7 @@ class _Worker:
         # score_stride. We also always log an "adaptive-new" decision
         # since that's the interesting per-request event.
         if budget_source == "adaptive-new" or not getattr(rs, "_budget_logged", False):
-            logger.info(
+            logger.debug(
                 "icms_budget rid=%s layer=%d src=%s budget=%.3f k=%d "
                 "total_pages=%d",
                 rid, next_layer_idx, budget_source, effective_budget,
@@ -1978,7 +2198,15 @@ class _Worker:
                     rid, getattr(rs, "current_layer", "?"),
                     tuple(quest_query.shape), self._tp_rank)
                 rs._q_shape_logged = True
-            q = quest_query.detach().to(dtype=torch.float32, device="cpu")
+            # Mean-pool on GPU FIRST, then move the small result to CPU.
+            # Pre-2026-04-26: did `.to(cpu, fp32)` on the full Q tensor first,
+            # then mean-pooled. At 128k context with qwen3 TP=2 that's
+            # [131072, 16, 128] bf16 = 537 MB GPU→CPU per stride boundary,
+            # consuming ~1050ms per stride × 7 strides = ~7 sec on the
+            # critical path. The GPU mean-pool runs in microseconds and the
+            # subsequent CPU transfer is on a [num_heads, head_dim]-sized
+            # tensor (~2 KB), so the H2D vanishes.
+            q = quest_query.detach()
             if q.ndim == 3:
                 q = q.squeeze(0) if q.shape[0] == 1 else q.mean(dim=0)
             # q is now [num_heads, head_dim]. Mean-pool for GQA against the
@@ -1998,7 +2226,7 @@ class _Worker:
                     heads_per_group = num_heads // local_kv_heads
                     q = (q.reshape(local_kv_heads, heads_per_group, head_dim)
                           .mean(dim=1))  # [local_kv_heads, head_dim]
-            q = q.reshape(-1)
+            q = q.reshape(-1).to(dtype=torch.float32, device="cpu")
             q_np = q.contiguous().numpy()
         else:
             q_np = np.asarray(quest_query, dtype=np.float32).ravel()
@@ -2131,7 +2359,7 @@ class _Worker:
             # flag anything noticeably above so we can grep spurious slow
             # calls out of sweep logs.
             slow_tag = " SLOW" if rpc_ms > 3.0 else ""
-            logger.info(
+            logger.debug(
                 "[rpc] src=score mode=reply-early rid=%s layers=%d..%d k=%d "
                 "rpc=%.2fms score=%.2fms summary_read=%.2fms "
                 "sink_write=%.2fms server=%.2fms hit=%d concurrent=%d%s",
@@ -2237,11 +2465,20 @@ class _Worker:
         # If the sink doesn't expose ready flags, is_layer_ready returns
         # True and this is a no-op.
         abs_layer = self._extract_layer_idx(layer_name)
+        # ICMS_DIAG_SLACK pairing: record the wait_for_layer entry time
+        # per layer. Combined with the poller's t_arrived[L], this is
+        # how we compute slack[L] = t_called[L] − t_arrived[L].
+        if (abs_layer is not None
+                and getattr(self, "_slack_t_called", None) is not None
+                and 0 <= abs_layer < len(self._slack_t_called)):
+            self._slack_t_called[abs_layer] = t_layer_start
+        ready_at_call = True
         if (abs_layer is not None
                 and self._sink_pool is not None
                 and getattr(self._sink_pool.sink, "flag_count", 0) > 0):
             sink = self._sink_pool.sink
-            if not sink.is_layer_ready(abs_layer):
+            ready_at_call = sink.is_layer_ready(abs_layer)
+            if not ready_at_call:
                 # Poll with exponential backoff starting at 0 (pure spin)
                 # — writes land within ~100µs so spin is right. Cap total
                 # wait at 5s to avoid hangs if something goes wrong.
@@ -2253,6 +2490,24 @@ class _Worker:
                         break
         t_after_spin = time.perf_counter()
         spin_us = (t_after_spin - t_layer_start) * 1e6
+        # ICMS_DIAG_LAYER_ARRIVAL=1: log per-layer arrival timing relative
+        # to step start. Lets us pin down whether per-stride RDMA writes are
+        # blocking compute (compute waits) or arriving early (compute slow).
+        if os.environ.get("ICMS_DIAG_LAYER_ARRIVAL") == "1":
+            for rid in per_request.keys():
+                e = self._ttft.get(rid)
+                if e is None:
+                    continue
+                t_step = e.get("t_step_start") or t_layer_start
+                logger.info(
+                    "[diag-arr] rid=%s layer=%d called_at=%.2fms "
+                    "ready_at_call=%d ready_at=%.2fms spin=%.0fus",
+                    rid, abs_layer if abs_layer is not None else -1,
+                    (t_layer_start - t_step) * 1e3,
+                    int(ready_at_call),
+                    (t_after_spin - t_step) * 1e3,
+                    spin_us,
+                )
 
         total_k_pages = 0
         for rid, (reply, req_idx) in per_request.items():
@@ -2381,15 +2636,29 @@ class _Worker:
             else:
                 return None
 
-        stored_groups = self._get_stored_context_groups(rs.chain)
+        # BUG-N7: cached on rs by on_step_start; avoids per-layer rescan.
+        stored_groups = rs.stored_groups
         effective_groups = max(rs.num_groups_written, stored_groups)
         context_pages = effective_groups * _GROUP_BLOCKS
         context_tokens = context_pages * PAGE_TOKENS
         total_blocks = (seq_len + PAGE_TOKENS - 1) // PAGE_TOKENS
 
         # ── Fetch selected pages' KV from ICMS sink → GPU blocks ──
+        # BUG-N9: the truncation to self._k is a real safety rail (sink
+        # buffer is sized to self._k pages; reading past it would corrupt).
+        # In normal operation len(reply.page_ids) <= self._k. Make the
+        # truncation visible so a server/client cap mismatch (or
+        # reply-early concurrency returning more winners than requested)
+        # doesn't silently drop pages.
+        n_pages = len(reply.page_ids)
+        if n_pages > self._k:
+            logger.warning(
+                "[apply] reply has %d pages but sink capacity self._k=%d; "
+                "truncating. Indicates a server/client cap mismatch — "
+                "check budget vs sink size.",
+                n_pages, self._k)
         selected = sorted(
-            pid for pid in reply.page_ids[:min(len(reply.page_ids), self._k)]
+            pid for pid in reply.page_ids[:min(n_pages, self._k)]
             if pid < context_pages
         )
         k = len(selected)
@@ -2745,6 +3014,26 @@ class _Worker:
         holding up the vLLM forward-pass return. Touches shared client
         state under self._score_lock to serialize with main-thread
         Score/FetchAll RPCs."""
+        # BUG-N13 Phase 1 diag: entry trace. Captures pipeline-thread state
+        # at the moment we attempt extract+flush. Toggle ICMS_DIAG_N13=1.
+        if os.environ.get("ICMS_DIAG_N13", "0") == "1":
+            meta_kind = "dict" if isinstance(meta, dict) else type(meta).__name__
+            rid_summaries = []
+            for rid in rids:
+                rs_dbg = self._requests.get(rid)
+                if rs_dbg is None:
+                    rid_summaries.append(f"{rid}=missing")
+                else:
+                    rid_summaries.append(
+                        f"{rid}=chain_len={len(rs_dbg.chain)} "
+                        f"stored={rs_dbg.stored_groups} "
+                        f"written={rs_dbg.num_groups_written} "
+                        f"buffers={len(rs_dbg.active_group_buffers)}")
+            logger.info(
+                "[diag-extract-entry] rank=%d caches=%d meta=%s rids=[%s] "
+                "skip_extract=%s",
+                self._tp_rank, len(caches), meta_kind,
+                "; ".join(rid_summaries), self._skip_extract)
         # ─── 1. Batch extraction
         for layer_name, kv in caches.items():
             if kv is None or kv.ndim != 5:
@@ -2763,8 +3052,14 @@ class _Worker:
                     "for layer=%s", layer_name)
 
         # ─── 2. Flush complete group buffers via WriteGroup RPCs.
-        # Hold the client lock so background WriteGroups don't race
-        # with main-thread Score/FetchAll on the same QP/client.
+        # BUG-N5: no _score_lock here. The icms client serializes
+        # QP access internally (per-conn QP mutex); _score_lock only
+        # guards _pending_scores / _pending_reuse dict mutations.
+        # Holding it across a 170 ms write_group RPC needlessly
+        # blocked main-thread wait_for_layer / on_layer_score dict
+        # ops. (The original comment on this block claimed the lock
+        # serialized the QP — that's stale: score()/fetch_all()
+        # already run lock-free at the connector level.)
         for rid in rids:
             rs = self._requests.get(rid)
             if rs is None:
@@ -2774,8 +3069,7 @@ class _Worker:
                 if buf is None:
                     continue
                 if buf.is_complete():
-                    with self._score_lock:
-                        self._flush_group(rid, gidx, partial=False)
+                    self._flush_group(rid, gidx, partial=False)
 
         # ─── 3. Push stored-prefix entries so subsequent requests can
         #       skip extraction for the matched prefix.
@@ -2806,21 +3100,50 @@ class _Worker:
         # noticeably with this set, those ops are on the critical path
         # despite running in a "background" thread.
         import os as _os
+        # BUG-N13 Phase 1 diag: trace every entry + every early-return
+        # path in extract_and_record. Only log on layer_idx==0 to avoid
+        # 48× spam per request.
+        _diag_n13 = _os.environ.get("ICMS_DIAG_N13", "0") == "1"
         if _os.environ.get("ICMS_SKIP_EXTRACT", "0") == "1":
+            if _diag_n13:
+                logger.info("[diag-extract] rank=%d layer=%s SKIP=env_skip",
+                            self._tp_rank, layer_name)
+            return
+        # BUG-N2: scheduler-decided per-step skip flag. Set by
+        # on_step_start when every active request's stored prefix
+        # already covers its complete-group count. Symmetric across TP
+        # ranks because it's derived from broadcast metadata.
+        if self._skip_extract:
+            if _diag_n13:
+                logger.info("[diag-extract] rank=%d layer=%s SKIP=N2_skip_extract",
+                            self._tp_rank, layer_name)
             return
         t0 = time.perf_counter()
         logger.debug("extract_and_record: layer=%s kv_shape=%s", layer_name,
                       tuple(kv_layer.shape) if hasattr(kv_layer, 'shape') else '?')
         if not self._requests or self._geom is None:
+            if _diag_n13:
+                logger.info("[diag-extract] rank=%d layer=%s SKIP=no_requests/geom "
+                            "requests=%d geom=%s",
+                            self._tp_rank, layer_name,
+                            len(self._requests), self._geom is not None)
             return
 
         # Parse layer index from layer_name like "model.layers.5.self_attn.attn"
         layer_idx = self._parse_layer_idx(layer_name)
         if layer_idx is None or layer_idx >= self._geom.num_layers:
+            if _diag_n13:
+                logger.info("[diag-extract] rank=%d layer=%s SKIP=bad_layer_idx",
+                            self._tp_rank, layer_name)
             return
 
         # kv_layer: [2, num_blocks, block_size, num_kv_heads, head_dim]
         if kv_layer.ndim != 5 or kv_layer.shape[0] != 2:
+            if _diag_n13 and layer_idx == 0:
+                logger.info("[diag-extract] rank=%d layer=%s SKIP=bad_kv_shape "
+                            "ndim=%d shape0=%d", self._tp_rank, layer_name,
+                            kv_layer.ndim,
+                            kv_layer.shape[0] if kv_layer.ndim > 0 else -1)
             return
         k_cache = kv_layer[0]  # [num_blocks, block_size, num_kv_heads, head_dim]
         v_cache = kv_layer[1]
@@ -2829,7 +3152,20 @@ class _Worker:
         block_table = getattr(attn_metadata, "block_table", None)
         seq_lens = getattr(attn_metadata, "seq_lens", None)
         if block_table is None or seq_lens is None:
+            if _diag_n13 and layer_idx == 0:
+                logger.info("[diag-extract] rank=%d layer=%s SKIP=missing_attn_md "
+                            "bt=%s sl=%s", self._tp_rank, layer_name,
+                            block_table is not None, seq_lens is not None)
             return
+        if _diag_n13 and layer_idx == 0:
+            sl0 = (int(sl_cpu[0]) if (hasattr(seq_lens, '__len__') and len(seq_lens) > 0)
+                   else None) if False else None
+            # Don't crash on weird metadata — just log shape
+            logger.info("[diag-extract] rank=%d layer=%s ENTRY ok kv_shape=%s "
+                        "bt_shape=%s",
+                        self._tp_rank, layer_name,
+                        tuple(kv_layer.shape),
+                        tuple(block_table.shape) if hasattr(block_table, 'shape') else '?')
 
         # Block size from the KV cache tensor.
         block_size = k_cache.shape[1]
@@ -2864,13 +3200,32 @@ class _Worker:
             return
         num_blocks = (seq_len + block_size - 1) // block_size
 
+        # BUG-N1 fix: under prefix elision (TP>1 + ICMS), vLLM only
+        # allocates the trailing slice of the block table, but seq_lens
+        # still reports the full prompt length. Trailing slots in
+        # bt_cpu[0, k:] hold stale IDs from another request's
+        # allocation; indexing k_cache by those produces a CUDA OOB
+        # that surfaces as a device-side assert at the next .cpu().
+        # Clamp num_blocks to the actually-allocated row width so we
+        # never read past the live region. Both ranks at TP>1 observe
+        # bt_cpu shape symmetrically, so this clamp is collective-safe.
+        # The existing dedup early-return at `effective_start >=
+        # len(req_block_ids)` below then short-circuits when the
+        # already-stored groups cover the (clamped) allocation — but
+        # crucially that early-return only fires after the AllGather,
+        # so an asymmetric skip *before* AllGather would deadlock.
+        if bt_cpu.ndim >= 2:
+            num_blocks = min(num_blocks, int(bt_cpu.shape[1]))
+        elif bt_cpu.ndim == 1:
+            num_blocks = min(num_blocks, int(bt_cpu.shape[0]))
+        else:
+            return
+
         # Extract the request's block IDs from the block table.
         if bt_cpu.ndim >= 2:
             req_block_ids = bt_cpu[0, :num_blocks].tolist()
-        elif bt_cpu.ndim == 1:
-            req_block_ids = bt_cpu[:num_blocks].tolist()
         else:
-            return
+            req_block_ids = bt_cpu[:num_blocks].tolist()
 
         # Only process blocks we haven't recorded yet for this layer.
         recorded_key = (rid, layer_idx)
@@ -3048,15 +3403,38 @@ class _Worker:
 
     def _flush_group(self, request_id: str, group_idx: int, partial: bool = False):
         """Issue WriteGroup for a completed (or partial) group buffer."""
+        # BUG-N13 Phase 1 diag: catch the early-return paths.
+        _diag_n13 = os.environ.get("ICMS_DIAG_N13", "0") == "1"
         rs = self._requests.get(request_id)
         if rs is None:
+            if _diag_n13:
+                logger.info("[diag-flush-attempted] rank=%d rid=%s gidx=%d "
+                            "EARLY_RETURN=rs_missing", self._tp_rank,
+                            request_id, group_idx)
             return
         buf = rs.active_group_buffers.pop(group_idx, None)
         if buf is None:
+            if _diag_n13:
+                logger.info("[diag-flush-attempted] rank=%d rid=%s gidx=%d "
+                            "EARLY_RETURN=buf_missing buffers=%s",
+                            self._tp_rank, request_id, group_idx,
+                            sorted(rs.active_group_buffers.keys()))
             return
         chain_prefix = rs.chain[:group_idx + 1]
         if not chain_prefix:
+            if _diag_n13:
+                logger.info("[diag-flush-attempted] rank=%d rid=%s gidx=%d "
+                            "EARLY_RETURN=empty_chain_prefix chain_len=%d",
+                            self._tp_rank, request_id, group_idx,
+                            len(rs.chain))
             return
+        if _diag_n13:
+            logger.info("[diag-flush-attempted] rank=%d rid=%s gidx=%d "
+                        "partial=%s buf.filled=%d/%d chain_prefix_len=%d",
+                        self._tp_rank, request_id, group_idx, partial,
+                        len(buf.filled),
+                        _GROUP_BLOCKS * (self._geom.num_layers if self._geom else 48),
+                        len(chain_prefix))
         pages = _GROUP_BLOCKS if not partial else len({p for (_, p) in buf.filled})
         phase = "decode" if self._prefill_done else "prefill"
         logger.info("[diag-flush] group=%d pages=%d partial=%s phase=%s "
@@ -3091,8 +3469,18 @@ class _Worker:
         # request's state. The pipeline's extract + flush tasks for
         # this request may still be running from the last wait_for_save;
         # they need rs.active_group_buffers etc. to still exist.
-        # This drain is off the TTFT critical path (runs after vLLM
-        # has already returned first-token).
+        # The drain ALSO serves as a NCCL-ordering barrier at TP>1:
+        # `extract_and_record` inside the pipeline thread does an
+        # AllGather on the TP group; if the next request's main-thread
+        # forward starts (with its own NCCL all-reduces) before the
+        # pipeline's AllGather completes, both threads hammer the same
+        # NCCL group concurrently and deadlock. Reverted BUG-N6 attempt
+        # caused exactly that hang at A-2k iter-2 (TP=1 stuck after
+        # layer 5; engine sample_tokens timeout). The drain runs after
+        # vLLM has already returned first-token (off TTFT critical
+        # path of the *current* request) and *before* the next
+        # request's forward begins, which is the right ordering for
+        # NCCL serialization.
         t0 = time.perf_counter()
         ok = self._write_pipeline.drain(timeout=30.0)
         drain_us = (time.perf_counter() - t0) * 1e6
@@ -3112,9 +3500,11 @@ class _Worker:
             return
         # Flush any partial group buffers first (must happen BEFORE we
         # pop rs, since _flush_group re-reads self._requests[rid]).
+        # BUG-N5: no _score_lock here — the icms client serializes
+        # QP access internally; the lock would only block dict
+        # mutations in wait_for_layer / on_layer_score for no gain.
         for gidx in list(rs.active_group_buffers.keys()):
-            with self._score_lock:
-                self._flush_group(request_id, gidx, partial=True)
+            self._flush_group(request_id, gidx, partial=True)
         # Push the final group-count to the scheduler's prefix index so
         # a subsequent request with the same prefix can skip prefill.
         # wait_for_pending_writes is NOT called after on_request_finished,
@@ -3132,6 +3522,18 @@ class _Worker:
                         "(NOT pushed — chain empty or no groups)",
                         request_id, len(rs.chain) if rs.chain else 0,
                         rs.num_groups_written)
+        # BUG-N8: sweep _pending_scores and _pending_reuse for this rid.
+        # Both maps are {layer_name: {rid: tuple}}, drained per-layer-name.
+        # If a layer never fires (request finished mid-stride, layer
+        # skipped, etc.), the inner {rid: ...} entries persist forever.
+        # Bounded slow leak; clean up here to prevent unbounded growth
+        # under heavy churn.
+        for inner in self._pending_reuse.values():
+            inner.pop(request_id, None)
+        for inner in self._pending_scores.values():
+            inner.pop(request_id, None)
+        self._pending_reuse  = {k: v for k, v in self._pending_reuse.items()  if v}
+        self._pending_scores = {k: v for k, v in self._pending_scores.items() if v}
         # Now pop the request state and reset prefill_done.
         self._requests.pop(request_id, None)
         self._prefill_done = False
