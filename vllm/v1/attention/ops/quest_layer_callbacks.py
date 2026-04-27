@@ -145,7 +145,7 @@ def _debug_log_first_call(which: str, marker: int, layer_idx: int) -> None:
     counter[0] += 1
     n = counter[0]
     if n == 1 or n % 50 == 0:
-        logger.warning(
+        logger.debug(
             "[quest-debug] %s op invoked: call#=%d marker=%d layer=%d "
             "registries=%d", which, n, marker, layer_idx,
             len(_REGISTRIES))

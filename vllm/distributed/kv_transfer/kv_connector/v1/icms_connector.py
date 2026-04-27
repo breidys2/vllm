@@ -86,6 +86,16 @@ try:
 except ImportError:
     _HAVE_RDMA = False
 
+# C++ ArrivalPoller (slack diagnostic). Optional — the binding may
+# pre-date the poller addition. When absent, the slack path falls back
+# to the inline-probe (lower-bound) scheme.
+try:
+    from icms_client._icms_client import ArrivalPoller as _ArrivalPoller  # noqa: E402
+    _HAVE_ARRIVAL_POLLER = True
+except ImportError:
+    _ArrivalPoller = None  # type: ignore[assignment]
+    _HAVE_ARRIVAL_POLLER = False
+
 # ─── constants ───────────────────────────────────────────────────────────
 # TODO(batching): _SINK_SLOTS=4 caps in-flight Score/FetchAll RPCs at 4
 # concurrent operations. Fine for batch=1 perf-sweep workloads, but blocks
@@ -1198,6 +1208,11 @@ class _Worker:
         self._geom: ModelGeometry | None = None
         self._sink_pool: _SinkSlotPool | None = None
 
+        # ICMS_DIAG_SLACK: optional C++ poll thread that records each
+        # ready-flag's first-non-zero timestamp without holding the GIL.
+        # Allocated lazily on the first slack-enabled step.
+        self._slack_poller = None  # type: ignore[var-annotated]
+
         # Tensor-parallel identity. At TP=1 this is {0, 1} and the rank-tag
         # prefix is a no-op level in the trie. At TP>1 each rank prefixes
         # every outbound chain with its own rank tag (_rank_tagged_chain).
@@ -1379,15 +1394,26 @@ class _Worker:
             head_dim=ack.head_dim,
             elem_bytes=ack.elem_bytes,
         )
-        # Apply scored-layers mask from env. Must match the server's
-        # --scored-layers flag; when unset, mask=0 = "all layers scored".
+        # Apply scored-layers mask from env. Clamp to the model's actual
+        # num_layers so a global env spec like "0,6,12,18,24,30,36,42"
+        # works across heterogeneous models — bits beyond num_layers get
+        # cleared (matches the server-side clamp at handlers.cc::handle_hello).
+        # Without this clamp, llama-3 (32 layers) packs 8 summary slots
+        # but the server expects 6 → "WriteGroup: bytes underflow" → kError
+        # on the very first WriteGroup. Mistral (40 layers) hit the same
+        # asymmetry. (2026-04-26 llama3 dive.)
         _scored_spec = os.environ.get("ICMS_SCORED_LAYERS", "")
         _scored_mask = parse_scored_layers(_scored_spec)
+        if _scored_mask != 0 and self._geom.num_layers < 64:
+            _valid = ((1 << self._geom.num_layers) - 1)
+            _scored_mask &= _valid
         if _scored_mask != 0:
             self._geom = _dataclasses.replace(self._geom,
                                                scored_layers_mask=_scored_mask)
-            logger.info("[icms] scored_layers mask=0x%x popcount=%d",
-                         _scored_mask, self._geom.num_scored_layers)
+            logger.info("[icms] scored_layers mask=0x%x popcount=%d "
+                         "(num_layers=%d)",
+                         _scored_mask, self._geom.num_scored_layers,
+                         self._geom.num_layers)
         # KV on-disk layout from env. Must match server --kv-layout.
         _kv_layout_str = os.environ.get("ICMS_KV_LAYOUT", "layer-major").lower()
         if _kv_layout_str in ("page-major", "page_major", "page"):
@@ -1614,56 +1640,117 @@ class _Worker:
             # Clear after emit so next step doesn't double-log.
             self._ttft.pop(rid, None)
 
-        # ICMS_DIAG_SLACK: stop poller, format per-layer slack table.
-        # slack[L] = t_called[L] − t_arrived[L] (sign convention: positive
-        # = data ready before compute end of L−1, "could have transferred
-        # more"; negative = data not ready by L−1's compute end, "stall").
-        if getattr(self, "_slack_stop_evt", None) is not None:
-            self._slack_stop_evt.set()
+    def _slack_emit_and_reset(self) -> None:
+        """ICMS_DIAG_SLACK: format the per-layer bracketed slack table.
+
+        Three checkpoints per layer L (timestamps relative to step start):
+          t_post[L]  = on_layer_score(L) entry  ≈ compute end of L-1
+          t_pre[L]   = on_layer_score(L) exit   ≈ compute start of L
+          t_call[L]  = wait_for_layer(L) entry  ≈ start of L's attention
+        Plus three flag observations (ready at each checkpoint) and the
+        spin-observed t_after_spin[L] for the not-ready-at-call case.
+
+        Categorisation per layer:
+          IDLE    : flag True at post-hook → arrived ≤ t_post; idle ≥ (t_call - t_post)
+          NEAR    : False at post, True at pre → arrived in (post, pre);
+                    idle ∈ [0, t_call - t_pre]; small slack
+          BRINK   : False at pre, True at call → arrived in (pre, call);
+                    no idle, but no stall either
+          STALL   : False at call → captured by spin; stall = (t_after_spin - t_call)
+        """
+        t_step = getattr(self, "_slack_t_step", None)
+        t_post = getattr(self, "_slack_t_post_hook", None)
+        if t_step is None or t_post is None:
+            return
+        t_pre = self._slack_t_pre_hook
+        t_call = self._slack_t_called
+        t_aspin = self._slack_t_after_spin
+        f_post = self._slack_flag_at_post
+        f_pre = self._slack_flag_at_pre
+        f_call = self._slack_flag_at_call
+        n = len(t_post)
+
+        # Stop the C++ poller if it ran this step. arrivals_ns is in the
+        # same clock as time.perf_counter() (CLOCK_MONOTONIC on Linux),
+        # so we can subtract Python timestamps directly.
+        arrivals_ns: list[int] | None = None
+        if self._slack_poller is not None:
             try:
-                self._slack_thread.join(timeout=1.0)
+                arrivals_ns = list(self._slack_poller.stop())
             except Exception:
-                pass
-            t_step = getattr(self, "_slack_t_step", None)
-            t_arrived = self._slack_t_arrived
-            t_called = self._slack_t_called
-            n = len(t_arrived)
-            if t_step is not None and n > 0:
-                rows = []
-                slacks_pos = 0.0   # sum of positive slack (idle ms)
-                slacks_neg = 0.0   # sum of negative slack (stall ms)
-                n_stalls = 0
-                for L in range(n):
-                    ta = t_arrived[L]
-                    tc = t_called[L]
-                    if ta is None or tc is None:
-                        rows.append((L, None, None, None))
-                        continue
-                    s_ms = (tc - ta) * 1e3
-                    rows.append((L,
-                                 (ta - t_step) * 1e3,
-                                 (tc - t_step) * 1e3,
-                                 s_ms))
-                    if s_ms > 0:
-                        slacks_pos += s_ms
+                logger.exception("ArrivalPoller.stop failed; using inline probes")
+                arrivals_ns = None
+
+        idle_ms = 0.0
+        stall_ms = 0.0
+        n_idle = n_near = n_brink = n_stall = 0
+        rows = []
+        for L in range(n):
+            tp = t_post[L]; tr = t_pre[L]; tc = t_call[L]; tas = t_aspin[L]
+            if tp is None or tc is None:
+                rows.append((L, "NA", 0.0))
+                continue
+            t_arr_s: float | None = None
+            if (arrivals_ns is not None
+                    and 0 <= L < len(arrivals_ns)
+                    and arrivals_ns[L] > 0):
+                t_arr_s = arrivals_ns[L] / 1e9
+            if t_arr_s is not None:
+                # Exact arrival timestamp from the C++ poller.
+                if t_arr_s <= tc:
+                    # Idle = compute waited from arrival to t_call.
+                    delta = (tc - t_arr_s) * 1e3
+                    idle_ms += delta
+                    if t_arr_s <= tp:
+                        n_idle += 1
+                        rows.append((L, "IDLE", delta))
+                    elif tr is not None and t_arr_s <= tr:
+                        n_near += 1
+                        rows.append((L, "NEAR", delta))
                     else:
-                        slacks_neg += -s_ms
-                        n_stalls += 1
-                # Compact per-layer line: "L:slack_ms" only for layers
-                # where both timestamps were captured.
-                per_layer = " ".join(
-                    f"{L}:{s:.2f}" for (L, _a, _c, s) in rows if s is not None)
-                logger.info(
-                    "[diag-slack] n=%d n_stalls=%d total_idle_ms=%.2f "
-                    "total_stall_ms=%.2f per_layer=[%s]",
-                    n, n_stalls, slacks_pos, slacks_neg, per_layer,
-                )
-            # Reset for next step.
-            self._slack_stop_evt = None
-            self._slack_thread = None
-            self._slack_t_arrived = None
-            self._slack_t_called = None
-            self._slack_t_step = None
+                        n_brink += 1
+                        rows.append((L, "BRINK", delta))
+                else:
+                    # Stall = compute waited from t_call to arrival.
+                    delta = (t_arr_s - tc) * 1e3
+                    stall_ms += delta
+                    n_stall += 1
+                    rows.append((L, "STALL", -delta))
+            else:
+                # Fallback: flag-observation lower bound.
+                fp = f_post[L]; fr = f_pre[L]; fc = f_call[L]
+                if fp is True:
+                    lb = (tc - tp) * 1e3
+                    idle_ms += lb
+                    n_idle += 1
+                    rows.append((L, "IDLE", lb))
+                elif fr is True:
+                    ub = (tc - tr) * 1e3 if tr is not None else 0.0
+                    n_near += 1
+                    rows.append((L, "NEAR", ub))
+                elif fc is True:
+                    n_brink += 1
+                    rows.append((L, "BRINK", 0.0))
+                else:
+                    stall = ((tas - tc) * 1e3) if tas is not None else 0.0
+                    stall_ms += stall
+                    n_stall += 1
+                    rows.append((L, "STALL", -stall))
+
+        per_layer = " ".join(f"{L}:{cat}:{v:.2f}" for (L, cat, v) in rows)
+        src = "cpp" if arrivals_ns is not None else "inline"
+        logger.info(
+            "[diag-slack] src=%s n=%d idle=%d near=%d brink=%d stall=%d "
+            "idle_ms=%.2f stall_ms=%.2f per_layer=[%s]",
+            src, n, n_idle, n_near, n_brink, n_stall,
+            idle_ms, stall_ms, per_layer,
+        )
+        # Reset state for next step.
+        for L in range(n):
+            t_post[L] = None; t_pre[L] = None; t_call[L] = None
+            t_aspin[L] = None
+            f_post[L] = None; f_pre[L] = None; f_call[L] = None
+        self._slack_t_step = None
 
     # ─── metadata drain (C1) ─────────────────────────────────────────────
 
@@ -1677,34 +1764,48 @@ class _Worker:
             for rid in meta.new_chains.keys():
                 self._ttft_reset(rid, t_step)
 
-        # ICMS_DIAG_SLACK=1: spawn a per-step polling thread that records
-        # the first-observed-true timestamp for every layer's ready flag.
-        # Combined with each layer's wait_for_layer entry time, lets us
-        # answer per-layer "could we have transferred more?" — slack[L] =
-        # t_compute_end[L-1] - t_arrived[L]. Sub-µs resolution because
-        # is_layer_ready is a numpy item-read (releases GIL) and the
-        # poll loop is just a memory load + flag check.
+        # ICMS_DIAG_SLACK=1: inline-probe slack tracking. Earlier polling
+        # thread approach GIL-thrashed wait_for_layer's spin loop at TP=2,
+        # wedging on shm_broadcast 60s. Inline probes at three checkpoints
+        # per layer (on_layer_score entry/exit + wait_for_layer entry)
+        # bracket the flag-flip time without any thread:
+        #   case 1: flag True at on_layer_score entry  → idle ≥ (called - post_hook)
+        #   case 2: flag True at on_layer_score exit   → small idle / small stall
+        #   case 3: flag True at wait_for_layer entry  → small stall
+        #   case 4: flag False, captured by spin       → stall = (after_spin - called)
         if (os.environ.get("ICMS_DIAG_SLACK") == "1"
                 and self._sink_pool is not None):
             sink = self._sink_pool.sink
             flag_count = int(getattr(sink, "flag_count", 0) or 0)
             if flag_count > 0:
+                # Clear ALL flags so stale True values from the previous
+                # step don't contaminate this step's first-observed-true
+                # readings. Without this, layers that aren't covered by
+                # an early stride would still hold last step's flip.
+                sink.clear_ready_flags()
                 self._slack_t_step = t_step
-                self._slack_t_arrived: list = [None] * flag_count
+                self._slack_t_post_hook: list = [None] * flag_count
+                self._slack_flag_at_post: list = [None] * flag_count
+                self._slack_t_pre_hook: list = [None] * flag_count
+                self._slack_flag_at_pre: list = [None] * flag_count
                 self._slack_t_called: list = [None] * flag_count
-                self._slack_stop_evt = threading.Event()
-                t_arrived = self._slack_t_arrived
-                stop_evt = self._slack_stop_evt
-                def _poll(s=sink, n=flag_count, ta=t_arrived, ev=stop_evt):
-                    seen = [False] * n
-                    while not ev.is_set():
-                        for L in range(n):
-                            if not seen[L] and s.is_layer_ready(L):
-                                seen[L] = True
-                                ta[L] = time.perf_counter()
-                self._slack_thread = threading.Thread(
-                    target=_poll, daemon=True, name="icms-slack-poller")
-                self._slack_thread.start()
+                self._slack_flag_at_call: list = [None] * flag_count
+                self._slack_t_after_spin: list = [None] * flag_count
+                # Start the C++ poll thread (GIL released) — records exact
+                # arrival timestamps for each flag without contending with
+                # the main worker thread. Falls back to inline probes when
+                # the binding doesn't expose the poller.
+                if (_HAVE_ARRIVAL_POLLER
+                        and getattr(sink, "flag_buffer", None) is not None):
+                    if self._slack_poller is None:
+                        self._slack_poller = _ArrivalPoller()
+                    try:
+                        self._slack_poller.start(sink.flag_buffer)
+                    except Exception:
+                        logger.exception(
+                            "ArrivalPoller.start failed; falling back to "
+                            "inline-probe slack data this step")
+                        self._slack_poller = None
 
         # Dedup-aware extraction: skip blocks that already live in a
         # group covered by a previously-stored chain prefix. Saves the
@@ -1788,9 +1889,18 @@ class _Worker:
     def on_layer_all_pages(self, next_layer_idx, budget, stats,
                             connector_meta=None):
         """Budget >= 1.0: fetch every stored page via kFetchAll (no scoring)."""
+        # ICMS_DIAG_SLACK probe #1: post-hook of L-1. Mirrors what
+        # on_layer_score / on_layer_reuse do — required so B's slack
+        # output is observable. Without this, the kFetchAll dispatch
+        # path leaves t_post_hook[L]=None for every layer and the
+        # diag-slack consumer drops to NA, producing all-zero state
+        # counters and idle_ms_mean=stall_ms_mean=0.
+        self._slack_probe_post_hook(next_layer_idx)
         try:
             self._on_layer_all_pages_impl(
                 next_layer_idx, budget, stats, connector_meta)
+            # Probe #2: pre-hook of L, just before L's forward starts.
+            self._slack_probe_pre_hook(next_layer_idx)
         except Exception:
             logger.exception("on_layer_all_pages FAILED for layer %d",
                              next_layer_idx)
@@ -1875,7 +1985,8 @@ class _Worker:
         total_pages = effective_groups * _GROUP_BLOCKS
 
         if not getattr(rs, "_budget_logged", False):
-            logger.debug(
+            # Once-per-request decision marker the perf-sweep scrapes.
+            logger.info(
                 "icms_budget rid=%s layer=%d src=fetch_all budget=%.3f k=%d "
                 "total_pages=%d",
                 rid, next_layer_idx, budget, total_pages, total_pages,
@@ -1976,11 +2087,17 @@ class _Worker:
         and stores as a pending score result. The wait_for_layer path
         picks it up and populates the fetch buffer.
         """
+        # ICMS_DIAG_SLACK probe #1: post-hook of L-1. Non-stride layers
+        # route here directly via save_kv_layer(quest_reuse_selection=
+        # True), so without this probe slack data only captured stride
+        # boundaries.
+        self._slack_probe_post_hook(next_layer_idx)
         import copy
         attn_layer_name = f"model.layers.{next_layer_idx}.self_attn.attn"
         with self._score_lock:
             reuse_data = self._pending_reuse.pop(attn_layer_name, None)
         if reuse_data is None:
+            self._slack_probe_pre_hook(next_layer_idx)
             return
         # reuse_data is dict[rid → (reply, reuse_offsets)]
         with self._score_lock:
@@ -1993,6 +2110,7 @@ class _Worker:
                     f"model.layers.{next_layer_idx - 1}.self_attn.attn", {})
                 req_idx = orig.get(rid, (None, 0))[1] if orig else 0
                 pending[rid] = (reuse_reply, req_idx)
+        self._slack_probe_pre_hook(next_layer_idx)
 
     def on_layer_score(self, next_layer_idx, quest_query, budget, stats,
                         connector_meta=None):
@@ -2024,6 +2142,10 @@ class _Worker:
                 if e is not None:
                     t_step = e.get("t_step_start")
             entry_rel_ms = ((t_entry - t_step) * 1e3) if t_step else -1.0
+        # ICMS_DIAG_SLACK probe #1: post-hook of L-1, just after L-1
+        # forward ended. Records wall time and whether layer L's ready
+        # flag is already up.
+        self._slack_probe_post_hook(next_layer_idx)
         try:
             if (next_layer_idx % self._score_stride) != 0:
                 self.on_layer_reuse(next_layer_idx, budget, stats)
@@ -2036,6 +2158,7 @@ class _Worker:
                         next_layer_idx, entry_rel_ms, exit_rel_ms,
                         (t_exit - t_entry) * 1e3,
                     )
+                self._slack_probe_pre_hook(next_layer_idx)
                 return
             self._on_layer_score_impl(
                 next_layer_idx, quest_query, budget, stats, connector_meta)
@@ -2048,8 +2171,38 @@ class _Worker:
                     next_layer_idx, entry_rel_ms, exit_rel_ms,
                     (t_exit - t_entry) * 1e3,
                 )
+            self._slack_probe_pre_hook(next_layer_idx)
         except Exception:
             logger.exception("on_layer_score FAILED for layer %d", next_layer_idx)
+
+    def _slack_probe_post_hook(self, layer_idx: int) -> None:
+        """ICMS_DIAG_SLACK probe #1: just after L-1's forward ended,
+        i.e. at the per-layer dispatch entry for layer L. Records the
+        wall time and whether L's ready flag is already up.
+
+        Used by on_layer_score, on_layer_reuse, and on_layer_all_pages
+        — must fire from all three so aggregate_slack can compute
+        per-layer slack regardless of which dispatch path served the
+        layer. Without it, B's slack is all-NA because t_post_hook[L]
+        stays None for every layer.
+        """
+        arr = getattr(self, "_slack_t_post_hook", None)
+        if (arr is not None
+                and 0 <= layer_idx < len(arr)
+                and self._sink_pool is not None):
+            arr[layer_idx] = time.perf_counter()
+            self._slack_flag_at_post[layer_idx] = bool(
+                self._sink_pool.sink.is_layer_ready(layer_idx))
+
+    def _slack_probe_pre_hook(self, layer_idx: int) -> None:
+        """ICMS_DIAG_SLACK probe #2: just before layer L's forward starts."""
+        arr = getattr(self, "_slack_t_pre_hook", None)
+        if (arr is not None
+                and 0 <= layer_idx < len(arr)
+                and self._sink_pool is not None):
+            arr[layer_idx] = time.perf_counter()
+            self._slack_flag_at_pre[layer_idx] = bool(
+                self._sink_pool.sink.is_layer_ready(layer_idx))
 
     def _on_layer_score_impl(self, next_layer_idx, quest_query, budget, stats,
                               connector_meta=None):
@@ -2148,10 +2301,25 @@ class _Worker:
             if not hasattr(rs, '_adaptive_registered') or not rs._adaptive_registered:
                 # Estimate new_tokens and cache_tokens from request state.
                 cache_tokens = total_pages * PAGE_TOKENS
-                # new_tokens is not directly available here; approximate from
-                # the metadata's num_computed_tokens range.
-                new_tokens = max(16, cache_tokens // 10)  # rough estimate
-                if connector_meta and connector_meta.requests:
+                # new_tokens for the slack-table lookup. quest_query is the
+                # Q tensor for layer 0 of THIS step; shape[0] is the count
+                # of new tokens being processed (i.e., pf in the perf-sweep
+                # terminology). This is the reliable signal — the
+                # scheduler-metadata fallback below was broken in V1: at
+                # register-time, step_req.num_computed_tokens_end
+                # - num_computed_tokens_start consistently returned 0,
+                # capping new_tokens at the floor (16) for every prefill
+                # regardless of pf. With new=16 ALL slack-table lookups hit
+                # the small-pf row (~29 ms forward), producing a fixed
+                # k≈123 cap and starving the allocator of actual headroom
+                # at large pf. Verified + fixed 2026-04-27.
+                new_tokens = max(16, cache_tokens // 10)  # last-resort estimate
+                if (quest_query is not None
+                        and hasattr(quest_query, 'shape')
+                        and quest_query.ndim >= 1
+                        and int(quest_query.shape[0]) >= 16):
+                    new_tokens = int(quest_query.shape[0])
+                elif connector_meta and connector_meta.requests:
                     step_req = connector_meta.requests[0]
                     new_tokens = max(16, step_req.num_computed_tokens_end
                                     - step_req.num_computed_tokens_start)
@@ -2174,7 +2342,8 @@ class _Worker:
         # score_stride. We also always log an "adaptive-new" decision
         # since that's the interesting per-request event.
         if budget_source == "adaptive-new" or not getattr(rs, "_budget_logged", False):
-            logger.debug(
+            # Once-per-request decision marker the perf-sweep scrapes.
+            logger.info(
                 "icms_budget rid=%s layer=%d src=%s budget=%.3f k=%d "
                 "total_pages=%d",
                 rid, next_layer_idx, budget_source, effective_budget,
@@ -2193,7 +2362,7 @@ class _Worker:
             # if vLLM ran the full prefill anyway, it would be 16448.
             # Fires once per request via the _budget_logged flag pattern.
             if not getattr(rs, "_q_shape_logged", False):
-                logger.warning(
+                logger.debug(
                     "[diag-fwd-shape] rid=%s layer=%s q.shape=%s tp_rank=%d",
                     rid, getattr(rs, "current_layer", "?"),
                     tuple(quest_query.shape), self._tp_rank)
@@ -2465,19 +2634,22 @@ class _Worker:
         # If the sink doesn't expose ready flags, is_layer_ready returns
         # True and this is a no-op.
         abs_layer = self._extract_layer_idx(layer_name)
-        # ICMS_DIAG_SLACK pairing: record the wait_for_layer entry time
-        # per layer. Combined with the poller's t_arrived[L], this is
-        # how we compute slack[L] = t_called[L] − t_arrived[L].
+        # ICMS_DIAG_SLACK probe #3: record wait_for_layer entry time per
+        # layer (= compute start of layer L, approximately).
+        _slack_called = getattr(self, "_slack_t_called", None)
         if (abs_layer is not None
-                and getattr(self, "_slack_t_called", None) is not None
-                and 0 <= abs_layer < len(self._slack_t_called)):
-            self._slack_t_called[abs_layer] = t_layer_start
+                and _slack_called is not None
+                and 0 <= abs_layer < len(_slack_called)):
+            _slack_called[abs_layer] = t_layer_start
         ready_at_call = True
         if (abs_layer is not None
                 and self._sink_pool is not None
                 and getattr(self._sink_pool.sink, "flag_count", 0) > 0):
             sink = self._sink_pool.sink
             ready_at_call = sink.is_layer_ready(abs_layer)
+            if (_slack_called is not None
+                    and 0 <= abs_layer < len(_slack_called)):
+                self._slack_flag_at_call[abs_layer] = bool(ready_at_call)
             if not ready_at_call:
                 # Poll with exponential backoff starting at 0 (pure spin)
                 # — writes land within ~100µs so spin is right. Cap total
@@ -2489,6 +2661,12 @@ class _Worker:
                             "wait_for_layer: flag timeout for layer=%d", abs_layer)
                         break
         t_after_spin = time.perf_counter()
+        # ICMS_DIAG_SLACK probe #4: when did the spin observe the flip?
+        # (Equal to t_layer_start when ready_at_call=True.)
+        if (abs_layer is not None
+                and getattr(self, "_slack_t_after_spin", None) is not None
+                and 0 <= abs_layer < len(self._slack_t_after_spin)):
+            self._slack_t_after_spin[abs_layer] = t_after_spin
         spin_us = (t_after_spin - t_layer_start) * 1e6
         # ICMS_DIAG_LAYER_ARRIVAL=1: log per-layer arrival timing relative
         # to step start. Lets us pin down whether per-stride RDMA writes are
@@ -2526,8 +2704,35 @@ class _Worker:
                 )
                 total_k_pages += len(reply.page_ids)
             except Exception as e:
-                logger.error("Path B: apply_selective FAILED for %s req=%s: %s",
-                             layer_name, rid, e, exc_info=True)
+                # CRITICAL: do NOT silently swallow. Without re-raising,
+                # the layer falls through to vLLM's default attention
+                # against the FULL prefix-cached HBM blocks → ICMS budget
+                # silently ignored, every budget produces baseline-
+                # equivalent numbers. That's a worst-case silent
+                # corruption mode for accuracy benchmarks. See the
+                # 2026-04-26 audit (docs/tp2_audit_2026-04-26.md
+                # Finding 2) for the discovery context.
+                #
+                # Mark the request's failed-layers set so future
+                # hardening can treat the request as poisoned, then
+                # re-raise so the engine surfaces the failure instead
+                # of emitting meaningless numbers.
+                rs = self._requests.get(rid)
+                if rs is not None:
+                    rs._apply_failed_layers = (
+                        getattr(rs, "_apply_failed_layers", set())
+                        | {layer_name})
+                logger.error(
+                    "Path B: apply_selective FAILED for %s req=%s: %s "
+                    "— re-raising (silent fall-through to default "
+                    "attention would give unmonitored budget=1.0)",
+                    layer_name, rid, e, exc_info=True)
+                if os.environ.get("ICMS_APPLY_SOFT_FAIL", "0") == "1":
+                    # Legacy behavior, gated and explicit. Use only if
+                    # production traffic absolutely cannot tolerate a
+                    # failed-request surface here.
+                    return
+                raise
 
         # Record per-layer breakdown for TTFT analysis.
         t_layer_end = time.perf_counter()
@@ -2875,7 +3080,16 @@ class _Worker:
             new_bt = new_bt_row.unsqueeze(0)
             _lt("after_bt_build")
         else:
-            # Fallback per-page loop for host-sink path (unchanged).
+            # Fallback per-page loop for host-sink path. Mirrors the
+            # GPU-direct branch's per-rank slicing at lines 2970-2974.
+            # Pre-fix-0b (2026-04-26 audit Finding 1) this missed the
+            # slice and crashed at .copy_() when tp_size>1 with a
+            # full-rank wire shape.
+            nkv_local = geom.num_kv_heads
+            head_start = 0
+            if self._tp_size > 1 and not per_rank_slice:
+                nkv_local = geom.num_kv_heads // self._tp_size
+                head_start = self._tp_rank * nkv_local
             filled_blocks = []
             for pid, sink_off in zip(valid_pids, valid_sink_offs):
                 phys_block = int(bt[req_idx, pid])
@@ -2883,10 +3097,25 @@ class _Worker:
                     continue
                 sink_view = sink.view()
                 raw = bytes(sink_view[sink_off:sink_off + kv_page_bytes])
+                # page_shape upstream is (PAGE_TOKENS, geom.num_kv_heads,
+                # head_dim) — the FULL-rank shape on the wire when
+                # per_rank_slice=False.
                 k_np = np.frombuffer(raw[:half_bytes], dtype=np.float16).reshape(page_shape)
                 v_np = np.frombuffer(raw[half_bytes:], dtype=np.float16).reshape(page_shape)
                 k_t = torch.from_numpy(k_np.copy()).to(dtype=model_dtype, device=device)
                 v_t = torch.from_numpy(v_np.copy()).to(dtype=model_dtype, device=device)
+                if self._tp_size > 1 and not per_rank_slice:
+                    # Slice to this rank's KV-head range BEFORE the copy.
+                    k_t = k_t[:, head_start:head_start + nkv_local, :]
+                    v_t = v_t[:, head_start:head_start + nkv_local, :]
+                # Now k_t / v_t shape == main_key[phys_block].shape per-rank.
+                # Assert is intentional — fix-0a re-raises the exception
+                # so this fails loudly under future regressions.
+                assert k_t.shape == main_key[phys_block].shape, (
+                    f"host-sink K shape {tuple(k_t.shape)} != main_key slice "
+                    f"{tuple(main_key[phys_block].shape)} at "
+                    f"tp_rank={self._tp_rank}/{self._tp_size}, "
+                    f"per_rank_slice={per_rank_slice}")
                 main_key[phys_block].copy_(k_t)
                 main_value[phys_block].copy_(v_t)
                 filled_blocks.append(phys_block)
@@ -2976,6 +3205,7 @@ class _Worker:
         """
         t_save_enter = time.perf_counter()
         self._ttft_emit(t_save_enter)
+        self._slack_emit_and_reset()
         if not (self._gpu_kv_caches and self._attn_metadata is not None
                 and self._requests and not self._skip_extract):
             # Nothing to extract — still flip the prefill_done flag.
@@ -2996,6 +3226,23 @@ class _Worker:
                 snap_caches, snap_meta, snap_rids)
 
         self._write_pipeline.submit(_task, tag="wait_for_save")
+
+        # Optional measurement mode: block until this prefill's writes
+        # complete before returning. Default behavior leaves writes async
+        # in the background, which is faster but means iter N's writes
+        # can race iter N+1's fetches on the same RDMA link, polluting
+        # slack measurements (per-layer fetch arrival times shift later
+        # under contention). With ICMS_BLOCK_WRITES=1, all writes are on
+        # the current prefill's TTFT critical path — the next prefill
+        # begins with an idle link.
+        if os.environ.get("ICMS_BLOCK_WRITES") == "1":
+            try:
+                drained = self._write_pipeline.drain(timeout=60.0)
+                if not drained:
+                    logger.warning(
+                        "ICMS_BLOCK_WRITES drain timed out (60s)")
+            except Exception:
+                logger.exception("ICMS_BLOCK_WRITES drain failed")
 
         if not self._prefill_done:
             self._prefill_done = True
@@ -3437,10 +3684,10 @@ class _Worker:
                         len(chain_prefix))
         pages = _GROUP_BLOCKS if not partial else len({p for (_, p) in buf.filled})
         phase = "decode" if self._prefill_done else "prefill"
-        logger.info("[diag-flush] group=%d pages=%d partial=%s phase=%s "
-                    "chain_len=%d num_groups_written(pre)=%d",
-                    group_idx, pages, partial, phase,
-                    len(chain_prefix), rs.num_groups_written)
+        logger.debug("[diag-flush] group=%d pages=%d partial=%s phase=%s "
+                     "chain_len=%d num_groups_written(pre)=%d",
+                     group_idx, pages, partial, phase,
+                     len(chain_prefix), rs.num_groups_written)
         t0 = time.perf_counter()
         try:
             # Option W: only rank 0 sends to the server. All ranks still
@@ -3481,13 +3728,21 @@ class _Worker:
         # path of the *current* request) and *before* the next
         # request's forward begins, which is the right ordering for
         # NCCL serialization.
+        # Drain timeout sized for the worst case mistral budget=0.5 @ 30k
+        # ctx (≈70 GiB of WriteGroup traffic at ~10 GiB/s ⇒ ~7 s on the
+        # link, plus the AllGather barrier). Past 30 s the timeout fired
+        # routinely, returned early, and the next request's NCCL collided
+        # with the still-running pipeline AllGather → shm_broadcast hang
+        # → sample_tokens RPC timeout. 90 s is safely above the observed
+        # 17-25 s drain times during the 2026-04-27 mistral quality run
+        # plus headroom for the larger budgets.
         t0 = time.perf_counter()
-        ok = self._write_pipeline.drain(timeout=30.0)
+        ok = self._write_pipeline.drain(timeout=90.0)
         drain_us = (time.perf_counter() - t0) * 1e6
         if not ok:
             logger.warning(
                 "on_request_finished: write-pipeline drain TIMED OUT "
-                "(>30s, %d tasks pending); request-finish proceeding — "
+                "(>90s, %d tasks pending); request-finish proceeding — "
                 "some writes may be lost.",
                 self._write_pipeline.pending())
         elif drain_us > 1000:
@@ -3514,11 +3769,11 @@ class _Worker:
             self._record_stored_groups(rs.chain, rs.num_groups_written)
             _stored_chain_queue.append(
                 (list(rs.chain), rs.num_groups_written))
-            logger.info("[diag-finish] rid=%s chain_len=%d num_groups_written=%d "
+            logger.debug("[diag-finish] rid=%s chain_len=%d num_groups_written=%d "
                         "pushed to stored-prefix index",
                         request_id, len(rs.chain), rs.num_groups_written)
         else:
-            logger.info("[diag-finish] rid=%s chain_len=%d num_groups_written=%d "
+            logger.debug("[diag-finish] rid=%s chain_len=%d num_groups_written=%d "
                         "(NOT pushed — chain empty or no groups)",
                         request_id, len(rs.chain) if rs.chain else 0,
                         rs.num_groups_written)

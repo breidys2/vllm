@@ -151,14 +151,28 @@ class AdaptiveBandwidthAllocator:
         )
 
         with self._lock:
+            n_active_before = len(self._active)
+            total_demand_before = sum(d.demand_bps for d in self._active.values())
+            stale_rids_sample = list(self._active.keys())[:5]
             self._active[request_id] = demand
             budget = self._compute_budget(demand)
+            total_demand_after = sum(d.demand_bps for d in self._active.values())
+            my_share = self._link_bw * (demand.demand_bps / total_demand_after) \
+                if total_demand_after > 0 else self._link_bw
 
-        logger.debug(
+        logger.info(
             "register_request %s: new=%d cache=%d pages=%d "
-            "slack=%.2fms demand=%.1f MB/s budget=%.3f",
+            "kv_page_B=%d num_layers=%d full_kv_MB=%.1f "
+            "slack=%.2fms demand=%.1f MB/s "
+            "n_active_before=%d total_demand_before=%.1f MB/s "
+            "stale=%s "
+            "link_bw_MBs=%.1f my_share_MBs=%.1f budget=%.3f",
             request_id, new_tokens, cache_tokens, total_cache_pages,
-            total_forward_ms, demand_bps / 1e6, budget,
+            self._kv_page_bytes, self._num_layers, full_kv_bytes / 1e6,
+            total_forward_ms, demand_bps / 1e6,
+            n_active_before, total_demand_before / 1e6,
+            stale_rids_sample,
+            self._link_bw / 1e6, my_share / 1e6, budget,
         )
         return budget
 
@@ -176,7 +190,13 @@ class AdaptiveBandwidthAllocator:
     def unregister_request(self, request_id: str):
         """Remove a finished request from the demand tracker."""
         with self._lock:
+            existed = request_id in self._active
             self._active.pop(request_id, None)
+            n_active_after = len(self._active)
+        logger.info(
+            "unregister_request %s: existed=%s n_active_after=%d",
+            request_id, existed, n_active_after,
+        )
 
     def _compute_budget(self, demand: RequestDemand) -> float:
         """Proportional bandwidth allocation → budget (compute side only).
