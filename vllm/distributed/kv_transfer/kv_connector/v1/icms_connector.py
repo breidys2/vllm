@@ -770,12 +770,15 @@ class IcmsConnector(KVConnectorBase_V1):
 
         if quest_query is not None and next_layer_idx is not None:
             # Extraction is deferred to wait_for_pending_writes; save_kv
-            # only needs to drive scoring here.
-            if not self._worker._prefill_done:
-                self._worker.on_layer_score(
-                    next_layer_idx, quest_query, budget, quest_stats,
-                    connector_meta=self._connector_metadata,
-                )
+            # only needs to drive scoring here. M3: in decode, the
+            # connector continues to issue Score calls (with the
+            # decode-mode bitmap filter) until each stride group's
+            # bitmap is full; once full, _score_one_request short-
+            # circuits and decode runs sparse against the in-cache set.
+            self._worker.on_layer_score(
+                next_layer_idx, quest_query, budget, quest_stats,
+                connector_meta=self._connector_metadata,
+            )
 
     def wait_for_save(self) -> None:
         if self._worker is not None:
@@ -2065,6 +2068,16 @@ class _Worker:
 
         self._sink_pool.sink.clear_ready_flags()
 
+        # Adaptive-bandwidth fields for the wire. Both 0 when adaptive is
+        # off, in which case the server skips its registry + min and the
+        # reply's effective_supply_bps is 0.
+        ab_demand_bps = 0
+        ab_compute_supply_bps = 0
+        if self._adaptive_allocator is not None:
+            ab_demand_bps = self._adaptive_allocator.demand_bps_for(rid)
+            ab_compute_supply_bps = (
+                self._adaptive_allocator.compute_supply_bps_for(rid))
+
         t_start = time.perf_counter()
         try:
             reply = self._client.fetch_all(
@@ -2081,10 +2094,18 @@ class _Worker:
                 # mode — the transfer wall-time shows up as the sum of
                 # per-layer wait_spin on the client side.
                 use_flags=True,
+                demand_bps=ab_demand_bps,
+                compute_supply_bps=ab_compute_supply_bps,
             )
             t_end = time.perf_counter()
             rs._last_storage_concurrent = getattr(
                 reply, 'concurrent_requests', 0)
+            # Adaptive-bandwidth: stash the storage-side effective supply
+            # so the next stride's get_budget(rid) takes
+            # min(compute, storage). 0 means adaptive off server-side.
+            if self._adaptive_allocator is not None:
+                self._adaptive_allocator.apply_storage_supply(
+                    rid, int(getattr(reply, 'effective_supply_bps', 0) or 0))
             rpc_ms = (t_end - t_start) * 1e3
             slow_tag = " SLOW" if rpc_ms > 5.0 else ""
             logger.debug(
@@ -2368,6 +2389,18 @@ class _Worker:
         if total_pages == 0:
             return
 
+        # M3: decode-mode short-circuit. If we're past prefill and this
+        # stride group's bitmap is already full (every page is on the
+        # client), there's nothing left to fetch — let decode run
+        # sparse against the in-cache set without issuing a Score RPC.
+        # _prefill_done is the worker-level gate; with max_num_seqs=1
+        # this is also per-request. Multi-request decode would need
+        # per-rs gating which is future work.
+        is_decode = bool(self._prefill_done)
+        already_fetched = rs.fetched_pages.get(next_layer_idx, set())
+        if is_decode and len(already_fetched) >= total_pages:
+            return
+
         # Determine effective budget: adaptive allocator or static.
         effective_budget = budget
         budget_source = "static"
@@ -2408,6 +2441,13 @@ class _Worker:
                 budget_source = "adaptive-cached"
 
         k = max(1, int(total_pages * effective_budget)) if total_pages > 0 else 1
+        # M3: 10%-of-total floor in decode-mode so the bitmap fills in
+        # ≤10 iters. The adaptive allocator can give more if there's
+        # bandwidth slack (decode iters are short → typically gives
+        # plenty), but the floor guarantees a minimum convergence rate.
+        if is_decode and total_pages > 0:
+            floor_k = (total_pages + 9) // 10  # ceil(0.10 * total_pages)
+            k = max(k, floor_k)
         k = min(k, self._k)
         # Log the chosen budget on the first scoring call of each request
         # so perf scripts can recover it without waiting for the
@@ -2433,7 +2473,10 @@ class _Worker:
         # server skips scoring entirely. Only fires at the first scored
         # layer of each request; subsequent strides see _fetch_all_complete
         # and reuse the cached chain on _pending_reuse.
-        if effective_budget >= 1.0 and total_pages > 0:
+        # M3: in decode, the bitmap-aware Score path is what we want even
+        # at budget=1.0 — kFetchAll ignores the bitmap and would re-fetch
+        # everything. Skip the redirect when decoding.
+        if effective_budget >= 1.0 and total_pages > 0 and not is_decode:
             try:
                 self._fetch_all_one_request(
                     rid, rs, req_idx, next_layer_idx, effective_budget, stats)
@@ -2550,9 +2593,24 @@ class _Worker:
             # drain-time fan-out replicates the sink bytes to every
             # peer rank's sink. Rank 0 then broadcasts the reply tuple
             # so every rank can populate _pending_scores identically.
+            # M3: pack the decode-mode bitmap from rs.fetched_pages.
+            # Empty bytes preserves prefill behavior (server's flag bit
+            # stays 0). During decode this masks already-fetched page
+            # IDs so they fall out of top-k server-side.
+            fetch_bitmap = (
+                _pack_fetch_bitmap(already_fetched, total_pages)
+                if is_decode and already_fetched else b""
+            )
             if self._tp_size > 1 and self._tp_rank != 0:
                 reply = None
             else:
+                # Adaptive-bandwidth pass-through. Both 0 if disabled.
+                ab_demand_bps = 0
+                ab_compute_supply_bps = 0
+                if self._adaptive_allocator is not None:
+                    ab_demand_bps = self._adaptive_allocator.demand_bps_for(rid)
+                    ab_compute_supply_bps = (
+                        self._adaptive_allocator.compute_supply_bps_for(rid))
                 reply = self._client.score(
                     request_id=icms_rid,
                     chain=self._rank_chain(rs.chain),
@@ -2569,6 +2627,9 @@ class _Worker:
                     # consumed (sweep-verified at TP=1). TP=2 correctness
                     # re-check will be done before removing this note.
                     use_flags=True,
+                    fetch_bitmap=fetch_bitmap,
+                    demand_bps=ab_demand_bps,
+                    compute_supply_bps=ab_compute_supply_bps,
                 )
             t_score_end = time.perf_counter()
         except Exception as e:
@@ -2616,6 +2677,13 @@ class _Worker:
             # Stash storage-side concurrent request count for adaptive budget.
             rs._last_storage_concurrent = getattr(
                 reply, 'concurrent_requests', 0)
+            # Adaptive-bandwidth: feed the storage-side effective supply
+            # back into the allocator so the next stride's get_budget()
+            # takes min(compute, storage). 0 ⇒ adaptive off server-side
+            # (no-op stash).
+            if self._adaptive_allocator is not None:
+                self._adaptive_allocator.apply_storage_supply(
+                    rid, int(getattr(reply, 'effective_supply_bps', 0) or 0))
             rpc_ms = (t_score_end - t_score_start) * 1e3
             # Target Score reply-early latency at 16k context is ~2 ms;
             # flag anything noticeably above so we can grep spurious slow
@@ -4012,6 +4080,21 @@ class _Worker:
         # Unregister from adaptive bandwidth allocator.
         if self._adaptive_allocator is not None:
             self._adaptive_allocator.unregister_request(request_id)
+            # Tell the BF2 to drop its matching demand entry. Best-effort:
+            # connection close + the server's on_closed cleanup is the
+            # safety net for crashed / SIGKILL'd ranks. Wrapped in
+            # try/except so a transport hiccup never blocks request
+            # teardown. Only rank 0 has an issuing client at TP>1.
+            if self._client is not None and (
+                    self._tp_size <= 1 or self._tp_rank == 0):
+                try:
+                    icms_rid = self._icms_request_id(request_id, 0)
+                    self._client.request_finished(icms_rid)
+                except Exception as e:
+                    logger.debug(
+                        "request_finished RPC failed for rid=%s: %s "
+                        "(harmless; on_closed will GC the entry)",
+                        request_id, e)
 
     # ─── direct helper API (backward compat with smoke tests) ────────────
 

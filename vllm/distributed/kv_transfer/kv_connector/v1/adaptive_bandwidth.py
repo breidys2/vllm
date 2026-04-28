@@ -24,6 +24,11 @@ class RequestDemand:
     demand_bps: float  # bytes per second needed for full KV transfer
     new_tokens: int
     cache_tokens: int
+    # Most recent storage-side effective supply for this rid, in bytes/sec.
+    # 0.0 means "not yet seen / adaptive disabled storage-side" — the
+    # allocator falls back to compute_supply alone. Updated by
+    # apply_storage_supply() from each Score/FetchAll reply.
+    last_storage_supply_bps: float = 0.0
 
 
 class ComputeSlackTable:
@@ -207,23 +212,40 @@ class AdaptiveBandwidthAllocator:
             request_id, existed, n_active_after,
         )
 
-    def _compute_budget(self, demand: RequestDemand) -> float:
-        """Proportional bandwidth allocation → budget (compute side only).
+    def _compute_share(self, demand: RequestDemand) -> float:
+        """Compute-side proportional share for this request, in B/s.
 
-        The storage side manages its own contention internally — it throttles
-        KV writes based on its concurrent request load.  The compute side
-        only manages its own demand/supply.
-
-        Must be called with self._lock held.
+        Same math as `BandwidthRegistry::effective_supply_bps` on the
+        server: link_bw * (mine / total). Must be called with the lock
+        held. Returns link_bw when the registry has only this one entry.
         """
         total_demand = sum(d.demand_bps for d in self._active.values())
         if total_demand <= 0:
+            return float(self._link_bw)
+        return self._link_bw * (demand.demand_bps / total_demand)
+
+    def _compute_budget(self, demand: RequestDemand) -> float:
+        """Effective budget = min(compute_share, storage_supply) / demand,
+        clamped to [MIN_BUDGET, 1.0] with the 0.95 ceiling-snap.
+
+        `storage_supply` is the most recent value the BF2 returned in
+        ScoreReplyPayload.effective_supply_bps for this rid (0 if no
+        reply yet, or storage-side allocation is off — in which case
+        compute_share alone gates).
+
+        Must be called with self._lock held.
+        """
+        if demand.demand_bps <= 0:
             return 1.0
 
-        # Proportional share of the link bandwidth.
-        my_share = self._link_bw * (demand.demand_bps / total_demand)
-        # Budget = what fraction of the full KV we can fetch in time.
-        budget = min(1.0, my_share / demand.demand_bps)
+        my_share = self._compute_share(demand)
+        # Min against storage side. last_storage_supply_bps==0 means
+        # "no signal" → compute side alone.
+        if demand.last_storage_supply_bps > 0:
+            effective = min(my_share, demand.last_storage_supply_bps)
+        else:
+            effective = my_share
+        budget = min(1.0, effective / demand.demand_bps)
 
         # Clamp + ceiling-snap. Floor at _MIN_BUDGET preserves attention
         # quality at very high ctx (where the natural budget drops below a
@@ -237,6 +259,41 @@ class AdaptiveBandwidthAllocator:
         if budget < self._MIN_BUDGET:
             return self._MIN_BUDGET
         return budget
+
+    # ── Storage-side hookup ─────────────────────────────────────────────
+
+    def demand_bps_for(self, request_id: str) -> int:
+        """Demand in bytes/sec for a registered request, rounded to int
+        (the wire protocol uses uint64). 0 if not registered."""
+        with self._lock:
+            d = self._active.get(request_id)
+            return int(d.demand_bps) if d is not None else 0
+
+    def compute_supply_bps_for(self, request_id: str) -> int:
+        """Host-side proportional share of link bw for a registered
+        request, rounded to int. 0 if not registered.
+
+        This is the value the connector stuffs into ScorePayload's
+        compute_supply_bps so the server can take min() against its own
+        proportional share.
+        """
+        with self._lock:
+            d = self._active.get(request_id)
+            if d is None:
+                return 0
+            return int(self._compute_share(d))
+
+    def apply_storage_supply(self, request_id: str,
+                              effective_supply_bps: int) -> None:
+        """Stash the storage-side effective_supply from a Score/FetchAll
+        reply so the next `get_budget(rid)` can take min(compute,
+        storage). 0 means "storage-side allocation off" — clear any
+        prior stash so we revert to compute-only."""
+        with self._lock:
+            d = self._active.get(request_id)
+            if d is None:
+                return
+            d.last_storage_supply_bps = float(effective_supply_bps or 0)
 
     @property
     def num_active(self) -> int:
