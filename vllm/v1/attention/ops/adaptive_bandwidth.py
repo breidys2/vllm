@@ -385,7 +385,7 @@ class AdaptiveBandwidthAllocator:
         profiler: LayerComputeProfiler,
         compute_bandwidth_bps: float,
         storage_bandwidth_bps: float | None = None,
-        min_budget: float = 0.01,
+        min_budget: float = 0.1,
     ):
         self.profiler = profiler
         self._compute_bw = compute_bandwidth_bps
@@ -408,7 +408,7 @@ class AdaptiveBandwidthAllocator:
         profile_path: str | Path,
         compute_bandwidth_gbps: float,
         storage_bandwidth_gbps: float | None = None,
-        min_budget: float = 0.01,
+        min_budget: float = 0.1,
         # Analytical fallback params (forwarded to LayerComputeProfiler).
         num_layers: int = 32,
         num_heads: int = 32,
@@ -532,6 +532,12 @@ class AdaptiveBandwidthAllocator:
         # (proportional allocation simplifies to total_bw / total_demand).
         raw = effective_bw / total_demand
         budget = max(self._min_budget, min(1.0, raw))
+        # Ceiling snap: at very low scarcity (raw >= 0.95) we'd be skipping
+        # ≤5% of pages, which doesn't justify the score RPC + per-page top-k
+        # selection cost. Round up to 1.0 so the upstream dispatch routes
+        # to kFetchAll (no scoring, no summary fetches).
+        if budget >= 0.95:
+            budget = 1.0
         logger.debug(
             "Budget: effective_bw=%.1f GB/s, total_demand=%.1f GB/s → %.3f",
             effective_bw / 1e9, total_demand / 1e9, budget,

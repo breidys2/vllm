@@ -417,6 +417,26 @@ class _RequestState:
     num_groups_written: int = 0                            # groups fully flushed to icms
     active_group_buffers: dict[int, _GroupBuffer] = field(default_factory=dict)  # group_idx → buf
     stored_groups: int = 0  # groups already in ICMS under this chain prefix (dedup-aware skip)
+    # Per-stride apply cache (set at the scored layer, reused on the
+    # following stride-1 reuse layers). The block_table layout, seq_len,
+    # phys_blocks, and per-page page_idx baseline are identical across all
+    # layers in a stride — only the sink_offset shifts by delta * actual_k
+    # pages. Caching skips ~0.5–1 ms of Python pid filter / sort / dict /
+    # tensor build at every reuse layer (5 of every 6 layers).
+    _apply_cached_layer_start: int = -1
+    _apply_cached_phys_blocks_dev: object = None  # torch.Tensor or None
+    _apply_cached_page_idx_dev: object = None
+    _apply_cached_actual_k: int = 0
+    _apply_cached_new_bt: object = None
+    _apply_cached_new_sl: object = None
+    _apply_cached_max_seq_len: int = 0
+    _apply_cached_filled_count: int = 0
+    # Per-request cached `cont_idx` device tensor for the trimmed
+    # block-table tail. cont_idx depends on (context_pages, cont_end)
+    # which are per-request constants during prefill — cache once at the
+    # first scored layer, reuse on every subsequent stride.
+    _apply_cached_cont_idx_dev: object = None
+    _apply_cached_cont_idx_range: tuple = (0, 0)  # (context_pages, cont_end)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1322,6 +1342,27 @@ class _Worker:
         # Enabled when ICMS_TTFT_BREAKDOWN=1.
         self._ttft_enabled = os.environ.get("ICMS_TTFT_BREAKDOWN", "1") != "0"
         self._ttft: dict[str, dict] = {}
+
+        # Cache apply-path env vars at init (was per-layer
+        # os.environ.get → ~us each × 48 layers × every iter). Static for
+        # the lifetime of the connector.
+        self._cfg_per_rank_slice = (
+            os.environ.get("ICMS_PER_RANK_SLICE", "0") == "1")
+        self._cfg_apply_stream = (
+            os.environ.get("ICMS_APPLY_STREAM", "0") == "1")
+        self._cfg_skip_bounds = (
+            os.environ.get("ICMS_SKIP_BOUNDS", "0") == "1")
+        self._cfg_line_timing = (
+            os.environ.get("ICMS_LINE_TIMING", "0") == "1")
+        self._cfg_apply_timing = (
+            os.environ.get("ICMS_APPLY_TIMING", "0") == "1")
+        self._cfg_no_seqlen_cache = (
+            os.environ.get("ICMS_NO_SEQLEN_CACHE", "0") == "1")
+        self._cfg_apply_soft_fail = (
+            os.environ.get("ICMS_APPLY_SOFT_FAIL", "0") == "1")
+        # Cached sink_pages view, populated lazily on first apply call
+        # (depends on geom which is only known post-_connect()).
+        self._sink_pages_view: object = None
 
         self._connect()
 
@@ -2351,6 +2392,24 @@ class _Worker:
             )
             rs._budget_logged = True
 
+        # Ceiling-snap redirect: when the adaptive allocator clamped budget
+        # up to 1.0 (raw >= 0.95), routing through scoring would just waste
+        # an RPC + summary-fetch RTT to ask for the top-(total_pages) pages
+        # — which is every page. Redirect to the kFetchAll dispatch so the
+        # server skips scoring entirely. Only fires at the first scored
+        # layer of each request; subsequent strides see _fetch_all_complete
+        # and reuse the cached chain on _pending_reuse.
+        if effective_budget >= 1.0 and total_pages > 0:
+            try:
+                self._fetch_all_one_request(
+                    rid, rs, req_idx, next_layer_idx, effective_budget, stats)
+                return  # skip scoring; FetchAll handles every page
+            except Exception:
+                logger.exception(
+                    "ceiling-snap redirect to kFetchAll failed for rid=%s "
+                    "layer=%d; falling back to scoring path",
+                    rid, next_layer_idx)
+
         # Marshal query to fp32 numpy, mean-pooling Q heads per KV-head
         # group for GQA (matching QuestPageSelector.compute_page_scores).
         geom = self._geom
@@ -2727,7 +2786,7 @@ class _Worker:
                     "— re-raising (silent fall-through to default "
                     "attention would give unmonitored budget=1.0)",
                     layer_name, rid, e, exc_info=True)
-                if os.environ.get("ICMS_APPLY_SOFT_FAIL", "0") == "1":
+                if self._cfg_apply_soft_fail:
                     # Legacy behavior, gated and explicit. Use only if
                     # production traffic absolutely cannot tolerate a
                     # failed-request surface here.
@@ -2767,6 +2826,21 @@ class _Worker:
                     (t_layer_end - (entry["t_step_start"] if entry else t_layer_start)) * 1e3,
                     len(reply.page_ids))
 
+    def _get_sink_pages(self, sink, kv_page_bytes: int):
+        """Cached `sink_pages` view of the entire sink as [N, page_bytes].
+
+        The sink's GPU buffer and shape are fixed for the connector's
+        lifetime, but constructing the gpu_view + view per layer fires
+        ~us of Python + CUDA driver overhead on every apply (≥48 layers
+        per iter). Cache the result on first call.
+        """
+        if self._sink_pages_view is not None:
+            return self._sink_pages_view
+        sink_base = sink.gpu_view(0, sink.size)
+        sink_pages = sink_base.view(-1, kv_page_bytes)
+        self._sink_pages_view = sink_pages
+        return sink_pages
+
     def _apply_selective_attention(self, layer_name: str, reply,
                                    req_idx: int, rid: str = ""):
         # Per-line wall-time instrumentation, gated by ICMS_LINE_TIMING=1.
@@ -2774,8 +2848,7 @@ class _Worker:
         # H2D tensor creations, dict/list ops, and tensor casts. Used
         # to localize the ~3.6 ms/layer Python overhead at TP=2 that
         # remains after seq_len caching. NOT for production.
-        import os as _os_lt
-        _line_dbg = _os_lt.environ.get("ICMS_LINE_TIMING", "0") == "1"
+        _line_dbg = self._cfg_line_timing
         _LT = []  # list of (label, t_perf_counter)
         def _lt(label):
             if _line_dbg:
@@ -2815,8 +2888,7 @@ class _Worker:
         # and reuse on subsequent layers. ICMS_NO_SEQLEN_CACHE=1
         # disables the cache for A/B testing.
         rs = self._requests.get(rid)
-        import os as _os_sl
-        _no_seqlen_cache = _os_sl.environ.get("ICMS_NO_SEQLEN_CACHE", "0") == "1"
+        _no_seqlen_cache = self._cfg_no_seqlen_cache
         if (rs is not None
                 and not _no_seqlen_cache
                 and getattr(rs, "_apply_cached_seq_len", None) is not None
@@ -2847,6 +2919,89 @@ class _Worker:
         context_pages = effective_groups * _GROUP_BLOCKS
         context_tokens = context_pages * PAGE_TOKENS
         total_blocks = (seq_len + PAGE_TOKENS - 1) // PAGE_TOKENS
+
+        # ─── FAST PATH: reuse the scored layer's cached apply on
+        # subsequent reuse layers within the same stride. The block_table,
+        # seq_len, valid pids, and phys_blocks are stride-invariant; only
+        # the per-layer sink offsets shift by `delta * cached_actual_k`
+        # pages. This skips the Python pid sort + filter + dict +
+        # pinned-tensor build at every reuse layer (5 of every 6 layers).
+        # The actual GPU memcpy (gather + slice + scatter) still runs.
+        layer_idx_for_cache = self._extract_layer_idx(layer_name)
+        cached_start = rs._apply_cached_layer_start
+        if (layer_idx_for_cache is not None
+                and cached_start >= 0
+                and rs._apply_cached_phys_blocks_dev is not None
+                and rs._apply_cached_new_bt is not None):
+            delta = layer_idx_for_cache - cached_start
+            if 0 < delta < self._score_stride:
+                cached_k_pages = rs._apply_cached_actual_k
+                page_idx_dev = (rs._apply_cached_page_idx_dev
+                                + (delta * cached_k_pages))
+                phys_blocks_dev = rs._apply_cached_phys_blocks_dev
+
+                geom = self._geom
+                sink = self._sink_pool.sink
+                per_rank_slice = (self._tp_size > 1 and self._cfg_per_rank_slice)
+                nkv_local_runtime = (
+                    geom.num_kv_heads // self._tp_size
+                    if self._tp_size > 1 else geom.num_kv_heads)
+                if per_rank_slice:
+                    kv_page_bytes_eff = geom.kv_page_bytes // self._tp_size
+                    kv_page_bytes = geom.kv_page_bytes
+                    half_bytes = kv_page_bytes_eff // 2
+                    page_shape = (PAGE_TOKENS, nkv_local_runtime, geom.head_dim)
+                else:
+                    kv_page_bytes = geom.kv_page_bytes
+                    half_bytes = kv_page_bytes // 2
+                    page_shape = (PAGE_TOKENS, geom.num_kv_heads, geom.head_dim)
+                model_dtype = main_key.dtype
+                device = main_key.device
+
+                if self._cfg_apply_stream and not hasattr(self, "_apply_stream"):
+                    self._apply_stream = torch.cuda.Stream(device=device)
+                apply_stream = (self._apply_stream
+                                if self._cfg_apply_stream else None)
+                default_stream = torch.cuda.current_stream(device)
+                if apply_stream is not None:
+                    in_event = torch.cuda.Event()
+                    in_event.record(default_stream)
+                    apply_stream.wait_event(in_event)
+                stream_ctx = (torch.cuda.stream(apply_stream)
+                              if apply_stream is not None
+                              else nullcontext())
+
+                with stream_ctx:
+                    sink_pages = self._get_sink_pages(sink, kv_page_bytes)
+                    pages_u8 = sink_pages.index_select(0, page_idx_dev)
+                    if per_rank_slice:
+                        pages_u8 = pages_u8[:, :kv_page_bytes_eff].contiguous()
+                    k_bytes = pages_u8[:, :half_bytes].contiguous()
+                    v_bytes = pages_u8[:, half_bytes:].contiguous()
+                    k_pages = k_bytes.view(model_dtype).reshape(-1, *page_shape)
+                    v_pages = v_bytes.view(model_dtype).reshape(-1, *page_shape)
+                    if self._tp_size > 1 and not per_rank_slice:
+                        nkv_local = geom.num_kv_heads // self._tp_size
+                        start = self._tp_rank * nkv_local
+                        k_pages = k_pages[:, :, start:start + nkv_local, :].contiguous()
+                        v_pages = v_pages[:, :, start:start + nkv_local, :].contiguous()
+                    main_key.index_copy_(0, phys_blocks_dev, k_pages)
+                    main_value.index_copy_(0, phys_blocks_dev, v_pages)
+
+                if apply_stream is not None:
+                    out_event = torch.cuda.Event()
+                    out_event.record(apply_stream)
+                    default_stream.wait_event(out_event)
+
+                from vllm.v1.attention import icms_fetch_state
+                icms_fetch_state.set_active(icms_fetch_state.IcmsFetchState(
+                    key_cache=main_key,
+                    value_cache=main_value,
+                    block_table=rs._apply_cached_new_bt,
+                    seq_lens=rs._apply_cached_new_sl,
+                    max_seq_len=rs._apply_cached_max_seq_len,
+                ))
+                return True
 
         # ── Fetch selected pages' KV from ICMS sink → GPU blocks ──
         # BUG-N9: the truncation to self._k is a real safety rail (sink
@@ -2883,10 +3038,7 @@ class _Worker:
         # layout becomes (PAGE_TOKENS, nkv_local, head_dim) per K and V,
         # halving wire bandwidth + GPU memcpy. Skip the read-time slice
         # below in that mode.
-        import os as _os
-        per_rank_slice = (
-            self._tp_size > 1
-            and _os.environ.get("ICMS_PER_RANK_SLICE", "0") == "1")
+        per_rank_slice = (self._tp_size > 1 and self._cfg_per_rank_slice)
         nkv_local_runtime = (geom.num_kv_heads // self._tp_size
                               if self._tp_size > 1 else geom.num_kv_heads)
         if per_rank_slice:
@@ -2926,8 +3078,7 @@ class _Worker:
             # ── Batched GPU-direct path: one gather + one dtype convert + ──
             # ── one scatter per layer, instead of 4 kernels + 1 host-sync ──
             # ── per page (old path ran ~48k kernels + ~12k syncs per req). ──
-            sink_base = sink.gpu_view(0, sink.size)          # [sink_bytes] u8
-            sink_pages = sink_base.view(-1, kv_page_bytes)   # [N, page_bytes]
+            sink_pages = self._get_sink_pages(sink, kv_page_bytes)
 
             # One host→device copy for the index tensors. The naive
             # `torch.tensor(list, device=cuda)` path takes ~3.5 ms/layer
@@ -2953,14 +3104,11 @@ class _Worker:
                 0, valid_pids_dev).to(torch.int64)
             _lt("after_phys_blocks")
 
-            # Bound check: phys_block < main_key.shape[0]. ICMS_SKIP_BOUNDS=1
-            # disables this — the .item() forced a CPU↔GPU sync per layer
-            # (48× per request). At TP=2 it appears to serialize against
-            # in-flight NCCL collectives, dominating wait_apply (200 ms vs
-            # ~17 ms at TP=1, despite TP=2 doing half the data). We've
-            # never hit the out-of-bounds branch in practice.
-            import os as _os_bc
-            if _os_bc.environ.get("ICMS_SKIP_BOUNDS", "0") != "1":
+            # Bound check: phys_block < main_key.shape[0]. The .item() is a
+            # CPU↔GPU sync; never observed to fire in practice. Gated by
+            # ICMS_SKIP_BOUNDS=1 to disable. Empirically (2026-04-27 audit)
+            # leaving it on costs <2 ms per iter — keep enabled for safety.
+            if not self._cfg_skip_bounds:
                 max_blocks_hbm = main_key.shape[0]
                 if bool((phys_blocks_dev >= max_blocks_hbm).any().item()):
                     bounds_mask = phys_blocks_dev < max_blocks_hbm
@@ -2970,25 +3118,20 @@ class _Worker:
                         return None
 
             # ─── Dedicated apply stream (ICMS_APPLY_STREAM=1) ─────────
-            # Apply work has only ~5 ms of GPU compute total (across 48
-            # layers, measured with explicit syncs) but Python sees
-            # ~200 ms because the kernels queue behind in-flight TP
-            # AllReduces on the default CUDA stream at TP=2. Running
-            # them on a separate stream lets them overlap with NCCL.
-            #
-            # Correctness: bracket the apply with two events —
+            # Optional alternate-stream dispatch for the apply gather +
+            # scatter, intended to overlap NCCL on the default stream.
+            # 2026-04-27 audit: provides no measurable win after seq_len
+            # cache + per-stride apply cache landed; left in place but
+            # off by default. Brackets with in/out events for correctness:
             #   - in_event: apply stream waits for default stream's
             #     prior writes (block_table mods, sink data, etc.).
             #   - out_event: default stream waits for apply's writes
             #     before the NEXT layer's attention reads main_key/_value.
-            import os as _os_at
-            _apply_dbg = _os_at.environ.get("ICMS_APPLY_TIMING", "0") == "1"
-            _use_apply_stream = (
-                _os_at.environ.get("ICMS_APPLY_STREAM", "0") == "1")
-            if _use_apply_stream and not hasattr(self, "_apply_stream"):
+            _apply_dbg = self._cfg_apply_timing
+            if self._cfg_apply_stream and not hasattr(self, "_apply_stream"):
                 self._apply_stream = torch.cuda.Stream(device=device)
             apply_stream = (self._apply_stream
-                             if _use_apply_stream else None)
+                             if self._cfg_apply_stream else None)
             default_stream = torch.cuda.current_stream(device)
             if apply_stream is not None:
                 in_event = torch.cuda.Event()
@@ -3061,14 +3204,22 @@ class _Worker:
             # per-continuation-block int(bt[...]) sync.
             cont_end = min(total_blocks, bt.shape[1])
             if cont_end > context_pages:
-                # Build cont_idx on CPU (pinned) and async-copy to GPU.
-                # `torch.arange(..., device=cuda)` issues a kernel that
-                # serializes against in-flight model work, repeating the
-                # pageable-staging stall pattern.
-                _cont_idx_cpu = torch.arange(
-                    context_pages, cont_end,
-                    dtype=torch.int64, pin_memory=True)
-                cont_idx = _cont_idx_cpu.to(device, non_blocking=True)
+                # cont_idx depends only on (context_pages, cont_end),
+                # both per-request constants during prefill. Cache the
+                # device-side tensor on rs after the first scored
+                # layer; subsequent strides reuse it directly. Saves
+                # the pinned-tensor build + async-H2D per stride.
+                cached_range = rs._apply_cached_cont_idx_range
+                if (rs._apply_cached_cont_idx_dev is not None
+                        and cached_range == (context_pages, cont_end)):
+                    cont_idx = rs._apply_cached_cont_idx_dev
+                else:
+                    _cont_idx_cpu = torch.arange(
+                        context_pages, cont_end,
+                        dtype=torch.int64, pin_memory=True)
+                    cont_idx = _cont_idx_cpu.to(device, non_blocking=True)
+                    rs._apply_cached_cont_idx_dev = cont_idx
+                    rs._apply_cached_cont_idx_range = (context_pages, cont_end)
                 cont_blocks = bt[req_idx].index_select(
                     0, cont_idx).to(torch.int32)
                 new_bt_row = torch.cat(
@@ -3158,6 +3309,26 @@ class _Worker:
             max_seq_len=new_seq_len,
         ))
         _lt("after_set_active")
+
+        # Populate the per-stride apply cache for the next reuse layers.
+        # All quantities below are stride-invariant: phys_blocks and new_bt
+        # depend only on the selected page-id set; new_sl/max_seq_len
+        # depend only on filled_blocks_count + seq_len. The sink offset
+        # shift between layers is `delta * actual_k` pages — applied as a
+        # single device-side add in the fast path. Only safe to cache from
+        # the gpu_direct branch; the host-sink fallback exits earlier.
+        if (rs is not None
+                and gpu_direct
+                and layer_idx_for_cache is not None
+                and self._score_stride > 1):
+            rs._apply_cached_layer_start = layer_idx_for_cache
+            rs._apply_cached_phys_blocks_dev = phys_blocks_dev
+            rs._apply_cached_page_idx_dev = page_idx_dev
+            rs._apply_cached_actual_k = len(reply.page_ids)
+            rs._apply_cached_new_bt = new_bt
+            rs._apply_cached_new_sl = new_sl
+            rs._apply_cached_max_seq_len = new_seq_len
+            rs._apply_cached_filled_count = filled_blocks_count
         if _line_dbg and len(_LT) >= 2:
             parts = []
             for i in range(1, len(_LT)):

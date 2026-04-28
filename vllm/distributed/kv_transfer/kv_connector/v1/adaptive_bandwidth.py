@@ -94,6 +94,15 @@ class AdaptiveBandwidthAllocator:
     budget based on proportional bandwidth allocation.
     """
 
+    # Clamp the computed budget to [_MIN_BUDGET, 1.0] to keep accuracy
+    # bounded at very long context (where bandwidth would otherwise drop
+    # k below useful page counts) and to skip scoring/summary-fetch
+    # overhead when we'd be fetching nearly everything anyway.
+    _MIN_BUDGET = 0.1
+    # Above this raw budget we round up to 1.0 and skip scoring entirely
+    # (caller routes to the kFetchAll fast path on budget==1.0).
+    _CEILING_SNAP = 0.95
+
     def __init__(
         self,
         link_bandwidth_bps: float,
@@ -215,6 +224,18 @@ class AdaptiveBandwidthAllocator:
         my_share = self._link_bw * (demand.demand_bps / total_demand)
         # Budget = what fraction of the full KV we can fetch in time.
         budget = min(1.0, my_share / demand.demand_bps)
+
+        # Clamp + ceiling-snap. Floor at _MIN_BUDGET preserves attention
+        # quality at very high ctx (where the natural budget drops below a
+        # useful page count). Ceiling snap at >=_CEILING_SNAP rounds up to
+        # 1.0 — caller's budget==1.0 dispatch routes to kFetchAll, which
+        # skips the per-stride score RPC and per-page top-k selection that
+        # would otherwise add fixed overhead for negligible bandwidth
+        # savings (≤5% pages skipped).
+        if budget >= self._CEILING_SNAP:
+            return 1.0
+        if budget < self._MIN_BUDGET:
+            return self._MIN_BUDGET
         return budget
 
     @property
