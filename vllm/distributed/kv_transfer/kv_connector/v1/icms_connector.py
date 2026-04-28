@@ -112,6 +112,24 @@ _GROUP_BLOCKS = GROUP_PAGES  # blocks per group (= pages per group = 32)
 # See docs/icms_connector_tp_support.md.
 _RANK_TAG_MAGIC = 0xE1C5A4EE00000000
 
+def _pack_fetch_bitmap(fetched: "set[int]", total_pages: int) -> bytes:
+    """Pack a set of page IDs into the decode-mode bitmap wire format.
+
+    bit n of byte n/8 (LSB-first) ⇒ page_id n is "already fetched" on
+    the client. Sized to ceil(total_pages / 8) bytes. Page IDs outside
+    [0, total_pages) are ignored. M3 calls this on a stride-group's
+    fetched_pages set to build the wire suffix for decode-mode Score.
+    """
+    n_bytes = (total_pages + 7) // 8
+    if n_bytes == 0 or not fetched:
+        return b"\x00" * n_bytes
+    bm = bytearray(n_bytes)
+    for pid in fetched:
+        if 0 <= pid < total_pages:
+            bm[pid >> 3] |= 1 << (pid & 0x7)
+    return bytes(bm)
+
+
 def _rank_tag(tp_rank: int) -> int:
     return _RANK_TAG_MAGIC | int(tp_rank)
 
@@ -437,6 +455,15 @@ class _RequestState:
     # first scored layer, reuse on every subsequent stride.
     _apply_cached_cont_idx_dev: object = None
     _apply_cached_cont_idx_range: tuple = (0, 0)  # (context_pages, cont_end)
+    # Decode-mode fetch tracking (M2 of icms_decode_path_plan).
+    # Maps the *scored layer index* (e.g. 0, 6, 12, … for stride=6) to
+    # the set of page_ids already returned by Score / FetchAll for the
+    # stride group rooted at that layer. Updated after every Score
+    # reply during prefill (so by the prefill→decode transition the
+    # set already reflects everything fetched so far) and during
+    # decode iters once M3 wires the decode hooks. Use _pack_fetch_bitmap
+    # to encode for the wire suffix.
+    fetched_pages: dict = field(default_factory=dict)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2084,6 +2111,13 @@ class _Worker:
                 next_layer_idx,
                 scores=list(reply.scores),
             )
+            # M2: prime decode-mode fetched-pages tracking. FetchAll
+            # returns every page in the resolved chain, so this single
+            # update marks the stride-group fully populated — useful for
+            # M4's "skip Score when bitmap full" optimization later.
+            if reply.page_ids:
+                rs.fetched_pages.setdefault(
+                    next_layer_idx, set()).update(reply.page_ids)
             self._ttft_add(
                 rid,
                 num_fetch_alls=1,
@@ -2608,6 +2642,14 @@ class _Worker:
                 next_layer_idx,
                 scores=list(reply.scores),
             )
+            # M2: prime the decode-mode fetched-pages set for this
+            # stride group. After prefill completes this dict will hold
+            # exactly the pages on host (per scored layer); M3 reads it
+            # to build the bitmap wire suffix on decode-mode Score
+            # calls. No behavior change for prefill.
+            if reply.page_ids:
+                rs.fetched_pages.setdefault(
+                    next_layer_idx, set()).update(reply.page_ids)
             self._ttft_add(
                 rid,
                 num_scores=1,
