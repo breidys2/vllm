@@ -459,6 +459,20 @@ class QuestHookManager:
                 and getattr(self.kv_connector,
                             "is_dense_for_active_request", None) is not None
                 and self.kv_connector.is_dense_for_active_request()):
+            # M4 verification (ICMS_DIAG_DENSE=1): count + log Quest-hook
+            # skips post-flip so we can confirm both the connector AND
+            # the hook side observe dense_mode and bail out.
+            import os as _os_d
+            if _os_d.environ.get("ICMS_DIAG_DENSE") == "1":
+                if not hasattr(self, "_quest_dense_skip_count"):
+                    self._quest_dense_skip_count = 0
+                self._quest_dense_skip_count += 1
+                if (self._quest_dense_skip_count <= 5
+                        or self._quest_dense_skip_count % 100 == 0):
+                    import logging as _logging_d
+                    _logging_d.getLogger(__name__).info(
+                        "[quest] dense_skip layer=%d skip_count=%d",
+                        layer_idx, self._quest_dense_skip_count)
             return
 
         next_layer_idx = layer_idx + 1

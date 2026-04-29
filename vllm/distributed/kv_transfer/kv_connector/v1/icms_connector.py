@@ -2470,6 +2470,17 @@ class _Worker:
         # for the rest of the request and skip every subsequent Score
         # / Quest-hook on this rs. See update site below for the flip.
         if is_decode and rs.dense_mode:
+            # M4 verification (ICMS_DIAG_DENSE=1): increment + log a
+            # counter so we can confirm Score is *actually* skipped
+            # post-flip rather than just trusting the early-return.
+            if os.environ.get("ICMS_DIAG_DENSE") == "1":
+                if not hasattr(rs, "_dense_skip_count"):
+                    rs._dense_skip_count = 0
+                rs._dense_skip_count += 1
+                if rs._dense_skip_count <= 5 or rs._dense_skip_count % 50 == 0:
+                    logger.info(
+                        "[icms] dense_skip rid=%s layer=%d skip_count=%d",
+                        rid, next_layer_idx, rs._dense_skip_count)
             return
         already_fetched = rs.fetched_pages.get(next_layer_idx, set())
         if is_decode and len(already_fetched) >= total_pages:
