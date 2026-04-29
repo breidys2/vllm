@@ -2933,6 +2933,17 @@ class _Worker:
                 and 0 <= abs_layer < len(_slack_called)):
             _slack_called[abs_layer] = t_layer_start
         ready_at_call = True
+        # M4-A (Fix F, 2026-04-29): once any active request has flipped
+        # to dense_mode, no Score/FetchAll fires this iter, so per-layer
+        # flags will never be set — skip the spin to avoid 5s timeouts
+        # × num_layers per decode iter. Inline check (we're on _Worker;
+        # is_dense_for_active_request lives on IcmsConnector).
+        if self._requests:
+            _all_dense = all(
+                getattr(rs, "dense_mode", False)
+                for rs in self._requests.values())
+            if _all_dense:
+                return
         # ICMS_REPLY_EARLY=0 disables the flag-spin entirely so the
         # connector only proceeds after the sync Score/FetchAll reply
         # has returned (= Phase-2 fully done). Used to test whether the
