@@ -873,11 +873,22 @@ class IcmsConnector(KVConnectorBase_V1):
         # (~130 ms). The scheduler already has rid→chain from
         # get_num_new_matched_tokens, and n_groups is deterministic from
         # the prompt length, so we record it here directly without IPC.
+        #
+        # Fix I (2026-04-29): order the worker call FIRST. The worker's
+        # `on_request_finished` drains the deferred-extract pipeline
+        # (which finishes flushing groups) and then pushes the chain to
+        # `_stored_chain_queue`. At TP=1 (same process), the scheduler's
+        # subsequent `on_finished_record_stored` drains that queue into
+        # `_stored_chains` so the next request's
+        # `get_num_new_matched_tokens` sees `matched_groups > 0` instead
+        # of falling back to a full cold prefill on the first warm.
+        # Without this swap, first-warm-after-cold at large ctx took 96 s
+        # (full prefill of 32k tokens) instead of <300 ms (skip prefill).
+        if self._worker is not None:
+            self._worker.on_request_finished(request.request_id)
         if self._sched is not None:
             self._sched.on_finished_record_stored(request)
             self._sched.on_finished(request.request_id)
-        if self._worker is not None:
-            self._worker.on_request_finished(request.request_id)
         return False, None
 
     # ══════════════════════════════════════════════════════════════════════
@@ -1181,6 +1192,17 @@ class _Scheduler:
             "prefix_lookup: rid=%s chain_len=%d stored=%d matched=%d",
             rid, len(chain), len(self._stored_chains), matched_groups,
         )
+        # Bug 10 diag (ICMS_DIAG_NMT=1): log get_num_new_matched_tokens
+        # decision per request. If we see matched=0 for a warm-prefix
+        # request when the previous cold run STORED that chain, the
+        # _stored_chains index hasn't been populated yet — vLLM falls
+        # back to a full prefill, polluting first-warm timings.
+        if os.environ.get("ICMS_DIAG_NMT") == "1":
+            logger.info(
+                "[icms-nmt] rid=%s chain_len=%d stored_chains=%d "
+                "matched_groups=%d num_computed=%d",
+                rid, len(chain), len(self._stored_chains),
+                matched_groups, num_computed_tokens)
         if matched_groups == 0:
             return 0, False
 
