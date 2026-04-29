@@ -35,6 +35,14 @@ import queue as _queue
 import sys
 import threading
 import time
+
+# Bug 8 debug (ICMS_DUMP_ON_USR1=1): register faulthandler so SIGUSR1
+# dumps Python stacks for ALL threads to stderr. Used to investigate
+# TP=2 + M3 decode hang where ptrace_scope=1 prevents py-spy/gdb attach.
+if os.environ.get("ICMS_DUMP_ON_USR1") == "1":
+    import faulthandler as _faulthandler_dbg
+    import signal as _signal_dbg
+    _faulthandler_dbg.register(_signal_dbg.SIGUSR1, all_threads=True)
 from collections import defaultdict
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -1902,6 +1910,29 @@ class _Worker:
             self._prefill_done = False
             for rid in meta.new_chains.keys():
                 self._ttft_reset(rid, t_step)
+        # ICMS_DIAG_DECODE_ITER=1: bump per-decode-iter wall-time counter
+        # on each post-prefill step + log iter wall_ms. Used to measure
+        # M3+M4-A overhead per decode iter at large ctx.
+        if os.environ.get("ICMS_DIAG_DECODE_ITER") == "1":
+            now = time.perf_counter()
+            for rs in self._requests.values():
+                if not getattr(self, "_prefill_done", False):
+                    rs._decode_iter_count = 0
+                    rs._decode_iter_t_last = now
+                    continue
+                if not hasattr(rs, "_decode_iter_count"):
+                    rs._decode_iter_count = 0
+                    rs._decode_iter_t_last = now
+                else:
+                    rs._decode_iter_count += 1
+                    iter_ms = (now - rs._decode_iter_t_last) * 1e3
+                    rs._decode_iter_t_last = now
+                    logger.info(
+                        "[icms] decode_iter rid=%s iter=%d ms=%.2f "
+                        "dense=%s fetched_layers=%d",
+                        rs.request_id, rs._decode_iter_count,
+                        iter_ms, rs.dense_mode,
+                        len(rs.fetched_pages))
 
         # ICMS_DIAG_SLACK=1: inline-probe slack tracking. Earlier polling
         # thread approach GIL-thrashed wait_for_layer's spin loop at TP=2,
@@ -2835,10 +2866,16 @@ class _Worker:
                 page_set.update(reply.page_ids)
             if is_decode and not rs.dense_mode and len(page_set) == prev_size:
                 rs.dense_mode = True
+                # Track decode-iter at which the flip fired (1-based).
+                # Counter is bumped in `wait_for_pending_writes` (called
+                # once per forward = once per decode token after prefill).
+                _flip_iter = getattr(rs, "_decode_iter_count", -1)
                 logger.info(
                     "[icms] dense_mode flip rid=%s layer=%d fetched=%d "
+                    "decode_iter=%d total_pages=%d "
                     "(no net-new pages from bitmap-filtered Score)",
                     rid, next_layer_idx, prev_size,
+                    _flip_iter, total_pages,
                 )
             self._ttft_add(
                 rid,
@@ -3904,7 +3941,16 @@ class _Worker:
         # under contention). With ICMS_BLOCK_WRITES=1, all writes are on
         # the current prefill's TTFT critical path — the next prefill
         # begins with an idle link.
-        if os.environ.get("ICMS_BLOCK_WRITES") == "1":
+        #
+        # Fix H (2026-04-29): at TP>1, default to blocking. The pipeline
+        # thread does an AllGather on the TP NCCL group; if the next
+        # iter's main-thread forward starts before the AllGather + .cpu()
+        # sync completes, both threads hammer the same NCCL group
+        # concurrently and deadlock at TP=2 (worker stuck in
+        # extract_and_record's .cpu(), engine core's shm_broadcast times
+        # out at 60s). Set ICMS_BLOCK_WRITES=0 to override.
+        _block_default = "1" if self._tp_size > 1 else "0"
+        if os.environ.get("ICMS_BLOCK_WRITES", _block_default) == "1":
             try:
                 drained = self._write_pipeline.drain(timeout=60.0)
                 if not drained:
