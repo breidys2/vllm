@@ -906,6 +906,30 @@ class FlashAttentionImpl(AttentionImpl):
                 # Benchmarked: no performance impact on H100 up to 64K.
                 scheduler_metadata = None
 
+            # ICMS_DIAG_ATTN: log block_table summary and seq_lens at the
+            # attention call site so we can compare cold vs warm paths.
+            import os as _os_attn
+            if _os_attn.environ.get("ICMS_DIAG_ATTN") == "1":
+                _path = "warm" if _icms_state is not None else "cold"
+                try:
+                    _bt0 = block_table[0]
+                    _bt_first8 = _bt0[:8].cpu().tolist()
+                    _bt_last8 = _bt0[max(0, _bt0.shape[0]-8):].cpu().tolist()
+                except Exception:
+                    _bt_first8 = "err"; _bt_last8 = "err"
+                try:
+                    _sl_list = seqused_k.cpu().tolist() if hasattr(seqused_k, "cpu") else list(seqused_k)
+                except Exception:
+                    _sl_list = "err"
+                from vllm.logger import init_logger as _init_logger
+                _logger_attn = _init_logger("icms.diag-attn")
+                _logger_attn.info(
+                    "[diag-attn] path=%s layer=%s bt_shape=%s seqused_k=%s "
+                    "max_seqlen_k=%s bt[0][:8]=%s bt[0][-8:]=%s",
+                    _path, getattr(layer, "layer_name", "?"),
+                    tuple(block_table.shape),
+                    _sl_list, max_seqlen_k, _bt_first8, _bt_last8)
+
             descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
 
             q_descale = layer._q_scale.expand(descale_shape)

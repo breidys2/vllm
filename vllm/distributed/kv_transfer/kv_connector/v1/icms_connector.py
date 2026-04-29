@@ -29,6 +29,7 @@ Design decisions (from the walkthrough):
 from __future__ import annotations
 
 
+import errno
 import os
 import queue as _queue
 import sys
@@ -71,6 +72,7 @@ def _ensure_icms_client_on_path():
 _ensure_icms_client_on_path()
 
 from icms_client import IcmsClient                          # noqa: E402
+from icms_client.client import IcmsError                     # noqa: E402
 from icms_client.geometry import (                           # noqa: E402
     GROUP_PAGES, PAGE_TOKENS, KvLayout, ModelGeometry, find_model,
     parse_scored_layers,
@@ -432,7 +434,13 @@ class _RequestState:
     request_id: str
     chain: list[int] = field(default_factory=list)       # group hashes (C1)
     block_ids: list[int] = field(default_factory=list)    # in-order CPU block IDs
-    num_groups_written: int = 0                            # groups fully flushed to icms
+    num_groups_written: int = 0                            # groups covered by THIS request's
+                                                            # writes OR inherited stored prefix
+                                                            # (drives skip-extract elision)
+    flushed_local: int = 0                                  # groups THIS request actually
+                                                            # flushed via _flush_group success
+                                                            # (drives stored-prefix recording —
+                                                            # never inflated by elision path)
     active_group_buffers: dict[int, _GroupBuffer] = field(default_factory=dict)  # group_idx → buf
     stored_groups: int = 0  # groups already in ICMS under this chain prefix (dedup-aware skip)
     # Per-stride apply cache (set at the scored layer, reused on the
@@ -464,6 +472,12 @@ class _RequestState:
     # decode iters once M3 wires the decode hooks. Use _pack_fetch_bitmap
     # to encode for the wire suffix.
     fetched_pages: dict = field(default_factory=dict)
+    # M4: once a decode-mode Score reply yields 0 net-new pages for any
+    # stride group, the bitmap is effectively saturated — flip the
+    # request into dense mode and skip all further Score RPCs / Quest
+    # hooks until the request finishes. Adaptive to chain growth: as
+    # long as Score keeps returning new pages, we keep scoring.
+    dense_mode: bool = False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -712,6 +726,21 @@ class IcmsConnector(KVConnectorBase_V1):
         if self._worker is None:
             return
         self._worker.wait_for_layer(layer_name)
+
+    def is_dense_for_active_request(self) -> bool:
+        """M4: True if every currently-active request has flipped to
+        dense_mode (bitmap saturated → no more Score RPCs to issue).
+
+        Quest hooks call this at the top of their per-layer callback
+        to short-circuit the Q-compute path entirely. Returns False
+        when there are no active requests so we don't accidentally
+        suppress the very first Score of a new request."""
+        if self._worker is None:
+            return False
+        reqs = getattr(self._worker, "_requests", None)
+        if not reqs:
+            return False
+        return all(getattr(rs, "dense_mode", False) for rs in reqs.values())
 
     def save_kv_layer(  # noqa: C901
         self,
@@ -1091,6 +1120,14 @@ class _Scheduler:
         chain from token IDs and check our in-process prefix index.
         Returns (num_external_tokens, is_async).
         """
+        # ICMS_FORCE_COLD=1: pretend nothing is externally cached. vLLM
+        # then takes the cold prefill path even on run 2 (no apply, no
+        # FetchAll). Sanity check: if run 2 PASSES with this flag, the
+        # bug is purely in the warm-path code (apply / matched-tokens
+        # contract). If it FAILS, BF2 server state from run 1 is
+        # poisoning run 2 (e.g., NVMe namespace pollution).
+        if os.environ.get("ICMS_FORCE_COLD") == "1":
+            return 0, False
         # Drain worker → scheduler notifications first.
         global _stored_chain_queue
         if _stored_chain_queue:
@@ -1165,39 +1202,70 @@ class _Scheduler:
         return ext_tokens, False
 
     def on_finished_record_stored(self, request: Request) -> None:
-        """Record this request's chain into the scheduler-side prefix index
-        so subsequent iter-2 lookups via get_num_new_matched_tokens find it.
+        """Record this request's chain into the scheduler-side prefix
+        index so subsequent iter-2 lookups via get_num_new_matched_tokens
+        find it.
 
-        Required at TP>1 with multiproc_executor where the worker's save
-        notifications never reach the scheduler process (the
-        ``_stored_chain_queue`` global is per-process). The chain was
-        already computed in get_num_new_matched_tokens for this rid;
-        n_groups is deterministic from prompt length.
+        BOUNDED by the worker's actual flushed count to prevent
+        overstating. Previous behavior — record `len(token_ids) //
+        group_tokens` regardless of what the worker actually wrote —
+        caused Score RPCs to ENOENT when WriteGroup partially failed
+        (allocator OOM, transient errors): the scheduler claimed N
+        groups stored, vLLM elided that range, but the trie only had
+        K < N groups → Score for the elided prefix returned
+        "no resolvable groups". Cap on the worker's reported count
+        keeps the ledger honest with what the trie actually has.
+
+        We drain the worker queue first, then look up the matching
+        chain in self._stored_chains. If found, the entry was written
+        by the worker via _stored_chain_queue with `flushed_local`
+        (which only counts successful WriteGroup calls). If not found,
+        nothing was successfully flushed for this chain — record
+        nothing, since claiming any count would overstate.
 
         Idempotent: record_stored_chain merges duplicates by chain key.
         """
+        # Drain worker → scheduler notifications so we can read the
+        # latest flushed count for this rid's chain.
+        global _stored_chain_queue
+        if _stored_chain_queue:
+            for chain_q, n_groups_q in _stored_chain_queue:
+                self.record_stored_chain(chain_q, n_groups_q)
+            _stored_chain_queue.clear()
+
         rid = request.request_id
         chain = self._chains.get(rid)
         if not chain:
             return
-        token_ids = getattr(request, "all_token_ids", None)
-        if token_ids is None or len(token_ids) == 0:
-            token_ids = getattr(request, "prompt_token_ids", [])
-        if not token_ids:
+
+        # Look up the worker-reported flushed count for this chain. The
+        # ledger is keyed on `tuple(chain[:n_groups])` — search for any
+        # entry whose key is a prefix of this request's chain.
+        chain_t = tuple(chain)
+        worker_n_groups = 0
+        for stored_chain, n_groups in self._stored_chains:
+            if len(stored_chain) <= len(chain_t) and \
+                    chain_t[:len(stored_chain)] == stored_chain:
+                worker_n_groups = max(worker_n_groups, n_groups)
+
+        if worker_n_groups <= 0:
+            # No successful flush for this chain — don't record. Better
+            # to under-promise (no scheduler-side prefix elision for
+            # this chain) than to over-promise and trigger ENOENT.
+            logger.debug(
+                "on_finished_record_stored: rid=%s chain_len=%d "
+                "worker_n_groups=0 — NOT recording (no flushed groups)",
+                rid, len(chain))
             return
-        # n_groups = number of COMPLETE groups written. The worker only
-        # saves complete groups, so floor-divide is correct (matches the
-        # match_best=32 behavior we see at TP=1 for prompt_len=16448:
-        # 16448 // 512 = 32).
-        group_tokens = _GROUP_BLOCKS * PAGE_TOKENS  # 32 * 16 = 512
-        n_groups = len(token_ids) // group_tokens
-        if n_groups <= 0:
-            return
-        self.record_stored_chain(chain, n_groups)
+
+        # The worker entry already exists from the queue drain above;
+        # this call is just defensive (idempotent merge). The bound is
+        # the worker's flushed_local — never the prompt-length estimate.
+        self.record_stored_chain(chain, worker_n_groups)
         logger.debug(
-            "on_finished_record_stored: rid=%s chain_len=%d n_groups=%d "
-            "prompt_len=%d",
-            rid, len(chain), n_groups, len(token_ids))
+            "on_finished_record_stored: rid=%s chain_len=%d "
+            "worker_n_groups=%d (bounded by flushed_local)",
+            rid, len(chain), worker_n_groups)
 
     def on_finished(self, request_id: str):
         self._chains.pop(request_id, None)
@@ -2093,7 +2161,7 @@ class _Worker:
                 # server_ingest_to_ready_ns are reported as 0 in this
                 # mode — the transfer wall-time shows up as the sum of
                 # per-layer wait_spin on the client side.
-                use_flags=True,
+                use_flags=(os.environ.get("ICMS_REPLY_EARLY", "1") == "1"),
                 demand_bps=ab_demand_bps,
                 compute_supply_bps=ab_compute_supply_bps,
             )
@@ -2397,6 +2465,12 @@ class _Worker:
         # this is also per-request. Multi-request decode would need
         # per-rs gating which is future work.
         is_decode = bool(self._prefill_done)
+        # M4: once any prior decode-mode Score returned 0 net-new pages
+        # for this rs, the bitmap is saturated — drop into dense decode
+        # for the rest of the request and skip every subsequent Score
+        # / Quest-hook on this rs. See update site below for the flip.
+        if is_decode and rs.dense_mode:
+            return
         already_fetched = rs.fetched_pages.get(next_layer_idx, set())
         if is_decode and len(already_fetched) >= total_pages:
             return
@@ -2626,12 +2700,34 @@ class _Worker:
                     # practice the sink bytes will land before it's
                     # consumed (sweep-verified at TP=1). TP=2 correctness
                     # re-check will be done before removing this note.
-                    use_flags=True,
+                    use_flags=(os.environ.get("ICMS_REPLY_EARLY", "1") == "1"),
                     fetch_bitmap=fetch_bitmap,
                     demand_bps=ab_demand_bps,
                     compute_supply_bps=ab_compute_supply_bps,
                 )
             t_score_end = time.perf_counter()
+        except IcmsError as e:
+            t_score_end = time.perf_counter()
+            # status=2 (ENOENT, "Score: no resolvable groups") means the
+            # trie has nothing under chain[0]. Silently falling back to
+            # dense would corrupt benchmark numbers — the request gets
+            # dense-decode behavior labeled as a budget config. With the
+            # bookkeeping fixes (rs.flushed_local for worker ledger,
+            # worker-bounded scheduler ledger) this should never fire on
+            # a healthy run; raising surfaces any remaining ledger/trie
+            # skew loudly instead of producing silently-corrupt JSONs.
+            if e.status == errno.ENOENT:
+                logger.error(
+                    "Score RPC ENOENT rank=%d layer=%d rid=%s "
+                    "chain_len=%d k=%d total_pages=%d — ledger claims "
+                    "groups stored but trie has none. Failing loud "
+                    "(see B/C bookkeeping fixes in icms_connector).",
+                    self._tp_rank, next_layer_idx, rid,
+                    len(rs.chain), k, total_pages)
+                raise
+            logger.exception("Score RPC failed rank=%d layer=%d: %s",
+                              self._tp_rank, next_layer_idx, e)
+            reply = None
         except Exception as e:
             t_score_end = time.perf_counter()
             logger.exception("Score RPC failed rank=%d layer=%d: %s",
@@ -2715,9 +2811,24 @@ class _Worker:
             # exactly the pages on host (per scored layer); M3 reads it
             # to build the bitmap wire suffix on decode-mode Score
             # calls. No behavior change for prefill.
+            #
+            # M4: detect saturation. In decode mode, if the bitmap-
+            # filtered Score returned no net-new pages for this stride
+            # group, the server has nothing left to give — flip the
+            # whole rs into dense mode so subsequent Score / Quest-hook
+            # calls short-circuit. Adaptive to chain growth: as long as
+            # any Score keeps returning new pages we stay sparse.
+            page_set = rs.fetched_pages.setdefault(next_layer_idx, set())
+            prev_size = len(page_set)
             if reply.page_ids:
-                rs.fetched_pages.setdefault(
-                    next_layer_idx, set()).update(reply.page_ids)
+                page_set.update(reply.page_ids)
+            if is_decode and not rs.dense_mode and len(page_set) == prev_size:
+                rs.dense_mode = True
+                logger.info(
+                    "[icms] dense_mode flip rid=%s layer=%d fetched=%d "
+                    "(no net-new pages from bitmap-filtered Score)",
+                    rid, next_layer_idx, prev_size,
+                )
             self._ttft_add(
                 rid,
                 num_scores=1,
@@ -2811,7 +2922,12 @@ class _Worker:
                 and 0 <= abs_layer < len(_slack_called)):
             _slack_called[abs_layer] = t_layer_start
         ready_at_call = True
-        if (abs_layer is not None
+        # ICMS_REPLY_EARLY=0 disables the flag-spin entirely so the
+        # connector only proceeds after the sync Score/FetchAll reply
+        # has returned (= Phase-2 fully done). Used to test whether the
+        # warm-prefix corruption is a reply-early ordering issue.
+        if (os.environ.get("ICMS_REPLY_EARLY", "1") != "0"
+                and abs_layer is not None
                 and self._sink_pool is not None
                 and getattr(self._sink_pool.sink, "flag_count", 0) > 0):
             sink = self._sink_pool.sink
@@ -2953,6 +3069,12 @@ class _Worker:
 
     def _apply_selective_attention(self, layer_name: str, reply,
                                    req_idx: int, rid: str = ""):
+        # ICMS_SKIP_APPLY=1: skip the apply entirely (no scatter, no
+        # bt override). Used to isolate whether the apply is the cause
+        # of warm-prefix corruption — if run 2 still fails with apply
+        # disabled, the bug is elsewhere (e.g., Quest hooks or save_kv).
+        if os.environ.get("ICMS_SKIP_APPLY") == "1":
+            return None
         # Per-line wall-time instrumentation, gated by ICMS_LINE_TIMING=1.
         # Captures the Python-side wall time of every step including
         # H2D tensor creations, dict/list ops, and tensor casts. Used
@@ -3088,8 +3210,13 @@ class _Worker:
                         pages_u8 = pages_u8[:, :kv_page_bytes_eff].contiguous()
                     k_bytes = pages_u8[:, :half_bytes].contiguous()
                     v_bytes = pages_u8[:, half_bytes:].contiguous()
-                    k_pages = k_bytes.view(model_dtype).reshape(-1, *page_shape)
-                    v_pages = v_bytes.view(model_dtype).reshape(-1, *page_shape)
+                    # Storage is fp16 — see the slow path comment for
+                    # why a direct view as model_dtype mangles bf16
+                    # models. Mirror the fix here.
+                    k_pages = (k_bytes.view(torch.float16)
+                                .reshape(-1, *page_shape).to(model_dtype))
+                    v_pages = (v_bytes.view(torch.float16)
+                                .reshape(-1, *page_shape).to(model_dtype))
                     if self._tp_size > 1 and not per_rank_slice:
                         nkv_local = geom.num_kv_heads // self._tp_size
                         start = self._tp_rank * nkv_local
@@ -3136,12 +3263,91 @@ class _Worker:
             return None
 
         pid_to_sink_off = {}
+        # ICMS_DIAG_APPLY=1: log layer-0 reply distribution to detect
+        # duplicate pids (which dedup last-wins, possibly overwriting
+        # real offsets with phantom-group zeros), wrong-layer payloads,
+        # and to reconcile reply_n_pages vs expected K-page count.
+        _diag_apply = (os.environ.get("ICMS_DIAG_APPLY") == "1"
+                       and layer_idx_for_cache == 0)
+        _dup_count = 0
+        _seen_pids: set = set()
         for i, pid in enumerate(reply.page_ids):
             if i < len(reply.sink_offsets):
+                if _diag_apply and pid in _seen_pids:
+                    _dup_count += 1
                 pid_to_sink_off[pid] = reply.sink_offsets[i]
+                if _diag_apply:
+                    _seen_pids.add(pid)
+        if _diag_apply:
+            _pid_list = list(reply.page_ids)
+            _off_list = list(reply.sink_offsets)
+            _n = len(_pid_list)
+            kpb_log = self._geom.kv_page_bytes if self._geom else 0
+            _pid_min = min(_pid_list) if _pid_list else -1
+            _pid_max = max(_pid_list) if _pid_list else -1
+            _off_min = min(_off_list) if _off_list else -1
+            _off_max = max(_off_list) if _off_list else -1
+            # Show pid+off pairs at head/tail.
+            _pairs_h = list(zip(_pid_list[:8], _off_list[:8]))
+            _pairs_t = list(zip(_pid_list[-8:], _off_list[-8:])) \
+                if _n > 8 else []
+            # Slot bucketing: how many pids per (offset // kv_page_bytes
+            # // GROUP_BLOCKS) — i.e., per "group slot" in the sink.
+            slot_counts: dict[int, int] = {}
+            if kpb_log > 0 and _GROUP_BLOCKS > 0:
+                for off in _off_list:
+                    slot = (off // kpb_log) // _GROUP_BLOCKS
+                    slot_counts[slot] = slot_counts.get(slot, 0) + 1
+            logger.info(
+                "[diag-apply-reply] rid=%s layer=0 n=%d uniq_pids=%d "
+                "dup_pids=%d pid_range=[%d..%d] off_range=[%d..%d] "
+                "kv_page_bytes=%d slot_counts=%s "
+                "pairs_head=%s pairs_tail=%s",
+                rid, _n, len(_seen_pids), _dup_count,
+                _pid_min, _pid_max, _off_min, _off_max,
+                kpb_log, sorted(slot_counts.items()),
+                _pairs_h, _pairs_t)
 
         geom = self._geom
         sink = self._sink_pool.sink
+
+        # ICMS_DIAG_APPLY=1: read first 32 bytes from sink at the START
+        # of each 32-page slot (slots 0, 1, 2 — the three groups the
+        # server is returning). Pair with [diag-canary-write] on run 1
+        # to identify which slot holds which group's K data. If slot 0
+        # matches pid=0's write canary, slot 0 has g1's real data and
+        # apply is correct. If slot 0 matches a different pid's canary
+        # (e.g., g2's first page), the server enumerated trie nodes in
+        # the wrong order.
+        if _diag_apply:
+            try:
+                import hashlib as _hl_diag
+                kpb_log2 = self._geom.kv_page_bytes if self._geom else 0
+                bytes_per_slot = _GROUP_BLOCKS * kpb_log2
+                # Try to read sink bytes via gpu-direct or host buffer.
+                _sink_obj = self._sink_pool.sink
+                # Use the ABI: read_bytes(offset, length) if available;
+                # fall back to torch tensor view of the sink if not.
+                _read_fn = getattr(_sink_obj, "read_bytes", None)
+                slot_sigs = []
+                for slot_i in range(3):
+                    base = slot_i * bytes_per_slot
+                    if _read_fn is not None:
+                        head32 = bytes(_read_fn(base, 32))
+                    else:
+                        # Fallback: torch tensor of the sink as uint8.
+                        sp_local = self._get_sink_pages(_sink_obj, kpb_log2)
+                        head32 = bytes(sp_local[slot_i * _GROUP_BLOCKS, :32]
+                                       .cpu().numpy())
+                    sha = _hl_diag.sha1(head32).hexdigest()[:16]
+                    slot_sigs.append(
+                        f"slot{slot_i}@off={base}:k_sha={sha}:"
+                        f"head32={head32.hex()}")
+                logger.info("[diag-apply-sink-slots] rid=%s layer=0 %s",
+                            rid, " | ".join(slot_sigs))
+            except Exception as _e:
+                logger.warning("[diag-apply-sink-slots] failed: %r", _e)
+
         # ICMS_PER_RANK_SLICE=1 (server-side Option Y): the server has
         # already gathered THIS rank's nkv_local heads and packed them
         # at the start of each page slot in the sink. The remote-page
@@ -3184,6 +3390,29 @@ class _Worker:
             return None
         _lt("after_python_filter")
 
+        # M3+M4-A: during decode, attention's block_table must reference
+        # ALL pages fetched so far for this stride group, not just the
+        # current Score reply's slice. rs.fetched_pages[stride_root]
+        # tracks the cumulative set (populated by every Score reply
+        # including this one — see _score_one_request line ~2730).
+        # Sink-scatter still uses only valid_pids (current reply) since
+        # older pages already landed in main_key on prior iters.
+        # Prefill: cumulative == current (one-shot scoring per chain), so
+        # no behavior change.
+        cumulative_pids: list[int] = valid_pids
+        if (self._prefill_done
+                and rs is not None
+                and layer_idx_for_cache is not None
+                and self._score_stride > 0):
+            stride_root = (layer_idx_for_cache // self._score_stride) \
+                          * self._score_stride
+            prior_set = rs.fetched_pages.get(stride_root, set())
+            if prior_set:
+                merged = prior_set | set(valid_pids)
+                cumulative_pids = sorted(
+                    p for p in merged
+                    if p < context_pages and p < bt_row_max)
+
         if gpu_direct:
             # ── Batched GPU-direct path: one gather + one dtype convert + ──
             # ── one scatter per layer, instead of 4 kernels + 1 host-sync ──
@@ -3213,6 +3442,52 @@ class _Worker:
             phys_blocks_dev = bt[req_idx].index_select(
                 0, valid_pids_dev).to(torch.int64)
             _lt("after_phys_blocks")
+
+            # ICMS_DIAG_APPLY=1: dump scatter destinations at layer 0 to
+            # see whether apply targets the same physical blocks vLLM
+            # uses for attention. Compare vs diag-attn output (bt[0][:8])
+            # in flash_attn.py. Layer-0 only to keep log cheap.
+            if (os.environ.get("ICMS_DIAG_APPLY") == "1"
+                    and layer_idx_for_cache == 0):
+                bt_row = bt[req_idx]
+                _vp_h = valid_pids[:8]
+                _vp_t = valid_pids[-8:] if len(valid_pids) > 8 else []
+                _pb_h = phys_blocks_dev[:8].tolist()
+                _pb_t = (phys_blocks_dev[-8:].tolist()
+                         if phys_blocks_dev.numel() > 8 else [])
+                _bt_h = bt_row[:8].tolist()
+                _bt_pad = (bt_row[len(valid_pids):
+                                  len(valid_pids)+8].tolist()
+                           if len(valid_pids) < bt_row.numel() else [])
+                logger.info(
+                    "[diag-apply] rid=%s layer=0 req_idx=%d "
+                    "n_valid=%d bt_row_len=%d ctx_pages=%d eff_grp=%d "
+                    "stored_grp=%d num_grp_written=%d seq_len=%d "
+                    "reply_n_pages=%d "
+                    "valid_pids[:8]=%s valid_pids[-8:]=%s "
+                    "phys_blocks[:8]=%s phys_blocks[-8:]=%s "
+                    "bt[req_idx][:8]=%s bt[req_idx][n_valid:n_valid+8]=%s "
+                    "selected_count=%d sink_off_count=%d",
+                    rid, req_idx, len(valid_pids), int(bt_row.numel()),
+                    context_pages, effective_groups,
+                    int(rs.stored_groups), int(rs.num_groups_written),
+                    int(seq_len), int(len(reply.page_ids)),
+                    _vp_h, _vp_t, _pb_h, _pb_t, _bt_h, _bt_pad,
+                    len(selected), len(pid_to_sink_off))
+
+            # M3+M4-A: build a parallel phys_blocks tensor for the
+            # cumulative pid set (used for new_bt only). Falls through
+            # to phys_blocks_dev when cumulative == current to avoid
+            # the extra H2D + index_select on the prefill path.
+            if cumulative_pids is valid_pids or cumulative_pids == valid_pids:
+                phys_blocks_for_bt_dev = phys_blocks_dev
+            else:
+                _cum_pids_cpu = torch.tensor(
+                    cumulative_pids, dtype=torch.int64, pin_memory=True)
+                cum_pids_dev = _cum_pids_cpu.to(device, non_blocking=True)
+                phys_blocks_for_bt_dev = bt[req_idx].index_select(
+                    0, cum_pids_dev).to(torch.int64)
+            _lt("after_phys_blocks_for_bt")
 
             # Bound check: phys_block < main_key.shape[0]. The .item() is a
             # CPU↔GPU sync; never observed to fire in practice. Gated by
@@ -3271,9 +3546,71 @@ class _Worker:
                 k_bytes = pages_u8[:, :half_bytes].contiguous()
                 v_bytes = pages_u8[:, half_bytes:].contiguous()
                 _t2 = _t()
-                k_pages = k_bytes.view(model_dtype).reshape(-1, *page_shape)
-                v_pages = v_bytes.view(model_dtype).reshape(-1, *page_shape)
+                # Storage roundtrip is fp16 (record_page hard-codes
+                # `key_block.to(torch.float16)`). For bf16 models (qwen3,
+                # mistral-nemo at bf16), interpreting the raw bytes as
+                # model_dtype silently mangles every value (fp16 0xba80
+                # = -0.563 read as bf16 0xba80 = -0.000977 → -0.563
+                # information lost). Always view as fp16, then cast to
+                # model_dtype. fp16 models pay no extra cost (no-op
+                # cast); bf16 models pay a ~µs/page convert that fixes
+                # the warm-prefix corruption identified 2026-04-28.
+                k_pages = (k_bytes.view(torch.float16)
+                            .reshape(-1, *page_shape).to(model_dtype))
+                v_pages = (v_bytes.view(torch.float16)
+                            .reshape(-1, *page_shape).to(model_dtype))
                 _t3 = _t()
+
+                # ICMS_DIAG_CANARY=1: read-side fingerprint for layer 0
+                # pages 0, 17, 100, 500 (whichever exist in valid_pids).
+                # Pair with [diag-canary-write] in record_page.
+                if (os.environ.get("ICMS_DIAG_CANARY") == "1"
+                        and layer_name.endswith(".0.self_attn.attn")):
+                    # Sink scan: dump first 8 bytes of sink_pages at
+                    # slots 0,1,2,17,100,500. If write k_head bytes
+                    # appear at a slot ≠ expected, server's sink_offsets
+                    # are pointing to the wrong place.
+                    import hashlib as _hl
+                    for slot in (0, 1, 2, 17, 100, 500):
+                        if slot >= sink_pages.shape[0]:
+                            continue
+                        slot_bytes = bytes(sink_pages[slot, :32].cpu().numpy())
+                        logger.info("[diag-sink-slot] layer=0 sink_slot=%d "
+                                     "first32_hex=%s",
+                                     slot, slot_bytes.hex())
+                    # Also dump valid_sink_offs[:5] so we can correlate
+                    # what offsets the server returned for the valid
+                    # pids vs where we look in the sink.
+                    logger.info("[diag-sink-offs] layer=0 "
+                                 "valid_sink_offs[:5]=%s page_idx_dev[:5]=%s",
+                                 valid_sink_offs[:5],
+                                 page_idx_dev[:5].cpu().tolist())
+                    import hashlib
+                    chain_head = rs.chain[:1] if rs is not None and rs.chain else []
+                    for probe_pid in (0, 1, 2, 3, 4, 8, 16, 17, 24, 31, 32, 33, 100, 500):
+                        if probe_pid not in valid_pids:
+                            continue
+                        canary_idx = valid_pids.index(probe_pid)
+                        k_one_fp16 = k_pages[canary_idx].to(torch.float16).contiguous().cpu().numpy().tobytes()
+                        v_one_fp16 = v_pages[canary_idx].to(torch.float16).contiguous().cpu().numpy().tobytes()
+                        kh = hashlib.sha1(k_one_fp16).hexdigest()[:16]
+                        vh = hashlib.sha1(v_one_fp16).hexdigest()[:16]
+                        khead = k_one_fp16[:32].hex()
+                        # Quick "is-this-zero" probe: count non-zero fp16 elements.
+                        # NB: use module-level `np` — re-importing here as
+                        # `import numpy as np` made the entire function scope
+                        # treat `np` as local, breaking earlier references at
+                        # line ~3561 with UnboundLocalError on qwen3-extras.
+                        k_fp16_arr = np.frombuffer(k_one_fp16, dtype=np.float16)
+                        nonzero = int((k_fp16_arr != 0).sum())
+                        logger.info("[diag-canary-read] rid=%s chain_head=%s "
+                                     "layer=0 pid=%d canary_idx=%d "
+                                     "nonzero_k=%d/%d k_sha=%s v_sha=%s "
+                                     "k_head=%s",
+                                     rid, chain_head,
+                                     probe_pid, canary_idx,
+                                     nonzero, len(k_fp16_arr),
+                                     kh, vh, khead)
 
                 # Option W broadcast path: when server didn't slice,
                 # each rank still extracts its head range here.
@@ -3307,7 +3644,12 @@ class _Worker:
                     int(phys_blocks_dev.numel()), nkv_local_runtime,
                     "apply" if apply_stream else "default")
 
-            filled_blocks_count = int(phys_blocks_dev.numel())
+            # M3+M4-A: filled_blocks_count drives new_seq_len which
+            # bounds attention's K/V reads. Must match the cumulative
+            # phys_blocks count actually exposed via new_bt — otherwise
+            # attention either over-reads (garbage) or under-reads
+            # (drops valid pages).
+            filled_blocks_count = int(phys_blocks_for_bt_dev.numel())
             _lt("after_filled_count")
 
             # Build trimmed block table entirely on device — avoids a
@@ -3332,10 +3674,14 @@ class _Worker:
                     rs._apply_cached_cont_idx_range = (context_pages, cont_end)
                 cont_blocks = bt[req_idx].index_select(
                     0, cont_idx).to(torch.int32)
+                # M3+M4-A: cumulative phys_blocks for attention's
+                # block_table. During prefill / when cumulative ==
+                # current, phys_blocks_for_bt_dev is the same tensor
+                # as phys_blocks_dev — zero-cost.
                 new_bt_row = torch.cat(
-                    [phys_blocks_dev.to(torch.int32), cont_blocks])
+                    [phys_blocks_for_bt_dev.to(torch.int32), cont_blocks])
             else:
-                new_bt_row = phys_blocks_dev.to(torch.int32)
+                new_bt_row = phys_blocks_for_bt_dev.to(torch.int32)
             if new_bt_row.numel() == 0:
                 return None
             new_bt = new_bt_row.unsqueeze(0)
@@ -3393,7 +3739,17 @@ class _Worker:
             filled_blocks_count = len(filled_blocks)
 
         continuation_tokens = max(0, seq_len - context_tokens)
-        new_seq_len = filled_blocks_count * PAGE_TOKENS + continuation_tokens
+        # Clamp to the actual prompt length. Without this, the last
+        # cached group's partial-page padding (e.g., 33 stored groups
+        # of 32 pages each = 1056 pages = 16896 tokens, but the prompt
+        # is only 16466 tokens) inflates new_seq_len and Q for the
+        # next decode token gets rotary-embedded for the WRONG
+        # position (16896 instead of 16466). Cold path passes the
+        # actual seq_len to FlashAttention; warm path must too.
+        new_seq_len = min(
+            filled_blocks_count * PAGE_TOKENS + continuation_tokens,
+            seq_len,
+        )
         # Pin + async-copy: same pattern as the page_idx_dev fix above.
         # Without pinning, this last H2D inherits the implicit pageable-
         # staging sync that `cuda.synchronize`-equivalent stalls the
@@ -3410,14 +3766,19 @@ class _Worker:
         )
 
         # Set fetch state for FlashAttention to read.
-        from vllm.v1.attention import icms_fetch_state
-        icms_fetch_state.set_active(icms_fetch_state.IcmsFetchState(
-            key_cache=main_key,
-            value_cache=main_value,
-            block_table=new_bt,
-            seq_lens=new_sl,
-            max_seq_len=new_seq_len,
-        ))
+        # ICMS_SKIP_BT_OVERRIDE=1 disables the bt/seq_lens override so
+        # attention reads main_key via vLLM's natural block_table. Used
+        # to isolate apply-scatter correctness from bt-override
+        # correctness during debugging.
+        if os.environ.get("ICMS_SKIP_BT_OVERRIDE") != "1":
+            from vllm.v1.attention import icms_fetch_state
+            icms_fetch_state.set_active(icms_fetch_state.IcmsFetchState(
+                key_cache=main_key,
+                value_cache=main_value,
+                block_table=new_bt,
+                seq_lens=new_sl,
+                max_seq_len=new_seq_len,
+            ))
         _lt("after_set_active")
 
         # Populate the per-stride apply cache for the next reuse layers.
@@ -3432,9 +3793,14 @@ class _Worker:
                 and layer_idx_for_cache is not None
                 and self._score_stride > 1):
             rs._apply_cached_layer_start = layer_idx_for_cache
+            # phys_blocks_dev = current reply's pids → used by the fast
+            # path to scatter THIS iter's sink data into main_key on
+            # subsequent layers within the stride. Stays current-only.
             rs._apply_cached_phys_blocks_dev = phys_blocks_dev
             rs._apply_cached_page_idx_dev = page_idx_dev
             rs._apply_cached_actual_k = len(reply.page_ids)
+            # new_bt is built from cumulative pids (M3+M4-A) and is
+            # reused by the fast path for attention's block_table.
             rs._apply_cached_new_bt = new_bt
             rs._apply_cached_new_sl = new_sl
             rs._apply_cached_max_seq_len = new_seq_len
@@ -3601,14 +3967,19 @@ class _Worker:
 
         # ─── 3. Push stored-prefix entries so subsequent requests can
         #       skip extraction for the matched prefix.
+        # Record `flushed_local` (count of groups this request actually
+        # flushed), NOT `num_groups_written` (which may be inflated by
+        # the inherited-prefix elision path in extract_and_record). The
+        # ledger must reflect what's truly in the trie or downstream
+        # Score RPCs hit ENOENT.
         for rid in rids:
             rs = self._requests.get(rid)
             if rs is None:
                 continue
-            if rs.chain and rs.num_groups_written > 0:
-                self._record_stored_groups(rs.chain, rs.num_groups_written)
+            if rs.chain and rs.flushed_local > 0:
+                self._record_stored_groups(rs.chain, rs.flushed_local)
                 _stored_chain_queue.append(
-                    (list(rs.chain), rs.num_groups_written))
+                    (list(rs.chain), rs.flushed_local))
 
     # ─── KV extraction from GPU paged buffer (C2 write path) ────────────
 
@@ -3897,6 +4268,27 @@ class _Worker:
         v_bytes = value_block.to(torch.float16).contiguous().numpy().tobytes()
         kv_bytes = k_bytes + v_bytes
 
+        # ICMS_DIAG_CANARY=1: per-write fingerprint for a few logical
+        # pages of layer 0 (we recompute target pages from intra_idx →
+        # group_idx*32+page_in_group). Pair with [diag-canary-read]
+        # for the same pid in _apply_selective_attention.
+        if (os.environ.get("ICMS_DIAG_CANARY") == "1"
+                and layer_idx == 0):
+            absolute_pid = group_idx * _GROUP_BLOCKS + page_in_group
+            if absolute_pid in (0, 1, 2, 3, 4, 8, 16, 17, 24, 31, 32, 33, 100, 500):
+                import hashlib
+                chain_head = rs.chain[:1] if rs.chain else []
+                kh = hashlib.sha1(k_bytes).hexdigest()[:16]
+                vh = hashlib.sha1(v_bytes).hexdigest()[:16]
+                khead = k_bytes[:32].hex()
+                logger.info("[diag-canary-write] rid=%s chain_head=%s "
+                             "abs_pid=%d gidx=%d page_in_group=%d layer=0 "
+                             "k_len=%d v_len=%d k_sha=%s v_sha=%s "
+                             "k_head=%s",
+                             rs.request_id, chain_head, absolute_pid,
+                             group_idx, page_in_group,
+                             len(k_bytes), len(v_bytes), kh, vh, khead)
+
         spb = geom.summary_page_bytes
         kpb = geom.kv_page_bytes
         # Byte offset within buf.kv_blob for (layer_idx, page_in_group).
@@ -3970,6 +4362,33 @@ class _Worker:
                      group_idx, pages, partial, phase,
                      len(chain_prefix), rs.num_groups_written)
         t0 = time.perf_counter()
+        # ICMS_DIAG_CANARY=1: hash bytes at layer 0 / specific page
+        # offsets right before shipping. Pair with [diag-canary-write]
+        # (record_page side) and [server-canary-recv]. If these match
+        # write canaries but server differs → wire transfer dropped
+        # bytes. If they differ from write canaries → record_page
+        # stored at wrong offset OR something clobbered buf.kv_blob.
+        if os.environ.get("ICMS_DIAG_CANARY") == "1":
+            import hashlib as _hl
+            kv_blob_bytes = bytes(buf.kv_blob)
+            kpb = self._geom.kv_page_bytes if self._geom else 32768
+            kgb = self._geom.kv_group_bytes if self._geom else 32 * kpb
+            for probe_pid in (0, 1, 2, 3, 4, 8, 16, 17, 24, 31, 32, 33, 100, 500):
+                pg_idx = probe_pid // _GROUP_BLOCKS
+                if pg_idx != group_idx:
+                    continue
+                page_in_group = probe_pid % _GROUP_BLOCKS
+                off = 0 * kgb + page_in_group * kpb  # layer=0
+                if off + 32 > len(kv_blob_bytes):
+                    continue
+                head32 = kv_blob_bytes[off:off + 32].hex()
+                k_sha = _hl.sha1(
+                    kv_blob_bytes[off:off + kpb // 2]).hexdigest()[:16]
+                logger.info("[diag-flush-bytes] rid=%s gidx=%d "
+                             "probe_pid=%d layer=0 off=%d "
+                             "k_sha=%s head32=%s",
+                             request_id, group_idx, probe_pid, off,
+                             k_sha, head32)
         try:
             # Option W: only rank 0 sends to the server. All ranks still
             # update local bookkeeping (_record_stored_groups etc.) below.
@@ -3985,6 +4404,27 @@ class _Worker:
             self.stats.total_groups_written += 1
             if group_idx >= rs.num_groups_written:
                 rs.num_groups_written = group_idx + 1
+            # flushed_local tracks ONLY successful WriteGroup calls from
+            # this request — never the elision-path bump in
+            # extract_and_record. The recording sites (on_request_finished
+            # and the deferred-write push) use this so the local ledger
+            # never overstates what the trie has, which previously caused
+            # "Score: no resolvable groups" ENOENT cascades.
+            #
+            # Fix D (2026-04-28): partial groups must NOT bump flushed_local.
+            # _record_stored_groups uses flushed_local as the n_groups stored
+            # for cross-request reuse via _get_stored_context_groups. A
+            # partial group has fewer than 32 pages (e.g., 5 for a prompt
+            # whose final group is short), but on warm reuse apply trusts
+            # n_groups * _GROUP_BLOCKS as context_pages → builds valid_pids
+            # for 64 pages when only 32+5 pages of real data exist →
+            # scatter targets bt[req_idx, 32..63] which is mostly padding
+            # 0 → corrupts physical block 0. The partial group's K/V is
+            # still useful for THIS request's decode-time reuse (kept in
+            # rs.chain and the trie), but a different request that hashes
+            # to the same prefix must NOT see those 5 pages as a full group.
+            if group_idx >= rs.flushed_local and not partial:
+                rs.flushed_local = group_idx + 1
         except Exception as e:
             self.stats.record_flush((time.perf_counter() - t0) * 1e6)
             logger.warning("WriteGroup failed for req=%s group=%d: %s",
@@ -4046,18 +4486,22 @@ class _Worker:
         # wait_for_pending_writes is NOT called after on_request_finished,
         # so the last partial group's contribution to num_groups_written
         # would otherwise be lost.
-        if rs.chain and rs.num_groups_written > 0:
-            self._record_stored_groups(rs.chain, rs.num_groups_written)
+        # Use flushed_local — the count of groups this request actually
+        # wrote via _flush_group success. num_groups_written is inflated
+        # by the inherited-prefix elision path in extract_and_record and
+        # would cause the ledger to advertise groups the trie doesn't have.
+        if rs.chain and rs.flushed_local > 0:
+            self._record_stored_groups(rs.chain, rs.flushed_local)
             _stored_chain_queue.append(
-                (list(rs.chain), rs.num_groups_written))
-            logger.debug("[diag-finish] rid=%s chain_len=%d num_groups_written=%d "
+                (list(rs.chain), rs.flushed_local))
+            logger.debug("[diag-finish] rid=%s chain_len=%d flushed_local=%d "
                         "pushed to stored-prefix index",
-                        request_id, len(rs.chain), rs.num_groups_written)
+                        request_id, len(rs.chain), rs.flushed_local)
         else:
-            logger.debug("[diag-finish] rid=%s chain_len=%d num_groups_written=%d "
+            logger.debug("[diag-finish] rid=%s chain_len=%d flushed_local=%d "
                         "(NOT pushed — chain empty or no groups)",
                         request_id, len(rs.chain) if rs.chain else 0,
-                        rs.num_groups_written)
+                        rs.flushed_local)
         # BUG-N8: sweep _pending_scores and _pending_reuse for this rid.
         # Both maps are {layer_name: {rid: tuple}}, drained per-layer-name.
         # If a layer never fires (request finished mid-stride, layer

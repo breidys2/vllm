@@ -451,6 +451,16 @@ class QuestHookManager:
         if layer_idx >= self.num_layers - 1:
             return
 
+        # M4: connector flips rs.dense_mode once a bitmap-filtered
+        # decode-mode Score returns no net-new pages. Skip Q compute
+        # + every save_kv_layer dispatch for the rest of the request
+        # so dense decode runs without per-layer Python callbacks.
+        if (self.kv_connector is not None
+                and getattr(self.kv_connector,
+                            "is_dense_for_active_request", None) is not None
+                and self.kv_connector.is_dense_for_active_request()):
+            return
+
         next_layer_idx = layer_idx + 1
 
         # Can't compute Q without weights
@@ -637,6 +647,13 @@ class QuestHookManager:
         typically None so the layer's input_layernorm operates on
         hidden_states alone.
         """
+        # M4: dense-mode short-circuit — see _on_layer_complete.
+        if (self.kv_connector is not None
+                and getattr(self.kv_connector,
+                            "is_dense_for_active_request", None) is not None
+                and self.kv_connector.is_dense_for_active_request()):
+            return
+
         if 0 not in self._q_proj_weights or 0 not in self._layernorm_weights:
             return
 
