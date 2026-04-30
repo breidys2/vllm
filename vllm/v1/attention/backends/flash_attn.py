@@ -930,6 +930,129 @@ class FlashAttentionImpl(AttentionImpl):
                     tuple(block_table.shape),
                     _sl_list, max_seqlen_k, _bt_first8, _bt_last8)
 
+            # ICMS_DIAG_FULL: cross-check that the natural slot_mapping
+            # write target lands in a slot that the (possibly trimmed) bt
+            # read path can reach. Logs key_cache/value_cache pointers,
+            # block_table dtype, and the slot the new K/V was written to
+            # vs where the trimmed bt's last position will read from.
+            if (_os_attn.environ.get("ICMS_DIAG_FULL") == "1"
+                    and getattr(layer, "layer_name", "")
+                        .endswith(".0.self_attn.attn")):
+                try:
+                    _natural_bt = attn_metadata.block_table
+                    _natural_seq = attn_metadata.seq_lens
+                    _slot_mapping = attn_metadata.slot_mapping
+                    _slot_first = _slot_mapping[:4].cpu().tolist()
+                    _slot_last = _slot_mapping[-4:].cpu().tolist()
+                    _nat_seq_list = (_natural_seq.cpu().tolist()
+                                      if hasattr(_natural_seq, "cpu")
+                                      else list(_natural_seq))
+                    _nat_bt_first = _natural_bt[0][:8].cpu().tolist()
+                    _nat_bt_last = _natural_bt[0][max(0, _natural_bt[0].shape[0]-8):].cpu().tolist()
+                    from vllm.logger import init_logger as _init_logger
+                    _logger_attn = _init_logger("icms.diag-attn")
+                    _logger_attn.info(
+                        "[diag-full-attn] layer=%s _icms_active=%s "
+                        "key_cache_ptr=%s key_cache_shape=%s "
+                        "value_cache_ptr=%s "
+                        "nat_bt_shape=%s nat_bt[0][:8]=%s nat_bt[0][-8:]=%s "
+                        "nat_seq_lens=%s nat_max_seq_len=%s "
+                        "slot_map[:4]=%s slot_map[-4:]=%s "
+                        "trimmed_bt_shape=%s trimmed_seq=%s "
+                        "trimmed_max_seqlen_k=%s "
+                        "cu_seqlens_q=%s max_seqlen_q=%s",
+                        getattr(layer, "layer_name", "?"),
+                        _icms_state is not None,
+                        hex(key_cache.data_ptr()),
+                        tuple(key_cache.shape),
+                        hex(value_cache.data_ptr()),
+                        tuple(_natural_bt.shape), _nat_bt_first, _nat_bt_last,
+                        _nat_seq_list, attn_metadata.max_seq_len,
+                        _slot_first, _slot_last,
+                        (tuple(block_table.shape) if _icms_state else None),
+                        (_sl_list if _icms_state else None),
+                        (max_seqlen_k if _icms_state else None),
+                        (cu_seqlens_q.cpu().tolist()
+                         if hasattr(cu_seqlens_q, "cpu") else list(cu_seqlens_q)),
+                        max_seqlen_q)
+                except Exception as _e:
+                    from vllm.logger import init_logger as _init_logger
+                    _init_logger("icms.diag-attn").warning(
+                        "[diag-full-attn] failed: %r", _e)
+
+            # ICMS_DIAG_KV: hash check K/V content at the decode token's slot
+            # via NATURAL slot_mapping vs the TRIMMED bt's last position
+            # (where chop-bt expects to find the just-written decode K/V).
+            # If they differ, the trimmed bt is reading from a different
+            # memory location than where reshape_and_cache_flash wrote.
+            # ALSO sample a chain-page slot to compare layer 0 vs layer 12
+            # (the asymmetric stride). For first 8 decode iters of layer 0
+            # AND layer 12 only — full GPU→CPU sync makes this expensive.
+            _layer_name_kv = getattr(layer, "layer_name", "")
+            _is_diag_layer = (_layer_name_kv.endswith(".0.self_attn.attn")
+                              or _layer_name_kv.endswith(".12.self_attn.attn"))
+            if (_os_attn.environ.get("ICMS_DIAG_KV") == "1"
+                    and _is_diag_layer
+                    and max_seqlen_q == 1):  # decode iter only
+                try:
+                    import hashlib as _hl
+                    _nat_bt_kv = attn_metadata.block_table
+                    _slot_mapping_kv = attn_metadata.slot_mapping
+                    _block_size = key_cache.shape[1]
+                    # ── Decode token's slot via NATURAL slot_mapping ──
+                    _nat_slot = int(_slot_mapping_kv[-1].item())
+                    _nat_phys = _nat_slot // _block_size
+                    _nat_in_block = _nat_slot % _block_size
+                    _nat_k = key_cache[_nat_phys, _nat_in_block].float()
+                    _nat_v = value_cache[_nat_phys, _nat_in_block].float()
+                    _nat_k_hash = _hl.sha256(
+                        _nat_k.cpu().numpy().tobytes()).hexdigest()[:16]
+                    _nat_v_hash = _hl.sha256(
+                        _nat_v.cpu().numpy().tobytes()).hexdigest()[:16]
+                    _nat_k_norm = float(_nat_k.norm().item())
+                    # ── Decode token's slot via TRIMMED bt last position ──
+                    if _icms_state is not None:
+                        _trim_bt = block_table  # already overridden
+                        _trim_max = max_seqlen_k
+                        _trim_pos = _trim_max - 1
+                        _trim_phys = int(_trim_bt[0][_trim_pos // _block_size].item())
+                        _trim_in_block = _trim_pos % _block_size
+                        _trim_k = key_cache[_trim_phys, _trim_in_block].float()
+                        _trim_k_hash = _hl.sha256(
+                            _trim_k.cpu().numpy().tobytes()).hexdigest()[:16]
+                        _trim_match = (_nat_k_hash == _trim_k_hash)
+                    else:
+                        _trim_phys = -1
+                        _trim_in_block = -1
+                        _trim_k_hash = "n/a"
+                        _trim_match = "n/a (no _icms_state)"
+                    # ── Sample a chain-page slot at phys_block bt[0][50]
+                    # (= chain page 50 in cold path / chain page 50 of run) ──
+                    # In layer 12 with stride-12 partial-fill, this slot may
+                    # contain garbage if pid 50 wasn't in stride 12's
+                    # cumulative_pids. In layer 0 it should be valid.
+                    _chain_phys = int(_nat_bt_kv[0][50].item())
+                    _chain_k = key_cache[_chain_phys, 0].float()  # slot 0
+                    _chain_k_hash = _hl.sha256(
+                        _chain_k.cpu().numpy().tobytes()).hexdigest()[:16]
+                    _chain_k_norm = float(_chain_k.norm().item())
+                    from vllm.logger import init_logger as _init_logger
+                    _init_logger("icms.diag-kv").info(
+                        "[diag-kv] layer=%s nat_slot=%d nat_phys=%d "
+                        "nat_in_block=%d nat_k_hash=%s nat_v_hash=%s "
+                        "nat_k_norm=%.4f trim_phys=%s trim_in_block=%s "
+                        "trim_k_hash=%s match=%s "
+                        "chain_phys(bt[50])=%d chain_k_hash=%s "
+                        "chain_k_norm=%.4f",
+                        _layer_name_kv, _nat_slot, _nat_phys, _nat_in_block,
+                        _nat_k_hash, _nat_v_hash, _nat_k_norm,
+                        _trim_phys, _trim_in_block, _trim_k_hash, _trim_match,
+                        _chain_phys, _chain_k_hash, _chain_k_norm)
+                except Exception as _e:
+                    from vllm.logger import init_logger as _init_logger
+                    _init_logger("icms.diag-kv").warning(
+                        "[diag-kv] failed: %r", _e)
+
             descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
 
             q_descale = layer._q_scale.expand(descale_shape)

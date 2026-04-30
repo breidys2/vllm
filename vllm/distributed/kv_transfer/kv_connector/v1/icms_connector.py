@@ -486,6 +486,11 @@ class _RequestState:
     # hooks until the request finishes. Adaptive to chain growth: as
     # long as Score keeps returning new pages, we keep scoring.
     dense_mode: bool = False
+    # ICMS_DIAG_FULL: counter that increments each forward pass after
+    # dense_mode flips. Used to gate verbose post-dense-flip metadata
+    # logging — first ~3 iters after the flip are the most likely to
+    # carry stale state into the natural-bt decode path.
+    _post_dense_iter: int = -1  # -1 = pre-flip, 0,1,2,... = post-flip iter
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1002,7 +1007,16 @@ class _Scheduler:
             # whole chain at O(n) total work instead of O(n²) — at 128k
             # the old per-group "hash all tokens up to here" pattern
             # would do ~150 MB of repr+SHA per request.
-            num_groups = (len(token_ids) + group_tokens - 1) // group_tokens
+            #
+            # Bug 11 fix (2026-04-29): floor division (was ceil). The
+            # partial last group can't be reliably stored on the server
+            # (worker's Fix D guards against partial-group writes), so
+            # including its hash in the chain made the server resolve N+1
+            # groups while the client only counted N — leaving N..N+1
+            # group's pages as "out-of-range from client's view, never
+            # in bitmap, perpetually returned by Score top-k". Use floor
+            # so client and server agree on group count.
+            num_groups = len(token_ids) // group_tokens
             prev_digest = b""
             for g in range(num_groups):
                 end = min((g + 1) * group_tokens, len(token_ids))
@@ -1168,7 +1182,9 @@ class _Scheduler:
                 # Mirrors the chain-construction in on_alloc — full prompt
                 # coverage with incremental hashing. Both call sites must
                 # produce identical hashes to match across requests.
-                num_groups = (len(token_ids) + group_tokens - 1) // group_tokens
+                # Bug 11 fix (2026-04-29): floor (not ceil) so the partial
+                # last group is excluded — see on_alloc for rationale.
+                num_groups = len(token_ids) // group_tokens
                 prev_digest = b""
                 for g in range(num_groups):
                     end = min((g + 1) * group_tokens, len(token_ids))
@@ -1932,6 +1948,14 @@ class _Worker:
             self._prefill_done = False
             for rid in meta.new_chains.keys():
                 self._ttft_reset(rid, t_step)
+        # ICMS_DIAG_FULL: bump _post_dense_iter at the start of each
+        # forward AFTER dense_mode flipped. Capped at 3 — beyond that the
+        # post-flip diagnostics turn off automatically (we only need the
+        # first few iters to spot stale-state leak).
+        if os.environ.get("ICMS_DIAG_FULL") == "1":
+            for rs in self._requests.values():
+                if rs.dense_mode and rs._post_dense_iter >= 0:
+                    rs._post_dense_iter = min(rs._post_dense_iter + 1, 99)
         # ICMS_DIAG_DECODE_ITER=1: bump per-decode-iter wall-time counter
         # on each post-prefill step + log iter wall_ms. Used to measure
         # M3+M4-A overhead per decode iter at large ctx.
@@ -2480,6 +2504,30 @@ class _Worker:
                 rid, rs, req_idx, next_layer_idx, q_for_request,
                 budget, stats, connector_meta)
 
+        # ICMS_FETCH_ALL_POST_SCORE=1: after the per-request Score loop
+        # populates pending_scores with the K-page sparse selection,
+        # immediately follow up with a FetchAll for each request so the
+        # sink + pending_scores end up holding ALL N pages of the chain.
+        # This implements "sparse prefill score signal + dense decode":
+        # Score still fires (its K-selection is logged as the icms_budget
+        # marker; useful signal for offline analysis), but the sink
+        # scattered to GPU is the full-N FetchAll result, so decode
+        # attends over every page exactly like the no-ICMS dense
+        # baseline. Block-table sizing is handled by the existing
+        # _fetch_all_one_request reuse-promote path.
+        #
+        # Cost: one extra RPC per scoring boundary at layer 0 only —
+        # subsequent boundaries early-return on rs._fetch_all_complete.
+        if os.environ.get("ICMS_FETCH_ALL_POST_SCORE", "0") == "1":
+            for req_idx, rid, rs in requests_to_score:
+                try:
+                    self._fetch_all_one_request(
+                        rid, rs, req_idx, next_layer_idx, budget, stats)
+                except Exception:
+                    logger.exception(
+                        "ICMS_FETCH_ALL_POST_SCORE: fetch_all failed "
+                        "for rid=%s layer=%d", rid, next_layer_idx)
+
     def _score_one_request(self, rid, rs, req_idx, next_layer_idx,
                            quest_query, budget, stats, connector_meta):
         """Score a single request against ICMS and store the result."""
@@ -2537,6 +2585,24 @@ class _Worker:
             return
         already_fetched = rs.fetched_pages.get(next_layer_idx, set())
         if is_decode and len(already_fetched) >= total_pages:
+            # Saturated. Without explicitly flipping dense_mode here, the
+            # natural flip at line ~2914 won't fire (it requires a Score
+            # reply with 0 new pages — but with this early-return, Score
+            # never even runs). That leaves Quest hooks + _score_one_request
+            # firing every stride per decode iter as no-ops, which is real
+            # overhead. Once dense_mode flips, the Quest hook short-
+            # circuits at quest_hooks.py:458 and wait_for_layer hits the
+            # cheaper all_dense early-return which also clears _active.
+            if not rs.dense_mode:
+                rs.dense_mode = True
+                rs._post_dense_iter = 0
+                logger.info(
+                    "[icms] dense_mode flip rid=%s layer=%d "
+                    "(saturated: fetched=%d total=%d)",
+                    rid, next_layer_idx, len(already_fetched),
+                    total_pages)
+                if os.environ.get("ICMS_DIAG_FULL") == "1":
+                    self._diag_full_dense_flip_snapshot(rs, next_layer_idx)
             return
 
         # Determine effective budget: adaptive allocator or static.
@@ -2886,8 +2952,33 @@ class _Worker:
             prev_size = len(page_set)
             if reply.page_ids:
                 page_set.update(reply.page_ids)
+            # ICMS_DIAG_REPLY: log per-Score-reply size + delta added to
+            # fetched_pages. If reply size > delta, server returned pages
+            # already in client's bitmap = bitmap filtering is broken.
+            # If reply size < k (cap), server's score+filter returned fewer
+            # candidates than requested.
+            if os.environ.get("ICMS_DIAG_REPLY") == "1" and is_decode:
+                _reply_n = len(reply.page_ids) if reply.page_ids else 0
+                _delta = len(page_set) - prev_size
+                _dups = _reply_n - _delta
+                _reply_pids_h = (list(reply.page_ids[:5])
+                                  if reply.page_ids else [])
+                _reply_pids_t = (list(reply.page_ids[-5:])
+                                  if reply.page_ids and len(reply.page_ids) > 5
+                                  else [])
+                logger.info(
+                    "[diag-reply] rid=%s layer=%d k=%d total=%d "
+                    "reply_n=%d prev_fetched=%d post_fetched=%d "
+                    "delta_new=%d dups=%d reply_pids[:5]=%s "
+                    "reply_pids[-5:]=%s",
+                    rid, next_layer_idx, k, total_pages,
+                    _reply_n, prev_size, len(page_set),
+                    _delta, _dups, _reply_pids_h, _reply_pids_t)
             if is_decode and not rs.dense_mode and len(page_set) == prev_size:
                 rs.dense_mode = True
+                # Mark the request as just-flipped so the next forward
+                # pass logs full metadata (gated by ICMS_DIAG_FULL=1).
+                rs._post_dense_iter = 0
                 # Track decode-iter at which the flip fired (1-based).
                 # Counter is bumped in `wait_for_pending_writes` (called
                 # once per forward = once per decode token after prefill).
@@ -2899,6 +2990,8 @@ class _Worker:
                     rid, next_layer_idx, prev_size,
                     _flip_iter, total_pages,
                 )
+                if os.environ.get("ICMS_DIAG_FULL") == "1":
+                    self._diag_full_dense_flip_snapshot(rs, next_layer_idx)
             self._ttft_add(
                 rid,
                 num_scores=1,
@@ -2968,12 +3061,47 @@ class _Worker:
         with self._score_lock:
             per_request = self._pending_scores.pop(layer_name, None)
 
+        # Bug 11 instrumentation (2026-04-29): log every wait_for_layer
+        # call's pop result + decode/prefill phase so we can see whether
+        # _pending_scores has entries during decode iters at budget < 1.0.
+        # Gated by ICMS_DIAG_WFL=1 to avoid log spam.
+        if os.environ.get("ICMS_DIAG_WFL") == "1":
+            _phase_dbg = "decode" if self._prefill_done else "prefill"
+            _per_req_n = len(per_request) if per_request else 0
+            _abs_layer_dbg = self._extract_layer_idx(layer_name)
+            try:
+                from vllm.v1.attention import icms_fetch_state as _ifs
+                _active_set = _ifs.get_active() is not None
+            except Exception:
+                _active_set = "err"
+            # Per-rs dense_mode + post-flip iter context.
+            _dense_summary = ",".join(
+                f"{r[:8]}:dense={rs.dense_mode}/pdi={rs._post_dense_iter}"
+                for r, rs in self._requests.items())
+            logger.info(
+                "[diag-wfl] phase=%s layer=%s abs=%s per_req=%d "
+                "active_set_pre=%s rs=%s",
+                _phase_dbg, layer_name, _abs_layer_dbg, _per_req_n,
+                _active_set, _dense_summary)
+        # ICMS_DIAG_FULL: at layer 0 (one per forward), dump natural attn
+        # metadata for any post-dense-flip request — pinpoints stale bt /
+        # slot_mapping / seq_lens drift across the prefill→decode
+        # transition or the dense-mode flip.
+        if (os.environ.get("ICMS_DIAG_FULL") == "1"
+                and self._extract_layer_idx(layer_name) == 0):
+            self._diag_full_iter_metadata(
+                layer_name, self._attn_metadata, where="wfl_entry")
+
         if not per_request:
             return
 
-        if (self._prefill_done
-                or not self._gpu_kv_caches
-                or self._attn_metadata is None):
+        # Bug 11 (2026-04-29): the prefill_done short-circuit was making the
+        # M3+M4-A decode-time apply path at line ~3500 dead code: chain
+        # pages incrementally fetched via decode-iter Score replies never
+        # landed in main_key, so at budget < 1.0 decode read garbage from
+        # un-applied chain blocks. Drop prefill_done from the gate; the
+        # other two guards still protect pre-init / shutdown.
+        if (not self._gpu_kv_caches or self._attn_metadata is None):
             return
 
         t_layer_start = time.perf_counter()
@@ -3002,6 +3130,19 @@ class _Worker:
                 getattr(rs, "dense_mode", False)
                 for rs in self._requests.values())
             if _all_dense:
+                # Clear icms_fetch_state to prevent the prior iter's
+                # set_active(trimmed bt) from leaking into this iter's
+                # attention. Once dense_mode flips, save_kv_layer (the
+                # usual restore_attn_metadata trigger) is short-circuited
+                # by the Quest hook, so without an explicit clear here
+                # the stale _active sticks around for the rest of decode.
+                from vllm.v1.attention import icms_fetch_state
+                icms_fetch_state.clear()
+                if (os.environ.get("ICMS_DIAG_FULL") == "1"
+                        and self._extract_layer_idx(layer_name) == 0):
+                    self._diag_full_iter_metadata(
+                        layer_name, self._attn_metadata,
+                        where="wfl_all_dense_return")
                 return
         # ICMS_REPLY_EARLY=0 disables the flag-spin entirely so the
         # connector only proceeds after the sync Score/FetchAll reply
@@ -3311,14 +3452,15 @@ class _Worker:
                     out_event.record(apply_stream)
                     default_stream.wait_event(out_event)
 
-                from vllm.v1.attention import icms_fetch_state
-                icms_fetch_state.set_active(icms_fetch_state.IcmsFetchState(
-                    key_cache=main_key,
-                    value_cache=main_value,
-                    block_table=rs._apply_cached_new_bt,
-                    seq_lens=rs._apply_cached_new_sl,
-                    max_seq_len=rs._apply_cached_max_seq_len,
-                ))
+                if os.environ.get("ICMS_SKIP_BT_OVERRIDE") != "1":
+                    from vllm.v1.attention import icms_fetch_state
+                    icms_fetch_state.set_active(icms_fetch_state.IcmsFetchState(
+                        key_cache=main_key,
+                        value_cache=main_value,
+                        block_table=rs._apply_cached_new_bt,
+                        seq_lens=rs._apply_cached_new_sl,
+                        max_seq_len=rs._apply_cached_max_seq_len,
+                    ))
                 return True
 
         # ── Fetch selected pages' KV from ICMS sink → GPU blocks ──
@@ -3481,6 +3623,8 @@ class _Worker:
         # Prefill: cumulative == current (one-shot scoring per chain), so
         # no behavior change.
         cumulative_pids: list[int] = valid_pids
+        _diag_cum = (os.environ.get("ICMS_DIAG_CUM") == "1"
+                     and layer_idx_for_cache == 0)
         if (self._prefill_done
                 and rs is not None
                 and layer_idx_for_cache is not None
@@ -3488,11 +3632,23 @@ class _Worker:
             stride_root = (layer_idx_for_cache // self._score_stride) \
                           * self._score_stride
             prior_set = rs.fetched_pages.get(stride_root, set())
+            if _diag_cum:
+                logger.info(
+                    "[diag-cum] rid=%s layer=0 stride_root=%d valid=%d "
+                    "prior=%d merged_in_range=%s",
+                    rid, stride_root, len(valid_pids), len(prior_set),
+                    "n/a" if not prior_set else len([
+                        p for p in (prior_set | set(valid_pids))
+                        if p < context_pages and p < bt_row_max]))
             if prior_set:
                 merged = prior_set | set(valid_pids)
                 cumulative_pids = sorted(
                     p for p in merged
                     if p < context_pages and p < bt_row_max)
+        elif _diag_cum:
+            logger.info(
+                "[diag-cum] rid=%s layer=0 PREFILL_DONE_FALSE valid=%d",
+                rid, len(valid_pids))
 
         if gpu_direct:
             # ── Batched GPU-direct path: one gather + one dtype convert + ──
@@ -3846,6 +4002,46 @@ class _Worker:
             seq_len, new_seq_len,
         )
 
+        # ICMS_DIAG_FULL: dump the slow-path inputs that get baked into
+        # set_active. Layer 0 only to keep log compact. Captures (a) the
+        # main_key/main_value pointers + shapes, (b) the trimmed bt
+        # contents, (c) the seq_lens/max_seq_len, (d) the natural bt
+        # contents at the same row for cross-check.
+        if (os.environ.get("ICMS_DIAG_FULL") == "1"
+                and layer_idx_for_cache == 0):
+            try:
+                _bt_first = new_bt[0][:8].cpu().tolist() if new_bt.numel() > 0 else []
+                _bt_last = new_bt[0][-8:].cpu().tolist() if new_bt.numel() > 8 else []
+                _bt_shape = tuple(new_bt.shape)
+                _natural_first = bt[req_idx][:8].cpu().tolist()
+                _natural_last_row = (bt[req_idx][cont_end-8:cont_end].cpu().tolist()
+                                      if cont_end > 0 else [])
+                _phys_h = phys_blocks_dev[:4].tolist() if phys_blocks_dev.numel() > 0 else []
+                _phys_t = phys_blocks_dev[-4:].tolist() if phys_blocks_dev.numel() > 4 else []
+                logger.info(
+                    "[diag-full-apply] layer=0 rid=%s pdf=%d "
+                    "main_key_ptr=%s main_key_shape=%s main_value_ptr=%s "
+                    "n_valid=%d n_cumulative=%d new_bt_shape=%s "
+                    "new_bt[0][:8]=%s new_bt[0][-8:]=%s "
+                    "natural_bt[0][:8]=%s natural_bt[%d-8:%d]=%s "
+                    "phys_blocks_dev[:4]=%s phys_blocks_dev[-4:]=%s "
+                    "filled_blocks_count=%d new_seq_len=%d cont_end=%d "
+                    "context_pages=%d total_blocks=%d seq_len=%d "
+                    "prefill_done=%s dense_mode=%s",
+                    rid, getattr(rs, "_post_dense_iter", -1),
+                    hex(main_key.data_ptr()), tuple(main_key.shape),
+                    hex(main_value.data_ptr()),
+                    len(valid_pids), len(cumulative_pids), _bt_shape,
+                    _bt_first, _bt_last,
+                    _natural_first, cont_end, cont_end, _natural_last_row,
+                    _phys_h, _phys_t,
+                    filled_blocks_count, new_seq_len, cont_end,
+                    context_pages, total_blocks, seq_len,
+                    self._prefill_done,
+                    getattr(rs, "dense_mode", False))
+            except Exception as _e:
+                logger.warning("[diag-full-apply] failed: %r", _e)
+
         # Set fetch state for FlashAttention to read.
         # ICMS_SKIP_BT_OVERRIDE=1 disables the bt/seq_lens override so
         # attention reads main_key via vLLM's natural block_table. Used
@@ -3938,6 +4134,7 @@ class _Worker:
                 and self._requests and not self._skip_extract):
             # Nothing to extract — still flip the prefill_done flag.
             if not self._prefill_done:
+                self._reset_apply_caches_for_prefill_done()
                 self._prefill_done = True
                 logger.info("Prefill done. Switching to dense decode.")
             return
@@ -3982,8 +4179,135 @@ class _Worker:
                 logger.exception("ICMS_BLOCK_WRITES drain failed")
 
         if not self._prefill_done:
+            self._reset_apply_caches_for_prefill_done()
             self._prefill_done = True
             logger.info("Prefill done. Switching to dense decode.")
+
+    def _diag_full_dense_flip_snapshot(self, rs, flipping_layer: int) -> None:
+        """ICMS_DIAG_FULL: dump rs metadata at the moment dense_mode flips.
+
+        Captures per-rs cache pointers, fetched_pages totals, _active
+        state, and a sample of the most recent set_active block_table —
+        the things most likely to carry stale state into the natural-bt
+        decode path that runs after the flip.
+        """
+        from vllm.v1.attention import icms_fetch_state
+        try:
+            active = icms_fetch_state.get_active()
+            active_bt_shape = (tuple(active.block_table.shape)
+                                if active is not None else None)
+            active_seq = (active.seq_lens.cpu().tolist()
+                           if active is not None else None)
+            active_max = active.max_seq_len if active is not None else None
+            active_kp = (hex(active.key_cache.data_ptr())
+                         if active is not None else None)
+        except Exception as _e:
+            active_bt_shape = active_seq = active_max = active_kp = f"err:{_e!r}"
+        fp_summary = {k: len(v) for k, v in rs.fetched_pages.items()}
+        cached_bt_shape = (tuple(rs._apply_cached_new_bt.shape)
+                           if rs._apply_cached_new_bt is not None else None)
+        logger.info(
+            "[diag-dense-flip] rid=%s flip_at_layer=%d stored_grp=%d "
+            "num_grp_written=%d cache_layer_start=%d cache_actual_k=%d "
+            "cache_new_bt_shape=%s cache_max_seq_len=%d "
+            "fetched_pages_sizes=%s _active_bt_shape=%s _active_seq=%s "
+            "_active_max=%s _active_key_ptr=%s",
+            rs.request_id, flipping_layer,
+            rs.stored_groups, rs.num_groups_written,
+            rs._apply_cached_layer_start, rs._apply_cached_actual_k,
+            cached_bt_shape, rs._apply_cached_max_seq_len,
+            fp_summary, active_bt_shape, active_seq,
+            active_max, active_kp,
+        )
+
+    def _diag_full_iter_metadata(
+        self, layer_name: str, attn_metadata, where: str
+    ) -> None:
+        """ICMS_DIAG_FULL: dump natural attn_metadata at well-known points.
+
+        For each active rs that's post-dense-flip (rs._post_dense_iter in
+        0..2), log block_table[0][:8/-8], seq_lens, slot_mapping[:4/-4],
+        max_seq_len, num_actual_tokens. This lets us watch metadata
+        evolve across the first 3 forwards after the flip — the regime
+        most likely to expose stale-pointer / stale-bt issues.
+        """
+        try:
+            am = attn_metadata
+            if am is None or not isinstance(am, dict):
+                # Some backends pass dict, some pass single object; handle both.
+                if am is None:
+                    return
+                am_local = am
+            else:
+                am_local = am.get(layer_name, None)
+                if am_local is None:
+                    return
+            for rs in self._requests.values():
+                pdi = getattr(rs, "_post_dense_iter", -1)
+                if pdi < 0 or pdi > 2:
+                    continue
+                bt_local = getattr(am_local, "block_table", None)
+                sl_local = getattr(am_local, "seq_lens", None)
+                sm_local = getattr(am_local, "slot_mapping", None)
+                msk_local = getattr(am_local, "max_seq_len", None)
+                nat_local = getattr(am_local, "num_actual_tokens", None)
+                bt_first = (bt_local[0][:8].cpu().tolist()
+                            if bt_local is not None else None)
+                bt_last = (bt_local[0][-8:].cpu().tolist()
+                            if bt_local is not None else None)
+                bt_shape = tuple(bt_local.shape) if bt_local is not None else None
+                bt_ptr = (hex(bt_local.data_ptr())
+                          if bt_local is not None else None)
+                sl_list = (sl_local.cpu().tolist()
+                           if sl_local is not None else None)
+                sm_first = (sm_local[:4].cpu().tolist()
+                            if sm_local is not None else None)
+                sm_last = (sm_local[-4:].cpu().tolist()
+                            if sm_local is not None else None)
+                logger.info(
+                    "[diag-postflip] where=%s rid=%s pdi=%d "
+                    "layer=%s bt_shape=%s bt_ptr=%s "
+                    "bt[0][:8]=%s bt[0][-8:]=%s seq_lens=%s "
+                    "slot_map[:4]=%s slot_map[-4:]=%s "
+                    "max_seq_len=%s num_actual_tokens=%s",
+                    where, rs.request_id, pdi, layer_name,
+                    bt_shape, bt_ptr, bt_first, bt_last, sl_list,
+                    sm_first, sm_last, msk_local, nat_local)
+        except Exception as _e:
+            logger.warning("[diag-postflip] snapshot failed: %r", _e)
+
+    def _reset_apply_caches_for_prefill_done(self):
+        """Bug 11 (2026-04-29) audit fix #1: invalidate per-rs apply
+        caches at the prefill→decode transition.
+
+        The fast-path cache (_apply_cached_*) was populated by the LAST
+        scored layer of prefill (typically layer N-1 of the last stride
+        group, e.g., layer 42 with stride=6). Without invalidation, the
+        first decode iter's reuse-layer wait_for_layer calls would hit
+        the fast path with prefill's stale phys_blocks/page_idx/new_bt
+        — scattering this iter's smaller decode Score reply via prefill's
+        actual_k stride into wrong sink slots and using prefill's trimmed
+        block_table for set_active. Resetting layer_start to -1 forces
+        the slow path to re-run on the first decode-iter scored layer,
+        rebuilding the cache with current data."""
+        from vllm.v1.attention import icms_fetch_state
+        for rs in self._requests.values():
+            rs._apply_cached_layer_start = -1
+            rs._apply_cached_phys_blocks_dev = None
+            rs._apply_cached_page_idx_dev = None
+            rs._apply_cached_actual_k = 0
+            rs._apply_cached_new_bt = None
+            rs._apply_cached_new_sl = None
+            rs._apply_cached_max_seq_len = 0
+            rs._apply_cached_filled_count = 0
+            rs._apply_cached_cont_idx_dev = None
+            rs._apply_cached_cont_idx_range = (0, 0)
+            rs._apply_cached_seq_len = None
+            rs._apply_cached_attn_md = None
+        # The trimmed bt/key_cache pointers stored in icms_fetch_state
+        # also reference prefill state — clear so the first decode-iter
+        # layer starts from a clean slate.
+        icms_fetch_state.clear()
 
     def _do_deferred_extract_and_flush(
         self,
