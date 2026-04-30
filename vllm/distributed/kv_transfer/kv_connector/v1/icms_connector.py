@@ -461,6 +461,7 @@ class _RequestState:
     _apply_cached_phys_blocks_dev: object = None  # torch.Tensor or None
     _apply_cached_page_idx_dev: object = None
     _apply_cached_actual_k: int = 0
+    _apply_cached_valid_pids: object = None  # diag-only: list[int] or None
     _apply_cached_new_bt: object = None
     _apply_cached_new_sl: object = None
     _apply_cached_max_seq_len: int = 0
@@ -647,6 +648,14 @@ class IcmsConnector(KVConnectorBase_V1):
         self._stats_level: int = int(extra.get("icms_stats_level", 1))
         self._log_selections: bool = bool(extra.get("icms_log_selections", False))
         self._score_stride: int = int(extra.get("icms_score_stride", 6))
+        # FAPS (FetchAll-post-Score): bench mode that combines Score's
+        # K-page selection signal with a follow-up FetchAll for the full
+        # N pages so decode runs dense. Read from extra_config (rather
+        # than env var) so spawn-method workers see it deterministically;
+        # the legacy ICMS_FETCH_ALL_POST_SCORE env var path is still
+        # checked as a fallback for shell-based benches.
+        self._fetch_all_post_score: bool = bool(
+            extra.get("fetch_all_post_score", False))
         self._adaptive_bandwidth: bool = bool(extra.get("adaptive_bandwidth", False))
         self._link_bandwidth_bps: float = float(extra.get(
             "link_bandwidth_bps", 25e9 / 8))  # default 25 Gbps (BF2)
@@ -703,6 +712,7 @@ class IcmsConnector(KVConnectorBase_V1):
                 rdma_ib_dev=self._rdma_ib_dev,
                 gpu_direct=self._gpu_direct,
                 gpu_device=self._gpu_device,
+                fetch_all_post_score=self._fetch_all_post_score,
             )
 
     # ══════════════════════════════════════════════════════════════════════
@@ -1337,7 +1347,8 @@ class _Worker:
                  rdma_port: int = 18515,
                  rdma_ib_dev: str = "mlx5_0",
                  gpu_direct: bool = False,
-                 gpu_device: str = "cuda:0"):
+                 gpu_device: str = "cuda:0",
+                 fetch_all_post_score: bool = False):
         self._socket_path = socket_path
         self._use_rdma = use_rdma
         self._rdma_server_host = rdma_server_host
@@ -1347,6 +1358,32 @@ class _Worker:
         self._gpu_device = gpu_device
         self._model_name = model_name
         self._k = k
+        # FAPS gate. Take the connector-init value (kv_connector_extra_config),
+        # but allow ICMS_FETCH_ALL_POST_SCORE=1 in env to opt in too — keeps
+        # the legacy shell-env benches working without code changes.
+        self._fetch_all_post_score: bool = (
+            bool(fetch_all_post_score)
+            or os.environ.get("ICMS_FETCH_ALL_POST_SCORE") == "1")
+        logger.info(
+            "[icms-init] _Worker init: fetch_all_post_score=%s "
+            "(extra_config=%s, env=%r)",
+            self._fetch_all_post_score, fetch_all_post_score,
+            os.environ.get("ICMS_FETCH_ALL_POST_SCORE"))
+        # Bug 11 family verification (2026-04-30): bf16 byte round-trip
+        # self-test. record_page writes raw bytes via view(uint8); apply
+        # reads back via view(model_dtype). If pytorch's reinterpret
+        # contract changes (or numpy strips/reorders bytes), this catches
+        # it at boot before any actual K/V flows. ~10µs cost, runs once.
+        try:
+            _x = torch.randn(8, 4, 128).to(torch.bfloat16)
+            _b = _x.contiguous().view(torch.uint8).numpy().tobytes()
+            _y = torch.frombuffer(bytearray(_b),
+                                   dtype=torch.bfloat16).reshape(_x.shape)
+            assert torch.equal(_x, _y), "bf16 byte round-trip mismatch"
+            logger.info("[icms-init] bf16 byte round-trip self-test PASS")
+        except Exception as _e:
+            logger.error("[icms-init] bf16 byte round-trip self-test "
+                          "FAIL: %s", _e)
         self._num_q_heads = num_q_heads
         # Score stride: fresh Quest scoring every N layers.
         # stride=1 → per-layer scoring, stride=6 → strided, stride=48 → single
@@ -2181,6 +2218,10 @@ class _Worker:
                 logger.debug(
                     "fetch_all promote: no _pending_reuse for rid=%s layer=%d",
                     rid, next_layer_idx)
+                if os.environ.get("ICMS_DIAG_FAPS") == "1":
+                    logger.info(
+                        "[diag-faps] fast-path MISS rid=%s layer=%d",
+                        rid[:8], next_layer_idx)
                 return
             reply, reuse_offsets = reuse_entry
             promoted = copy.copy(reply)
@@ -2188,6 +2229,11 @@ class _Worker:
             with self._score_lock:
                 self._pending_scores.setdefault(attn_layer_name, {})[rid] = (
                     promoted, req_idx)
+            if os.environ.get("ICMS_DIAG_FAPS") == "1":
+                logger.info(
+                    "[diag-faps] fast-path HIT rid=%s layer=%d k=%d sink_off_n=%d",
+                    rid[:8], next_layer_idx, len(reply.page_ids),
+                    len(reuse_offsets))
             return
 
         # Slow path: first scoring boundary for this request — issue
@@ -2314,6 +2360,13 @@ class _Worker:
                     self._pending_reuse.setdefault(reuse_attn, {})[rid] = (
                         reply, reuse_offsets)
             rs._fetch_all_complete = True
+            if os.environ.get("ICMS_DIAG_FAPS") == "1":
+                logger.info(
+                    "[diag-faps] slow-path DONE rid=%s layer=%d k=%d "
+                    "total_pages=%d reuse_layers_set=%d sink_off_n=%d",
+                    rid[:8], next_layer_idx, len(reply.page_ids),
+                    total_pages, reuse_through - next_layer_idx,
+                    len(reply.sink_offsets))
         except Exception as e:
             t_end = time.perf_counter()
             self.stats.record_score(
@@ -2518,7 +2571,12 @@ class _Worker:
         #
         # Cost: one extra RPC per scoring boundary at layer 0 only —
         # subsequent boundaries early-return on rs._fetch_all_complete.
-        if os.environ.get("ICMS_FETCH_ALL_POST_SCORE", "0") == "1":
+        if self._fetch_all_post_score:
+            if os.environ.get("ICMS_DIAG_FAPS") == "1":
+                logger.info(
+                    "[diag-faps] post-score fire layer=%d n_req=%d rids=%s",
+                    next_layer_idx, len(requests_to_score),
+                    [r[1][:8] for r in requests_to_score])
             for req_idx, rid, rs in requests_to_score:
                 try:
                     self._fetch_all_one_request(
@@ -3015,16 +3073,32 @@ class _Worker:
             # stride is actual_k*kv_page_bytes (NOT self._k — that's
             # the sink cap). Using self._k here would overshoot the
             # server's layer-delta offsets by a large factor.
-            actual_k = len(reply.page_ids)
-            per_layer_bytes = actual_k * self._geom.kv_page_bytes
-            for delta in range(1, reuse_through - next_layer_idx + 1):
-                reuse_layer = next_layer_idx + delta
-                reuse_attn = f"model.layers.{reuse_layer}.self_attn.attn"
-                reuse_offsets = [off + delta * per_layer_bytes
-                                 for off in reply.sink_offsets]
-                with self._score_lock:
-                    self._pending_reuse.setdefault(reuse_attn, {})[rid] = (
-                        reply, reuse_offsets)
+            #
+            # Skip in ICMS_FETCH_ALL_POST_SCORE mode: FetchAll's slow
+            # path at layer 0 already populated _pending_reuse[1..47]
+            # with the N-page reply for ALL reuse layers. Pre-populating
+            # here would clobber those entries for layers within this
+            # stride window with Score's smaller K-page reply, leaving
+            # the reuse layers' apply scattering only K pages while the
+            # stride boundary's apply gets the full N — i.e., 30/48
+            # layers under-fill main_key. Bug 11 family fix (2026-04-29).
+            if not self._fetch_all_post_score:
+                actual_k = len(reply.page_ids)
+                per_layer_bytes = actual_k * self._geom.kv_page_bytes
+                for delta in range(1, reuse_through - next_layer_idx + 1):
+                    reuse_layer = next_layer_idx + delta
+                    reuse_attn = f"model.layers.{reuse_layer}.self_attn.attn"
+                    reuse_offsets = [off + delta * per_layer_bytes
+                                     for off in reply.sink_offsets]
+                    with self._score_lock:
+                        self._pending_reuse.setdefault(reuse_attn, {})[rid] = (
+                            reply, reuse_offsets)
+            elif os.environ.get("ICMS_DIAG_FAPS") == "1":
+                logger.info(
+                    "[diag-faps] score-path FAPS-gate skip rid=%s layer=%d "
+                    "k=%d (would-have-set reuse_layers=%d)",
+                    rid[:8], next_layer_idx, len(reply.page_ids),
+                    reuse_through - next_layer_idx)
         except Exception as e:
             t_score_end = time.perf_counter()
             self.stats.record_score(
@@ -3060,6 +3134,18 @@ class _Worker:
         """
         with self._score_lock:
             per_request = self._pending_scores.pop(layer_name, None)
+
+        if os.environ.get("ICMS_DIAG_FAPS") == "1":
+            _abs = self._extract_layer_idx(layer_name)
+            if per_request:
+                for _rid_dbg, (_reply_dbg, _) in per_request.items():
+                    logger.info(
+                        "[diag-faps] wfl POP rid=%s layer=%s k=%d sink_off_n=%d",
+                        _rid_dbg[:8], _abs, len(_reply_dbg.page_ids),
+                        len(_reply_dbg.sink_offsets))
+            else:
+                logger.info(
+                    "[diag-faps] wfl POP-empty layer=%s", _abs)
 
         # Bug 11 instrumentation (2026-04-29): log every wait_for_layer
         # call's pop result + decode/prefill phase so we can see whether
@@ -3432,13 +3518,12 @@ class _Worker:
                         pages_u8 = pages_u8[:, :kv_page_bytes_eff].contiguous()
                     k_bytes = pages_u8[:, :half_bytes].contiguous()
                     v_bytes = pages_u8[:, half_bytes:].contiguous()
-                    # Storage is fp16 — see the slow path comment for
-                    # why a direct view as model_dtype mangles bf16
-                    # models. Mirror the fix here.
-                    k_pages = (k_bytes.view(torch.float16)
-                                .reshape(-1, *page_shape).to(model_dtype))
-                    v_pages = (v_bytes.view(torch.float16)
-                                .reshape(-1, *page_shape).to(model_dtype))
+                    # Bug 11 family fix (2026-04-30): bytes stored in
+                    # model_dtype now. Mirror of the slow-path change.
+                    k_pages = (k_bytes.view(model_dtype)
+                                .reshape(-1, *page_shape))
+                    v_pages = (v_bytes.view(model_dtype)
+                                .reshape(-1, *page_shape))
                     if self._tp_size > 1 and not per_rank_slice:
                         nkv_local = geom.num_kv_heads // self._tp_size
                         start = self._tp_rank * nkv_local
@@ -3446,6 +3531,42 @@ class _Worker:
                         v_pages = v_pages[:, :, start:start + nkv_local, :].contiguous()
                     main_key.index_copy_(0, phys_blocks_dev, k_pages)
                     main_value.index_copy_(0, phys_blocks_dev, v_pages)
+
+                # Multi-layer canary read in fast path (2026-04-30):
+                # detect mis-pack of layers 1..47 in the FAPS sink. Slow
+                # path only fires at layer 0, so without this block we'd
+                # never see hashes for higher layers.
+                _fast_layer_idx = self._extract_layer_idx(layer_name)
+                if (os.environ.get("ICMS_DIAG_CANARY") == "1"
+                        and _fast_layer_idx in
+                        (6, 12, 18, 24, 30, 36, 42)):
+                    import hashlib as _hl_fast
+                    chain_head = (rs.chain[:1]
+                                   if rs is not None and rs.chain else [])
+                    for probe_pid in (0, 17, 100):
+                        try:
+                            canary_idx = (rs._apply_cached_valid_pids.index(probe_pid)
+                                          if hasattr(rs, "_apply_cached_valid_pids")
+                                          and rs._apply_cached_valid_pids is not None
+                                          else None)
+                        except (ValueError, AttributeError):
+                            canary_idx = None
+                        if canary_idx is None or canary_idx >= k_bytes.shape[0]:
+                            continue
+                        k_raw = k_bytes[canary_idx].cpu().numpy().tobytes()
+                        v_raw = v_bytes[canary_idx].cpu().numpy().tobytes()
+                        kh = _hl_fast.sha1(k_raw).hexdigest()[:16]
+                        vh = _hl_fast.sha1(v_raw).hexdigest()[:16]
+                        khead = k_raw[:32].hex()
+                        nz = int((k_pages[canary_idx] != 0).sum())
+                        nt = int(k_pages[canary_idx].numel())
+                        logger.info(
+                            "[diag-canary-read] rid=%s chain_head=%s "
+                            "layer=%d pid=%d canary_idx=%d "
+                            "nonzero_k=%d/%d k_sha=%s v_sha=%s "
+                            "k_head=%s",
+                            rid, chain_head, _fast_layer_idx,
+                            probe_pid, canary_idx, nz, nt, kh, vh, khead)
 
                 if apply_stream is not None:
                     out_event = torch.cuda.Event()
@@ -3778,75 +3899,89 @@ class _Worker:
                     # kv_page_bytes_eff bytes hold valid data (this
                     # rank's slice). K/V split is at half of effective.
                     pages_u8 = pages_u8[:, :kv_page_bytes_eff].contiguous()
-                # PERF: skip the legacy fp16->bf16 round-trip; server
-                # bytes are already in model_dtype.
                 k_bytes = pages_u8[:, :half_bytes].contiguous()
                 v_bytes = pages_u8[:, half_bytes:].contiguous()
                 _t2 = _t()
-                # Storage roundtrip is fp16 (record_page hard-codes
-                # `key_block.to(torch.float16)`). For bf16 models (qwen3,
-                # mistral-nemo at bf16), interpreting the raw bytes as
-                # model_dtype silently mangles every value (fp16 0xba80
-                # = -0.563 read as bf16 0xba80 = -0.000977 → -0.563
-                # information lost). Always view as fp16, then cast to
-                # model_dtype. fp16 models pay no extra cost (no-op
-                # cast); bf16 models pay a ~µs/page convert that fixes
-                # the warm-prefix corruption identified 2026-04-28.
-                k_pages = (k_bytes.view(torch.float16)
-                            .reshape(-1, *page_shape).to(model_dtype))
-                v_pages = (v_bytes.view(torch.float16)
-                            .reshape(-1, *page_shape).to(model_dtype))
+                # Bug 11 family fix (2026-04-30): record_page now stores
+                # raw model_dtype bytes (was fp16-cast). View directly
+                # as model_dtype with no precision-losing cast. The
+                # legacy fp16 round-trip lost ~3 mantissa bits per value
+                # at the bf16→fp16→bf16 boundary; that drift accumulated
+                # over ~745M values per request at 32k chain and derailed
+                # multi-key NIAH retrieval. Both bf16 and fp16 are 2
+                # bytes/element so the byte count is identical — only the
+                # byte-pattern interpretation changes. Write-side change:
+                # record_page line ~4691; mirror in fast path: line ~3448
+                # and host-sink fallback: line ~3957.
+                k_pages = (k_bytes.view(model_dtype)
+                            .reshape(-1, *page_shape))
+                v_pages = (v_bytes.view(model_dtype)
+                            .reshape(-1, *page_shape))
                 _t3 = _t()
 
                 # ICMS_DIAG_CANARY=1: read-side fingerprint for layer 0
                 # pages 0, 17, 100, 500 (whichever exist in valid_pids).
                 # Pair with [diag-canary-write] in record_page.
+                # Multi-layer canary read (2026-04-30): extend to scored
+                # layers 6,12,18,24,30,36,42 so we get write↔read hash
+                # comparisons across the full FAPS reuse range. This is
+                # how we detect server-side per-layer mis-packing in
+                # the sink (which would show "layer 0 matches but layer
+                # 6 doesn't").
+                _layer_idx_for_canary = self._extract_layer_idx(layer_name)
                 if (os.environ.get("ICMS_DIAG_CANARY") == "1"
-                        and layer_name.endswith(".0.self_attn.attn")):
-                    # Sink scan: dump first 8 bytes of sink_pages at
-                    # slots 0,1,2,17,100,500. If write k_head bytes
-                    # appear at a slot ≠ expected, server's sink_offsets
-                    # are pointing to the wrong place.
-                    import hashlib as _hl
-                    for slot in (0, 1, 2, 17, 100, 500):
-                        if slot >= sink_pages.shape[0]:
-                            continue
-                        slot_bytes = bytes(sink_pages[slot, :32].cpu().numpy())
-                        logger.info("[diag-sink-slot] layer=0 sink_slot=%d "
-                                     "first32_hex=%s",
-                                     slot, slot_bytes.hex())
-                    # Also dump valid_sink_offs[:5] so we can correlate
-                    # what offsets the server returned for the valid
-                    # pids vs where we look in the sink.
-                    logger.info("[diag-sink-offs] layer=0 "
-                                 "valid_sink_offs[:5]=%s page_idx_dev[:5]=%s",
-                                 valid_sink_offs[:5],
-                                 page_idx_dev[:5].cpu().tolist())
+                        and _layer_idx_for_canary in
+                        (0, 6, 12, 18, 24, 30, 36, 42)):
+                    # Layer-0 only: sink-slot bytes + offset listing (layout-
+                    # specific to the first FAPS slow-path slice).
+                    if _layer_idx_for_canary == 0:
+                        import hashlib as _hl
+                        for slot in (0, 1, 2, 17, 100, 500):
+                            if slot >= sink_pages.shape[0]:
+                                continue
+                            slot_bytes = bytes(
+                                sink_pages[slot, :32].cpu().numpy())
+                            logger.info(
+                                "[diag-sink-slot] layer=0 sink_slot=%d "
+                                "first32_hex=%s",
+                                slot, slot_bytes.hex())
+                        logger.info(
+                            "[diag-sink-offs] layer=0 "
+                            "valid_sink_offs[:5]=%s page_idx_dev[:5]=%s",
+                            valid_sink_offs[:5],
+                            page_idx_dev[:5].cpu().tolist())
                     import hashlib
                     chain_head = rs.chain[:1] if rs is not None and rs.chain else []
-                    for probe_pid in (0, 1, 2, 3, 4, 8, 16, 17, 24, 31, 32, 33, 100, 500):
+                    # Layer 0 keeps full probe set; higher layers sample
+                    # a few pids to cap log volume across 7 extra layers.
+                    _probe_set = (
+                        (0, 1, 2, 3, 4, 8, 16, 17, 24, 31, 32, 33, 100, 500)
+                        if _layer_idx_for_canary == 0
+                        else (0, 17, 100))
+                    for probe_pid in _probe_set:
                         if probe_pid not in valid_pids:
                             continue
                         canary_idx = valid_pids.index(probe_pid)
-                        k_one_fp16 = k_pages[canary_idx].to(torch.float16).contiguous().cpu().numpy().tobytes()
-                        v_one_fp16 = v_pages[canary_idx].to(torch.float16).contiguous().cpu().numpy().tobytes()
-                        kh = hashlib.sha1(k_one_fp16).hexdigest()[:16]
-                        vh = hashlib.sha1(v_one_fp16).hexdigest()[:16]
-                        khead = k_one_fp16[:32].hex()
-                        # Quick "is-this-zero" probe: count non-zero fp16 elements.
-                        # NB: use module-level `np` — re-importing here as
-                        # `import numpy as np` made the entire function scope
-                        # treat `np` as local, breaking earlier references at
-                        # line ~3561 with UnboundLocalError on qwen3-extras.
-                        k_fp16_arr = np.frombuffer(k_one_fp16, dtype=np.float16)
-                        nonzero = int((k_fp16_arr != 0).sum())
+                        # Bug 11 verification (2026-04-30): hash the RAW
+                        # wire bytes (uint8 view, pre-model_dtype
+                        # interpretation), so write/read sha1 are
+                        # directly comparable regardless of how the
+                        # bytes are reinterpreted on either side.
+                        k_raw = k_bytes[canary_idx].cpu().numpy().tobytes()
+                        v_raw = v_bytes[canary_idx].cpu().numpy().tobytes()
+                        kh = hashlib.sha1(k_raw).hexdigest()[:16]
+                        vh = hashlib.sha1(v_raw).hexdigest()[:16]
+                        khead = k_raw[:32].hex()
+                        nonzero = int((k_pages[canary_idx] != 0).sum())
+                        n_total = int(k_pages[canary_idx].numel())
                         logger.info("[diag-canary-read] rid=%s chain_head=%s "
-                                     "layer=0 pid=%d canary_idx=%d "
+                                     "layer=%s pid=%d canary_idx=%d "
                                      "nonzero_k=%d/%d k_sha=%s v_sha=%s "
                                      "k_head=%s",
                                      rid, chain_head,
+                                     _layer_idx_for_canary,
                                      probe_pid, canary_idx,
-                                     nonzero, len(k_fp16_arr),
+                                     nonzero, n_total,
                                      kh, vh, khead)
 
                 # Option W broadcast path: when server didn't slice,
@@ -3944,10 +4079,17 @@ class _Worker:
                 # page_shape upstream is (PAGE_TOKENS, geom.num_kv_heads,
                 # head_dim) — the FULL-rank shape on the wire when
                 # per_rank_slice=False.
-                k_np = np.frombuffer(raw[:half_bytes], dtype=np.float16).reshape(page_shape)
-                v_np = np.frombuffer(raw[half_bytes:], dtype=np.float16).reshape(page_shape)
-                k_t = torch.from_numpy(k_np.copy()).to(dtype=model_dtype, device=device)
-                v_t = torch.from_numpy(v_np.copy()).to(dtype=model_dtype, device=device)
+                # Bug 11 family fix (2026-04-30): bytes are stored in
+                # model_dtype (was fp16). NumPy lacks bf16 so we go
+                # through torch.frombuffer to view the raw bytes as
+                # model_dtype. Mirror of slow/fast GPU-direct path
+                # changes — see record_page line ~4691.
+                k_buf = torch.frombuffer(bytearray(raw[:half_bytes]),
+                                          dtype=model_dtype).reshape(page_shape)
+                v_buf = torch.frombuffer(bytearray(raw[half_bytes:]),
+                                          dtype=model_dtype).reshape(page_shape)
+                k_t = k_buf.clone().to(device=device)
+                v_t = v_buf.clone().to(device=device)
                 if self._tp_size > 1 and not per_rank_slice:
                     # Slice to this rank's KV-head range BEFORE the copy.
                     k_t = k_t[:, head_start:head_start + nkv_local, :]
@@ -4076,6 +4218,10 @@ class _Worker:
             rs._apply_cached_phys_blocks_dev = phys_blocks_dev
             rs._apply_cached_page_idx_dev = page_idx_dev
             rs._apply_cached_actual_k = len(reply.page_ids)
+            # Diag-only: cache the valid_pids list so the fast path's
+            # multi-layer canary can map probe_pid → canary_idx without
+            # rebuilding it. Has no effect on hot path correctness.
+            rs._apply_cached_valid_pids = list(valid_pids)
             # new_bt is built from cumulative pids (M3+M4-A) and is
             # reused by the fast path for attention's block_table.
             rs._apply_cached_new_bt = new_bt
@@ -4678,29 +4824,52 @@ class _Worker:
             rs.active_group_buffers[group_idx] = buf
 
         # KV: K || V byte concatenation (C4). Always stored (every layer).
-        k_bytes = key_block.to(torch.float16).contiguous().numpy().tobytes()
-        v_bytes = value_block.to(torch.float16).contiguous().numpy().tobytes()
+        # Bug 11 family fix (2026-04-30): preserve full model precision by
+        # serializing raw model_dtype bytes (no fp16 down-cast). The
+        # legacy `.to(torch.float16)` was a bf16↔fp16 round-trip for bf16
+        # models like qwen3, losing ~3 mantissa bits per value. At 32k
+        # chain × 16 tokens × 4 KV heads × 128 dim × 48 layers = ~745M
+        # values per request, the accumulated drift derails attention
+        # enough that multi-key NIAH retrieval fails. Both bf16 and fp16
+        # are 2 bytes per element; view(uint8) reinterprets the buffer
+        # as numpy-compatible bytes without any conversion. Apply side
+        # must view back as model_dtype (not fp16) — see lines 3805+,
+        # 3448+, 3957+ for the corresponding read-side updates.
+        k_bytes = key_block.contiguous().view(torch.uint8).numpy().tobytes()
+        v_bytes = value_block.contiguous().view(torch.uint8).numpy().tobytes()
         kv_bytes = k_bytes + v_bytes
 
         # ICMS_DIAG_CANARY=1: per-write fingerprint for a few logical
         # pages of layer 0 (we recompute target pages from intra_idx →
         # group_idx*32+page_in_group). Pair with [diag-canary-read]
         # for the same pid in _apply_selective_attention.
+        # Multi-layer canary (2026-04-30): also fire for scored layers
+        # 6,12,18,24,30,36,42 so we can verify the FAPS slow-path
+        # per-layer offset arithmetic. If layer-0 hashes match write↔read
+        # but layer-6+ don't, the server's per-layer pack ordering is
+        # the bug. Restricted to one probe pid per layer to keep volume
+        # low.
         if (os.environ.get("ICMS_DIAG_CANARY") == "1"
-                and layer_idx == 0):
+                and layer_idx in (0, 6, 12, 18, 24, 30, 36, 42)):
             absolute_pid = group_idx * _GROUP_BLOCKS + page_in_group
-            if absolute_pid in (0, 1, 2, 3, 4, 8, 16, 17, 24, 31, 32, 33, 100, 500):
+            # Layer 0 keeps full probe set for byte-path correctness.
+            # Higher layers only sample pid=0 / 17 / 100 to keep log size
+            # manageable across 7 extra layers.
+            _probe_set = (
+                (0, 1, 2, 3, 4, 8, 16, 17, 24, 31, 32, 33, 100, 500)
+                if layer_idx == 0 else (0, 17, 100))
+            if absolute_pid in _probe_set:
                 import hashlib
                 chain_head = rs.chain[:1] if rs.chain else []
                 kh = hashlib.sha1(k_bytes).hexdigest()[:16]
                 vh = hashlib.sha1(v_bytes).hexdigest()[:16]
                 khead = k_bytes[:32].hex()
                 logger.info("[diag-canary-write] rid=%s chain_head=%s "
-                             "abs_pid=%d gidx=%d page_in_group=%d layer=0 "
+                             "abs_pid=%d gidx=%d page_in_group=%d layer=%d "
                              "k_len=%d v_len=%d k_sha=%s v_sha=%s "
                              "k_head=%s",
                              rs.request_id, chain_head, absolute_pid,
-                             group_idx, page_in_group,
+                             group_idx, page_in_group, layer_idx,
                              len(k_bytes), len(v_bytes), kh, vh, khead)
 
         spb = geom.summary_page_bytes
