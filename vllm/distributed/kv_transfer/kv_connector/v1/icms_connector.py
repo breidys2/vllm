@@ -3065,9 +3065,22 @@ class _Worker:
 
             # Store the score result keyed by (layer, request_id).
             attn_layer_name = f"model.layers.{next_layer_idx}.self_attn.attn"
-            with self._score_lock:
-                self._pending_scores.setdefault(attn_layer_name, {})[rid] = (
-                    reply, req_idx)
+            # Bug fix (2026-04-30): in FAPS mode, the FetchAll slow path
+            # (line ~2346) and the Score-then-promote fast path (line
+            # ~2230) are both responsible for writing _pending_scores
+            # for this layer with the N-page reply. If Score writes its
+            # K-page reply here too, there's a TOCTOU window where
+            # wait_for_layer can read Score's smaller reply before FAPS
+            # overwrites it. The downstream cache (_apply_cached_actual_k)
+            # then snapshots K, and fast-path layers 1..(stride-1) read
+            # the wrong sink offsets (delta*K instead of delta*N). At
+            # B=0.2 (K=51, N=256) the resulting per-layer reads land in
+            # incoherent slices of layer 0's region → degenerate output.
+            # Skip the Score write under FAPS — let FAPS be sole writer.
+            if not self._fetch_all_post_score:
+                with self._score_lock:
+                    self._pending_scores.setdefault(attn_layer_name, {})[rid] = (
+                        reply, req_idx)
 
             # Store references for reuse layers. Server's per-layer
             # stride is actual_k*kv_page_bytes (NOT self._k — that's
@@ -3187,6 +3200,15 @@ class _Worker:
         # landed in main_key, so at budget < 1.0 decode read garbage from
         # un-applied chain blocks. Drop prefill_done from the gate; the
         # other two guards still protect pre-init / shutdown.
+        #
+        # ICMS_DECODE_APPLY=0 — restore the legacy prefill_done short-
+        # circuit. With this set, decode-time Score replies are NOT
+        # scattered to main_key; decode attends only over the K pages
+        # selected at prefill (no bitmap growth, no M4-A dense flip).
+        # This gives the pure-sparse mode (no incremental fetch).
+        if (os.environ.get("ICMS_DECODE_APPLY") == "0"
+                and self._prefill_done):
+            return
         if (not self._gpu_kv_caches or self._attn_metadata is None):
             return
 
