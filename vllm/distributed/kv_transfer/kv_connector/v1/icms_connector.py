@@ -166,7 +166,14 @@ def _tp_broadcast_score_reply(reply, tp_rank: int, tp_size: int):
 
     # Header: [status, trie_walk_ns, summary_read_ns, score_ns,
     #          sink_write_ns, cache_hit, concurrent_requests,
-    #          server_ingest_to_ready_ns, num_pages]  — 9 i64 slots.
+    #          server_ingest_to_ready_ns, effective_supply_bps,
+    #          num_pages]  — 10 i64 slots.
+    # Bug fix (2026-04-30): added effective_supply_bps (slot 8) to match
+    # the protocol's two-sided adaptive-bandwidth wire format. Without
+    # this, the dataclass reconstruction at the end of this function
+    # raised "ScoreReply.__init__() missing effective_supply_bps" on
+    # every TP>1 broadcast and Score replies never reached non-rank-0
+    # workers — wedging decode at iter 1 with shm_broadcast timeouts.
     if tp_rank == 0 and reply is not None:
         n_pages = len(reply.page_ids)
         hdr = torch.tensor([
@@ -178,13 +185,14 @@ def _tp_broadcast_score_reply(reply, tp_rank: int, tp_size: int):
             int(bool(reply.cache_hit)),
             int(reply.concurrent_requests),
             int(reply.server_ingest_to_ready_ns),
+            int(reply.effective_supply_bps),
             int(n_pages),
         ], dtype=torch.int64, device=dev)
     else:
-        hdr = torch.zeros(9, dtype=torch.int64, device=dev)
+        hdr = torch.zeros(10, dtype=torch.int64, device=dev)
     dist.broadcast(hdr, src=tp_group.first_rank, group=dev_group)
 
-    n_pages = int(hdr[8].item())
+    n_pages = int(hdr[9].item())
     if n_pages == 0:
         from icms_client.protocol import ScoreReply
         return ScoreReply(
@@ -193,6 +201,7 @@ def _tp_broadcast_score_reply(reply, tp_rank: int, tp_size: int):
             sink_write_ns=int(hdr[4]), cache_hit=bool(hdr[5]),
             concurrent_requests=int(hdr[6]),
             server_ingest_to_ready_ns=int(hdr[7]),
+            effective_supply_bps=int(hdr[8]),
             page_ids=[], scores=[], sink_offsets=[],
         )
 
@@ -216,6 +225,7 @@ def _tp_broadcast_score_reply(reply, tp_rank: int, tp_size: int):
         sink_write_ns=int(hdr[4]), cache_hit=bool(hdr[5]),
         concurrent_requests=int(hdr[6]),
         server_ingest_to_ready_ns=int(hdr[7]),
+        effective_supply_bps=int(hdr[8]),
         page_ids=pids.cpu().tolist(),
         scores=scs.cpu().tolist(),
         sink_offsets=offs.cpu().tolist(),
@@ -3916,6 +3926,57 @@ class _Worker:
                 # One gather kernel: [k, page_bytes] u8.
                 pages_u8 = sink_pages.index_select(0, page_idx_dev)
                 _t1 = _t()
+                # TP=2 sink probe (2026-04-30): dump first 32 bytes of
+                # pages_u8[0] per-rank. Lets us discriminate "rank-1 sink
+                # is empty" (PRS=0 Option-W bug) vs "ranks see different
+                # but non-zero bytes" (PRS=1 server-slicing bug). Layer 0
+                # only.
+                if (os.environ.get("ICMS_DIAG_TP_SINK") == "1"
+                        and self._tp_size > 1
+                        and layer_name.endswith(".0.self_attn.attn")):
+                    try:
+                        page0_full = pages_u8[0].contiguous().cpu().numpy()
+                        head_b = bytes(page0_full[:32])
+                        nonzero = sum(1 for b in head_b if b != 0)
+                        # FNV-1a over the full 32K page slot (matches
+                        # server-canary-pre-strided-write algorithm so
+                        # we can sanity-diff what the server posted vs.
+                        # what arrived at the sink).
+                        h_full = 0xcbf29ce484222325
+                        for _b in page0_full.tobytes():
+                            h_full = ((h_full ^ _b) * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
+                        # Also hash just the rank-local valid window
+                        # ([0..kv_page_bytes_eff)) — what the apply
+                        # actually consumes under PRS=1.
+                        if per_rank_slice:
+                            valid = page0_full[:kv_page_bytes_eff]
+                        else:
+                            valid = page0_full
+                        h_valid = 0xcbf29ce484222325
+                        for _b in valid.tobytes():
+                            h_valid = ((h_valid ^ _b) * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
+                        # Tail probe: is bytes [16K..32K) of the slot
+                        # zeros (correct under PRS=1 with valid-window-
+                        # only writes), or is it populated (suggests
+                        # server is echoing full 32K)?
+                        if per_rank_slice:
+                            tail = page0_full[kv_page_bytes_eff:]
+                            tail_nz = int((tail != 0).sum())
+                        else:
+                            tail_nz = -1
+                        logger.info(
+                            "[diag-tp-sink] rank=%d per_rank_slice=%s "
+                            "page0[:32]=%s nonzero=%d/32 "
+                            "kv_page_bytes_eff=%s "
+                            "h_full=%016x h_valid=%016x tail_nonzero=%d",
+                            self._tp_rank,
+                            per_rank_slice,
+                            head_b.hex(),
+                            nonzero,
+                            kv_page_bytes_eff if per_rank_slice else "n/a",
+                            h_full, h_valid, tail_nz)
+                    except Exception as _e:
+                        logger.warning("[diag-tp-sink] dump failed: %r", _e)
                 if per_rank_slice:
                     # Sink slot is full-size but only the first
                     # kv_page_bytes_eff bytes hold valid data (this
@@ -4763,6 +4824,10 @@ class _Worker:
                 gv = [torch.empty_like(v_batch_gpu)
                       for _ in range(self._tp_size)]
                 _trace = os.environ.get("ICMS_NCCL_TRACE", "0") == "1"
+                _diag_order = (os.environ.get("ICMS_DIAG_HEAD_ORDER", "0") == "1"
+                               and not getattr(self, "_diag_head_order_fired", False))
+                if _diag_order:
+                    pre_hash = int(k_batch_gpu.contiguous().view(torch.uint8).sum().item())
                 if _trace:
                     torch.cuda.synchronize()
                 _t0 = time.perf_counter()
@@ -4773,6 +4838,32 @@ class _Worker:
                 if _trace:
                     torch.cuda.synchronize()
                 _us = (time.perf_counter() - _t0) * 1e6
+                if _diag_order:
+                    try:
+                        try:
+                            grp_rank_dist = dist.get_rank(group=dev_group)
+                        except Exception:
+                            grp_rank_dist = -1
+                        grp_rank_attr = getattr(tp_group, "rank_in_group", -1)
+                        per_rank_hashes = [
+                            int(t.contiguous().view(torch.uint8).sum().item())
+                            for t in gk
+                        ]
+                        head0_first = [
+                            int(gk[i].contiguous().view(-1).view(torch.uint8)[0].item())
+                            for i in range(self._tp_size)
+                        ]
+                        logger.info(
+                            "[icms-diag-head-order] self_tp_rank=%d "
+                            "tp_group.rank_in_group=%s dist.get_rank(dev_group)=%s "
+                            "pre_allgather_hash=%d gk_hashes=%s "
+                            "gk_head0_first_byte=%s layer=%d k_shape=%s",
+                            self._tp_rank, grp_rank_attr, grp_rank_dist,
+                            pre_hash, per_rank_hashes, head0_first,
+                            layer_idx, list(k_batch_gpu.shape))
+                    except Exception as _diag_e:
+                        logger.warning("[icms-diag-head-order] diag failed (non-fatal): %s", _diag_e)
+                    self._diag_head_order_fired = True
                 k_batch_gpu = torch.cat(gk, dim=2)
                 v_batch_gpu = torch.cat(gv, dim=2)
                 if _trace:
@@ -4893,6 +4984,32 @@ class _Worker:
                              rs.request_id, chain_head, absolute_pid,
                              group_idx, page_in_group, layer_idx,
                              len(k_bytes), len(v_bytes), kh, vh, khead)
+                # Per-rank-subset canary: hash the slice of key_block /
+                # value_block that EACH rank's apply read-side will see
+                # under PRS=1. key_block here has shape
+                # [block_size=16, num_kv_heads=4, head_dim=128]. Each
+                # rank's slice is heads [r*nkv_local, (r+1)*nkv_local).
+                # Direct-compare sub_sha against [diag-canary-read]
+                # k_sha at the same (layer, pid).
+                if self._tp_size > 1:
+                    nkv_local = (self._geom.num_kv_heads // self._tp_size)
+                    for _r in range(self._tp_size):
+                        _s = _r * nkv_local
+                        _sub_k = (key_block[:, _s:_s + nkv_local, :]
+                                  .contiguous().view(torch.uint8)
+                                  .numpy().tobytes())
+                        _sub_v = (value_block[:, _s:_s + nkv_local, :]
+                                  .contiguous().view(torch.uint8)
+                                  .numpy().tobytes())
+                        _sub_kh = hashlib.sha1(_sub_k).hexdigest()[:16]
+                        _sub_vh = hashlib.sha1(_sub_v).hexdigest()[:16]
+                        logger.info(
+                            "[diag-canary-write-rank] rid=%s abs_pid=%d "
+                            "layer=%d rank=%d k_sub_len=%d v_sub_len=%d "
+                            "k_sub_sha=%s v_sub_sha=%s k_sub_head=%s",
+                            rs.request_id, absolute_pid, layer_idx, _r,
+                            len(_sub_k), len(_sub_v),
+                            _sub_kh, _sub_vh, _sub_k[:32].hex())
 
         spb = geom.summary_page_bytes
         kpb = geom.kv_page_bytes
