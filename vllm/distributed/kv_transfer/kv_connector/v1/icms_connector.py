@@ -767,13 +767,16 @@ class IcmsConnector(KVConnectorBase_V1):
         Quest hooks call this at the top of their per-layer callback
         to short-circuit the Q-compute path entirely. Returns False
         when there are no active requests so we don't accidentally
-        suppress the very first Score of a new request."""
+        suppress the very first Score of a new request.
+
+        O(1) — reads the worker's memoized _cached_all_dense flag,
+        which is invalidated/recomputed at the three state-change
+        sites (on_step_start with new chains, the two flip sites,
+        on_request_finished). Pre-cache this iterated _requests every
+        call (×48 layers × N decode iters ≈ 2 ms/iter at high ctx)."""
         if self._worker is None:
             return False
-        reqs = getattr(self._worker, "_requests", None)
-        if not reqs:
-            return False
-        return all(getattr(rs, "dense_mode", False) for rs in reqs.values())
+        return bool(getattr(self._worker, "_cached_all_dense", False))
 
     def save_kv_layer(  # noqa: C901
         self,
@@ -1474,6 +1477,16 @@ class _Worker:
         # Per-request state (C1 worker-side cache).
         self._requests: dict[str, _RequestState] = {}
 
+        # Memoized "all active rs are in dense_mode" — checked O(1) by the
+        # per-layer hooks (wait_for_layer, Quest hook's
+        # is_dense_for_active_request) instead of iterating self._requests
+        # each call. Iterating per layer (×48) per iter (×N decode tokens)
+        # measured at ~2 ms/iter on Qwen3-30B-A3B at 131k ctx — that was
+        # the residual gap between sparse decode and pure dense baseline.
+        # Cache invalidated at three sites: on_step_start (new request),
+        # the two flip sites (line ~2664, ~3046), and on_request_finished.
+        self._cached_all_dense: bool = False
+
         # Persistent chain cache: survives request eviction so Quest hooks
         # can find the chain even after request_finished runs.
         self._last_chain_for_rid: dict[str, list[int]] = {}
@@ -1993,6 +2006,11 @@ class _Worker:
         # Reset prefill_done when a new request arrives (new chain delivered).
         if meta.new_chains:
             self._prefill_done = False
+            # Invalidate the all-dense cache: a new request always starts
+            # with rs.dense_mode=False, so the answer is necessarily False
+            # until the new rs flips. Avoids needing a recompute (we know
+            # the answer without iterating).
+            self._cached_all_dense = False
             for rid in meta.new_chains.keys():
                 self._ttft_reset(rid, t_step)
         # ICMS_DIAG_FULL: bump _post_dense_iter at the start of each
@@ -2652,23 +2670,45 @@ class _Worker:
                         rid, next_layer_idx, rs._dense_skip_count)
             return
         already_fetched = rs.fetched_pages.get(next_layer_idx, set())
-        if is_decode and len(already_fetched) >= total_pages:
-            # Saturated. Without explicitly flipping dense_mode here, the
-            # natural flip at line ~2914 won't fire (it requires a Score
-            # reply with 0 new pages — but with this early-return, Score
-            # never even runs). That leaves Quest hooks + _score_one_request
-            # firing every stride per decode iter as no-ops, which is real
-            # overhead. Once dense_mode flips, the Quest hook short-
-            # circuits at quest_hooks.py:458 and wait_for_layer hits the
-            # cheaper all_dense early-return which also clears _active.
+        # Configurable flip threshold (2026-05-01). Default 1.0 = full
+        # saturation (legacy). Set ICMS_DENSE_FLIP_FRAC=B (0<B<=1) to flip
+        # once per-layer fetched_pages reaches B*total. Intended for the
+        # sparse-decode case: combine with ICMS_DECODE_APPLY=0 so the
+        # leftover trimmed bt from prefill apply persists post-flip and
+        # decode reads a partial-context KV (≈B fraction). For mode (c)
+        # (DECODE_APPLY=1) early flip is INCORRECT — natural-bt attention
+        # post-flip reads unpopulated blocks. Stay at default 1.0 there.
+        try:
+            _flip_frac = float(os.environ.get("ICMS_DENSE_FLIP_FRAC", "1.0"))
+        except ValueError:
+            _flip_frac = 1.0
+        _flip_frac = max(0.0, min(_flip_frac, 1.0))
+        _flip_threshold = int(total_pages * _flip_frac)
+        if _flip_frac < 1.0 and _flip_threshold < 1:
+            _flip_threshold = 1
+        if is_decode and len(already_fetched) >= _flip_threshold:
+            # Threshold reached (default = full saturation). Once dense_mode
+            # flips, the Quest hook short-circuits at quest_hooks.py:458 and
+            # wait_for_layer takes the cheaper early-return path
+            # (DECODE_APPLY=0 short-circuit at line 3220-3221, OR all-dense
+            # clear at 3246-3264 for DECODE_APPLY=1). With APPLY=0 the
+            # leftover trimmed bt persists → genuine sparse decode.
             if not rs.dense_mode:
                 rs.dense_mode = True
                 rs._post_dense_iter = 0
+                # Recompute the cached all-dense flag now that this rs
+                # flipped. With max_num_seqs=1 typical case is a single rs
+                # → cache becomes True immediately. Cheaper to recompute
+                # here (once per flip) than to iterate _requests in every
+                # per-layer hook call (×48 layers ×N decode iters).
+                self._cached_all_dense = (bool(self._requests) and all(
+                    getattr(r, "dense_mode", False)
+                    for r in self._requests.values()))
                 logger.info(
                     "[icms] dense_mode flip rid=%s layer=%d "
-                    "(saturated: fetched=%d total=%d)",
+                    "(fetched=%d total=%d threshold=%d frac=%.3f)",
                     rid, next_layer_idx, len(already_fetched),
-                    total_pages)
+                    total_pages, _flip_threshold, _flip_frac)
                 if os.environ.get("ICMS_DIAG_FULL") == "1":
                     self._diag_full_dense_flip_snapshot(rs, next_layer_idx)
             return
@@ -3047,6 +3087,11 @@ class _Worker:
                 # Mark the request as just-flipped so the next forward
                 # pass logs full metadata (gated by ICMS_DIAG_FULL=1).
                 rs._post_dense_iter = 0
+                # Recompute the all-dense cache (paired with the
+                # saturation-flip site above and on_step_start invalidate).
+                self._cached_all_dense = (bool(self._requests) and all(
+                    getattr(r, "dense_mode", False)
+                    for r in self._requests.values()))
                 # Track decode-iter at which the flip fired (1-based).
                 # Counter is bumped in `wait_for_pending_writes` (called
                 # once per forward = once per decode token after prefill).
@@ -3155,6 +3200,23 @@ class _Worker:
         independently. Original values are saved for restoration in
         restore_attn_metadata.
         """
+        # Fast path: once every active rs is dense_mode AND DECODE_APPLY=0,
+        # no Score RPCs are pending and decode is meant to be sparse over
+        # the leftover trimmed bt from the last prefill stride. Skip the
+        # lock + dict-pop + diag block (was ~50 µs × 48 layers × N decode
+        # iters post-flip on Qwen3-30B-A3B at 131k = ~2 ms/iter — the
+        # residual gap between sparse decode and pure dense baseline).
+        # Restricted to DECODE_APPLY=0 because for DECODE_APPLY=1 (mode c)
+        # the existing path at line 3246-3264 clears icms_fetch_state on
+        # the all-dense check — that clear is required so attention falls
+        # back to natural-bt full-context dense (post-saturation, all
+        # pages are populated from incremental apply). Skipping the clear
+        # in mode (c) would leave a stale trimmed bt and corrupt
+        # attention for layers that didn't set their own state.
+        if (self._cached_all_dense
+                and os.environ.get("ICMS_DECODE_APPLY") == "0"
+                and self._prefill_done):
+            return
         with self._score_lock:
             per_request = self._pending_scores.pop(layer_name, None)
 
@@ -4368,6 +4430,19 @@ class _Worker:
                 logger.info("Prefill done. Switching to dense decode.")
             return
 
+        # M4-A all-dense gate: once every active request has flipped to
+        # dense_mode, the bitmap is saturated for each rs — no downstream
+        # Score will reference future decode-token KV. Skip the extract +
+        # flush closure (and the BLOCK_WRITES drain) entirely. Removes
+        # the ~33 ms decode-iter spikes at every 16-token page boundary
+        # (extract_and_record GPU→CPU + record_page × num_layers +
+        # WriteGroup RPC). Decode-token write-back is parked pending a
+        # multi-turn-reuse harness (see project_icms_decode_m3_status).
+        if (self._prefill_done
+                and all(getattr(rs, "dense_mode", False)
+                        for rs in self._requests.values())):
+            return
+
         # Snapshot references that the background task needs. The KV
         # cache tensors and request state are expected to remain valid
         # until on_request_finished drains the pipeline.
@@ -4399,11 +4474,28 @@ class _Worker:
         # out at 60s). Set ICMS_BLOCK_WRITES=0 to override.
         _block_default = "1" if self._tp_size > 1 else "0"
         if os.environ.get("ICMS_BLOCK_WRITES", _block_default) == "1":
+            # Drain timeout configurable (2026-05-01). Default raised from
+            # 60s → 180s: Llama-3.1-8B (32 layers × 8 KV heads × 128k ctx)
+            # generates 16+ GiB of WriteGroup traffic per prefill, which
+            # at the link's effective ~2-4 GiB/s takes well over 60s. Pre-
+            # fix the drain timed out, returned without finishing the
+            # pipeline AllGather, and the next iter's main-thread forward
+            # collided with the still-running pipeline thread on the same
+            # NCCL group → shm_broadcast hang → sample_tokens RPC timeout
+            # → EngineDeadError. Mirrors the existing 90 s timeout in
+            # on_request_finished but with more headroom for larger
+            # models. Set ICMS_BLOCK_WRITES_DRAIN_TIMEOUT_S to override.
             try:
-                drained = self._write_pipeline.drain(timeout=60.0)
+                _drain_timeout_s = float(os.environ.get(
+                    "ICMS_BLOCK_WRITES_DRAIN_TIMEOUT_S", "180.0"))
+            except ValueError:
+                _drain_timeout_s = 180.0
+            try:
+                drained = self._write_pipeline.drain(timeout=_drain_timeout_s)
                 if not drained:
                     logger.warning(
-                        "ICMS_BLOCK_WRITES drain timed out (60s)")
+                        "ICMS_BLOCK_WRITES drain timed out (%.1fs)",
+                        _drain_timeout_s)
             except Exception:
                 logger.exception("ICMS_BLOCK_WRITES drain failed")
 
@@ -5045,6 +5137,20 @@ class _Worker:
 
     def _flush_group(self, request_id: str, group_idx: int, partial: bool = False):
         """Issue WriteGroup for a completed (or partial) group buffer."""
+        # Diag (2026-05-02): ICMS_SKIP_WRITES=1 short-circuits the
+        # WriteGroup RPC entirely. Used to disambiguate whether a
+        # server-side LOC_LEN_ERR occurs on a write-path SEND
+        # (WriteGroup ACK) or a read-path SEND (Score reply / FetchAll).
+        # Also lets us measure decode-only TPOT without Phase-2 KV
+        # persistence — the prefix won't be reusable across sweeps but
+        # the in-flight request still sees correct attention because
+        # apply scattered the K pages into vLLM's local kv_cache before
+        # WriteGroup fires.
+        if os.environ.get("ICMS_SKIP_WRITES") == "1":
+            rs = self._requests.get(request_id)
+            if rs is not None:
+                rs.active_group_buffers.pop(group_idx, None)
+            return
         # BUG-N13 Phase 1 diag: catch the early-return paths.
         _diag_n13 = os.environ.get("ICMS_DIAG_N13", "0") == "1"
         rs = self._requests.get(request_id)
@@ -5239,6 +5345,12 @@ class _Worker:
         # Now pop the request state and reset prefill_done.
         self._requests.pop(request_id, None)
         self._prefill_done = False
+        # Recompute the all-dense cache after removing this rs. With
+        # max_num_seqs=1 _requests is now empty and the cache becomes
+        # False (no active rs to be dense for).
+        self._cached_all_dense = (bool(self._requests) and all(
+            getattr(r, "dense_mode", False)
+            for r in self._requests.values()))
         # KV data is NOT evicted — it persists for prefix reuse by
         # subsequent requests. Eviction is managed by the server's LRU
         # when capacity is full.
