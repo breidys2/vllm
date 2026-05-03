@@ -491,6 +491,14 @@ class _RequestState:
     # decode iters once M3 wires the decode hooks. Use _pack_fetch_bitmap
     # to encode for the wire suffix.
     fetched_pages: dict = field(default_factory=dict)
+    # ICMS_ORIGINAL_QUEST=1 only: per-layer GPU-side K-min/K-max summary
+    # stack, populated incrementally as pages are staged during prefill.
+    # Shape per layer: dict[layer_idx -> tuple[Tensor, Tensor]] where each
+    # Tensor is [P_so_far, num_kv_heads, head_dim] fp16. Replaces the
+    # BF2-side summary store for the local Quest scorer. Empty (and
+    # untouched) when ICMS_ORIGINAL_QUEST is unset — no impact on the
+    # default path. See quest_local_scorer.py.
+    quest_gpu_summaries: dict = field(default_factory=dict)
     # M4: once a decode-mode Score reply yields 0 net-new pages for any
     # stride group, the bitmap is effectively saturated — flip the
     # request into dense mode and skip all further Score RPCs / Quest
@@ -676,6 +684,11 @@ class IcmsConnector(KVConnectorBase_V1):
         self._rdma_server_host: str = extra.get("icms_server_host", "sprc01")
         self._rdma_port: int = int(extra.get("icms_rdma_port", 18515))
         self._rdma_ib_dev: str = extra.get("icms_ib_dev", "mlx5_0")
+        # In-process POSIX shmem transport (alt to AF_UNIX). When set,
+        # the connector instantiates ShmemIcmsClient instead of IcmsClient
+        # and ignores _socket_path. Mutually exclusive with --rdma — the
+        # accuracy bench plumbs this via --inprocess-icms.
+        self._shmem_name: str = extra.get("icms_shmem_name", "")
         # GPUDirect RDMA: server writes KV directly into GPU HBM.
         self._gpu_direct: bool = bool(extra.get("icms_gpu_direct", False))
         self._gpu_device: str = extra.get("icms_gpu_device", "cuda:0")
@@ -723,6 +736,7 @@ class IcmsConnector(KVConnectorBase_V1):
                 gpu_direct=self._gpu_direct,
                 gpu_device=self._gpu_device,
                 fetch_all_post_score=self._fetch_all_post_score,
+                shmem_name=self._shmem_name,
             )
 
     # ══════════════════════════════════════════════════════════════════════
@@ -1361,7 +1375,8 @@ class _Worker:
                  rdma_ib_dev: str = "mlx5_0",
                  gpu_direct: bool = False,
                  gpu_device: str = "cuda:0",
-                 fetch_all_post_score: bool = False):
+                 fetch_all_post_score: bool = False,
+                 shmem_name: str = ""):
         self._socket_path = socket_path
         self._use_rdma = use_rdma
         self._rdma_server_host = rdma_server_host
@@ -1369,6 +1384,7 @@ class _Worker:
         self._rdma_ib_dev = rdma_ib_dev
         self._gpu_direct = gpu_direct
         self._gpu_device = gpu_device
+        self._shmem_name = shmem_name  # non-empty → use ShmemIcmsClient
         self._model_name = model_name
         self._k = k
         # FAPS gate. Take the connector-init value (kv_connector_extra_config),
@@ -1584,6 +1600,10 @@ class _Worker:
             )
             self._client = RdmaIcmsClient(cfg)
             transport_desc = f"rdma://{self._rdma_server_host}:{self._rdma_port}"
+        elif self._shmem_name:
+            from icms_client.shmem_client import ShmemIcmsClient
+            self._client = ShmemIcmsClient(self._shmem_name)
+            transport_desc = f"shmem:/dev/shm/{self._shmem_name}"
         else:
             self._client = IcmsClient(self._socket_path)
             transport_desc = self._socket_path
@@ -1628,6 +1648,9 @@ class _Worker:
                 # left dangling RDMA state after a failed connect.
                 if self._use_rdma:
                     self._client = RdmaIcmsClient(cfg)
+                elif self._shmem_name:
+                    from icms_client.shmem_client import ShmemIcmsClient
+                    self._client = ShmemIcmsClient(self._shmem_name)
                 else:
                     self._client = IcmsClient(self._socket_path)
                 # Backoff with jitter on tp_rank so retries don't re-collide.
@@ -2713,6 +2736,18 @@ class _Worker:
                     self._diag_full_dense_flip_snapshot(rs, next_layer_idx)
             return
 
+        # ICMS_ORIGINAL_QUEST=1 — isolated branch. Replaces the BF2 Score
+        # RPC with a local per-(KV-head) Quest scorer running directly on
+        # the GPU-side summaries we retained in record_page(). Default
+        # path is byte-identical when env is unset; the rest of this
+        # method (adaptive budget, Q AllGather, RPC fire, reply handling)
+        # is skipped via the early `return` at the end of this branch.
+        if os.environ.get("ICMS_ORIGINAL_QUEST", "0") == "1":
+            self._quest_local_score_one_layer(
+                rid, rs, next_layer_idx, quest_query, budget,
+                total_pages, already_fetched)
+            return
+
         # Determine effective budget: adaptive allocator or static.
         effective_budget = budget
         budget_source = "static"
@@ -3174,6 +3209,83 @@ class _Worker:
                 False, [], next_layer_idx,
             )
             logger.debug("Score failed layer %d: %s", next_layer_idx, e)
+
+    def _quest_local_score_one_layer(self, rid, rs, next_layer_idx,
+                                      quest_query, budget,
+                                      total_pages, already_fetched):
+        """ICMS_ORIGINAL_QUEST=1 path: per-(KV-head) Quest top-K over
+        GPU-side summaries, union → fetched_pages. No BF2 Score RPC, no
+        adaptive allocator, no Q AllGather (TP=1 only). Isolated entry-
+        point so the default path is unaffected.
+
+        Stats: emitted in the same shape as the BF2 path so downstream
+        analysis (icms_perf_sweep, accuracy bench) sees a Score event
+        with the picked page IDs and a wall-time micro-measurement.
+        """
+        from vllm.distributed.kv_transfer.kv_connector.v1.quest_local_scorer \
+            import quest_score_local_chunked
+
+        # Mirror the default-path's input validation (icms_connector.py:2563)
+        # — quest_query may be None or a non-Tensor when the caller doesn't
+        # have one for this request slice. Skipping is the safe behavior:
+        # downstream apply machinery just sees an empty fetched_pages
+        # update and falls back to dense attention over what's already there.
+        if not isinstance(quest_query, torch.Tensor) or quest_query.ndim < 2:
+            return
+
+        if self._tp_size > 1:
+            if not getattr(self, "_quest_tp_warned", False):
+                logger.warning(
+                    "[icms_quest] ICMS_ORIGINAL_QUEST=1 currently supports "
+                    "TP=1 only; got tp_size=%d. Falling through to a no-op "
+                    "(no Score, no fetched pages added).", self._tp_size)
+                self._quest_tp_warned = True
+            return
+
+        per_layer = rs.quest_gpu_summaries.get(next_layer_idx)
+        if not per_layer:
+            # Summaries not yet materialized for this layer (first prefill
+            # pass before record_page fires). Nothing to score.
+            return
+
+        # Stack summaries into [P, H_kv, D] tensors, ordered by absolute pid.
+        # Note: per_layer is appended to in record_page order; sort to be
+        # safe against any out-of-order staging. P is bounded by total_pages.
+        items = sorted(per_layer, key=lambda t: t[0])
+        # Truncate to total_pages (defensive: stale entries from prior
+        # requests under request_id reuse shouldn't appear, but guard).
+        items = items[:total_pages]
+        if not items:
+            # Defensive: total_pages truncation could leave us empty even
+            # after the per_layer non-empty check. Skip silently.
+            return
+        kmin = torch.stack([m for _, m, _ in items], dim=0)  # [P, H_kv, D]
+        kmax = torch.stack([m for _, _, m in items], dim=0)
+        # Quest top-K page budget. Mirror the existing path's k formula:
+        # k = floor(total_pages * budget), at least 1.
+        k = max(1, int(total_pages * float(budget)))
+
+        t0 = time.perf_counter()
+        try:
+            picked = quest_score_local_chunked(
+                quest_query, kmin, kmax, k=k,
+                num_kv_heads=kmin.shape[1],
+                exclude_pages=already_fetched)
+        except Exception as e:
+            logger.warning("[icms_quest] scorer failed at layer %d: %s",
+                           next_layer_idx, e)
+            picked = []
+        wall_us = (time.perf_counter() - t0) * 1e6
+
+        rs.fetched_pages.setdefault(next_layer_idx, set()).update(picked)
+        # Match the existing Score-stats shape so downstream tooling
+        # doesn't have to special-case the Quest path.
+        self.stats.record_score(wall_us, bool(picked), picked, next_layer_idx)
+        logger.debug(
+            "[icms_quest] layer=%d total_pages=%d k=%d new=%d "
+            "fetched_so_far=%d wall_us=%.1f",
+            next_layer_idx, total_pages, k, len(picked),
+            len(rs.fetched_pages.get(next_layer_idx, set())), wall_us)
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Stash GPU KV cache tensors for Path B reordered block table."""
@@ -5127,6 +5239,21 @@ class _Worker:
             rank = geom.scored_rank(layer_idx)
             s_off = rank * geom.summary_group_bytes + page_in_group * spb
             buf.summary_blob[s_off:s_off + len(summary_bytes)] = summary_bytes
+
+        # ICMS_ORIGINAL_QUEST: also retain GPU-side per-(KV-head) summaries
+        # for *every* layer (not just scored ones), shape [num_kv_heads,
+        # head_dim] fp16, indexed by absolute page id. Used by the local
+        # Quest scorer in lieu of the BF2-side summary store. Gated by env
+        # so the default path is byte-identical when unset.
+        if os.environ.get("ICMS_ORIGINAL_QUEST", "0") == "1":
+            keys_gpu = key_block.detach()
+            if keys_gpu.ndim == 3:
+                # [block_size, num_kv_heads, head_dim] → reduce over tokens
+                kmin_gpu = keys_gpu.amin(dim=0).to(torch.float16)
+                kmax_gpu = keys_gpu.amax(dim=0).to(torch.float16)
+                abs_pid = group_idx * _GROUP_BLOCKS + page_in_group
+                rs.quest_gpu_summaries.setdefault(layer_idx, []).append(
+                    (abs_pid, kmin_gpu, kmax_gpu))
 
         buf.filled.add((layer_idx, page_in_group))
         # NOTE: no inline flush on completion. Flushing is deferred to
