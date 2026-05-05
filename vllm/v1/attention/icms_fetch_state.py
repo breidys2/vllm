@@ -15,7 +15,17 @@ import torch
 
 @dataclass
 class IcmsFetchState:
-    """Active fetch state for one layer's attention."""
+    """Active fetch state for one layer's attention.
+
+    Shape contract:
+      block_table: [N, max_k]  — N rids in the batch, padded to max trim length
+      seq_lens:    [N]          — per-rid effective seq_len (post-trim)
+      max_seq_len: int          — max(seq_lens)
+    For the legacy single-rid path (ICMS_ALLOW_BATCH unset / N==1) shapes
+    are [1, k+c] and [1]. Under ICMS_ALLOW_BATCH=1 with batch>=2, the
+    aggregator in icms_connector.wait_for_layer produces a multi-row state
+    in one set_active() call per layer.
+    """
     key_cache: torch.Tensor
     value_cache: torch.Tensor
     block_table: torch.Tensor

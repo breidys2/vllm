@@ -883,6 +883,14 @@ class FlashAttentionImpl(AttentionImpl):
         # The connector sets icms_fetch_state before each layer's attention
         # with a trimmed block_table containing only selected context pages
         # + continuation blocks.
+        #
+        # Shape contract:
+        #   - Single-rid path (legacy):       block_table [1, k+c], seq_lens [1]
+        #   - Multi-rid path (ICMS_ALLOW_BATCH=1, N>=2):
+        #         block_table [num_reqs, max_blocks], seq_lens [num_reqs]
+        # FA reads block_table[req_idx] and stops at seq_lens[req_idx], so
+        # both shapes work without backend changes — non-ICMS rids keep
+        # their natural rows in the multi-rid combined tensor.
         from vllm.v1.attention import icms_fetch_state as _icms_mod
         _icms_state = _icms_mod.get_active()
         _use_cascade = attn_metadata.use_cascade and _icms_state is None

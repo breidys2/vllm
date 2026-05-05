@@ -116,6 +116,25 @@ except ImportError:
 _SINK_SLOTS = 4           # C8: number of pre-allocated sink slots
 _GROUP_BLOCKS = GROUP_PAGES  # blocks per group (= pages per group = 32)
 
+
+def _allow_batch() -> bool:
+    """ICMS_ALLOW_BATCH=1 gates the multi-rid (N>=2) batching path.
+
+    When unset (default), the connector behaves exactly as the
+    single-request implementation: per-rid `set_active`, first-rid-only
+    extract, global `_skip_extract`. When set:
+      - wait_for_layer aggregates per-rid trimmed states into one
+        multi-row IcmsFetchState per layer (see icms_fetch_state.py).
+      - extract_and_record walks every active rid (per-layer single
+        AllGather at TP>1).
+      - _skip_extract becomes a per-rid set, not a global bool.
+
+    The flag is read fresh on each call so tests can flip it without a
+    process restart. See docs/icms_vllm_integration_audit_2026-05-05.md
+    for the Phase A landing plan.
+    """
+    return os.environ.get("ICMS_ALLOW_BATCH") == "1"
+
 # TP sharding: each rank prefixes its chain with a rank-tagged sentinel so
 # server-side trie entries never collide across ranks. At TP=1 this adds
 # one no-op level to the trie; wire and scoring behavior are unchanged.
@@ -1541,7 +1560,18 @@ class _Worker:
         # The context is already stored — no need to re-extract on the
         # critical TTFT path.  Set in on_step_start when stored chains
         # exist for the incoming request.
+        # Legacy (single-rid path): a global bool — extract is skipped
+        # iff EVERY active rid in the step is skip-extract. Conservative
+        # but correct.
+        # Multi-rid path (ICMS_ALLOW_BATCH=1): a per-rid set replaces
+        # the global gate inside extract_and_record. The bool is still
+        # populated for the legacy single-rid path.
         self._skip_extract: bool = False
+        self._skip_extract_rids: set[str] = set()
+        # Stash of the most recent IcmsConnectorMetadata.requests so the
+        # multi-rid extract path can map batch row index → rid without
+        # threading an extra arg through extract_and_record.
+        self._last_step_requests: list = []
 
 
         # Pending notifications for the scheduler (stored chain info).
@@ -2126,6 +2156,10 @@ class _Worker:
         active_rids = set(meta.new_chains) | set(self._requests)
         self._skip_extract = bool(active_rids) and active_rids.issubset(
             meta.skip_extract_rids)
+        # Multi-rid path uses a per-rid set instead of the global gate.
+        self._skip_extract_rids = set(meta.skip_extract_rids)
+        # Stash for extract_and_record's batch-order walk.
+        self._last_step_requests = list(meta.requests)
         # BUG-N13 Phase 1 diag: per-step skip_extract decision trace.
         # Toggle with ICMS_DIAG_N13=1.
         if os.environ.get("ICMS_DIAG_N13", "0") == "1":
@@ -3486,6 +3520,14 @@ class _Worker:
                     spin_us,
                 )
 
+        # Multi-rid batching path (ICMS_ALLOW_BATCH=1 + N>=2): collect
+        # per-rid IcmsFetchStates without firing set_active inside the
+        # loop, then aggregate into one multi-row state and fire
+        # set_active ONCE per layer. The single-rid path (legacy) still
+        # calls set_active inside _apply_selective_attention as before.
+        _use_batch_path = _allow_batch() and len(per_request) >= 2
+        _captures: list | None = [] if _use_batch_path else None
+
         total_k_pages = 0
         for rid, (reply, req_idx) in per_request.items():
             if reply is None or not reply.page_ids:
@@ -3493,7 +3535,8 @@ class _Worker:
             try:
                 t_apply_start = time.perf_counter()
                 self._apply_selective_attention(
-                    layer_name, reply, req_idx, rid)
+                    layer_name, reply, req_idx, rid,
+                    _capture=_captures)
                 apply_us = (time.perf_counter() - t_apply_start) * 1e6
                 self._ttft_add(
                     rid,
@@ -3533,6 +3576,12 @@ class _Worker:
                     return
                 raise
 
+        # Aggregate per-rid captures into one multi-row IcmsFetchState
+        # and fire set_active once. Skipped when no rids produced a
+        # capture (all replies empty / all rids errored soft-fail).
+        if _use_batch_path and _captures:
+            self._aggregate_and_set_fetch_state(layer_name, _captures)
+
         # Record per-layer breakdown for TTFT analysis.
         t_layer_end = time.perf_counter()
         layer_idx = self._extract_layer_idx(layer_name)
@@ -3566,6 +3615,71 @@ class _Worker:
                     (t_layer_end - (entry["t_step_start"] if entry else t_layer_start)) * 1e3,
                     len(reply.page_ids))
 
+    def _aggregate_and_set_fetch_state(self, layer_name: str,
+                                       captures: list) -> None:
+        """Stack per-rid IcmsFetchStates into one multi-row state.
+
+        captures: list of (req_idx, IcmsFetchState) tuples produced by
+        _apply_selective_attention(_capture=[...]) under the multi-rid
+        batching path (ICMS_ALLOW_BATCH=1, N>=2).
+
+        Strategy:
+          1. Start from the natural attn_metadata.block_table
+             (shape [num_reqs, max_blocks_natural]) and seq_lens
+             (shape [num_reqs]). Clone so we don't mutate vLLM's tensors.
+          2. For each captured rid, overwrite the first len(trim_row)
+             positions of combined_bt[req_idx] with the trim row. The
+             tail of that row keeps natural values, but FA stops at
+             seq_lens[req_idx] so they're never read.
+          3. Override seq_lens[req_idx] with the trim seq_len.
+          4. max_seq_len = natural max (trim seq_lens are <= natural,
+             so the natural max is a safe upper bound for FA's tile
+             scheduler).
+        Single-rid path (no aggregation) is untouched.
+        """
+        from vllm.v1.attention import icms_fetch_state
+        am = (self._attn_metadata.get(layer_name)
+              if isinstance(self._attn_metadata, dict) else None)
+        if am is None or not hasattr(am, "block_table"):
+            # Fallback: no natural metadata → set the first capture only
+            # (degrades to legacy single-rid behavior for this layer).
+            icms_fetch_state.set_active(captures[0][1])
+            return
+        natural_bt = am.block_table
+        natural_sl = am.seq_lens
+        # Clone so we don't mutate the engine's tensors. Both are GPU
+        # int32 typically; .clone() preserves dtype/device.
+        combined_bt = natural_bt.clone()
+        combined_sl = natural_sl.clone()
+        # Per-row override.
+        for req_idx, state in captures:
+            trim_row = state.block_table  # [1, k+c] tensor
+            if trim_row.dim() == 2:
+                trim_row = trim_row[0]
+            k_plus_c = int(trim_row.shape[0])
+            if (req_idx < combined_bt.shape[0]
+                    and k_plus_c <= combined_bt.shape[1]):
+                combined_bt[req_idx, :k_plus_c] = trim_row
+            trim_sl = state.seq_lens
+            if trim_sl.dim() >= 1:
+                trim_sl_val = trim_sl[0]
+            else:
+                trim_sl_val = trim_sl
+            if req_idx < combined_sl.shape[0]:
+                combined_sl[req_idx] = trim_sl_val
+        # Use natural max — safe upper bound for tile scheduling, and
+        # avoids a host sync vs. .max().item() on combined_sl.
+        max_seq_len = int(getattr(am, "max_seq_len", 0))
+        # KV pointers are per-layer constants; all captures share them.
+        head_state = captures[0][1]
+        icms_fetch_state.set_active(icms_fetch_state.IcmsFetchState(
+            key_cache=head_state.key_cache,
+            value_cache=head_state.value_cache,
+            block_table=combined_bt,
+            seq_lens=combined_sl,
+            max_seq_len=max_seq_len,
+        ))
+
     def _get_sink_pages(self, sink, kv_page_bytes: int):
         """Cached `sink_pages` view of the entire sink as [N, page_bytes].
 
@@ -3582,13 +3696,21 @@ class _Worker:
         return sink_pages
 
     def _apply_selective_attention(self, layer_name: str, reply,
-                                   req_idx: int, rid: str = ""):
+                                   req_idx: int, rid: str = "",
+                                   _capture: list | None = None):
         # ICMS_SKIP_APPLY=1: skip the apply entirely (no scatter, no
         # bt override). Used to isolate whether the apply is the cause
         # of warm-prefix corruption — if run 2 still fails with apply
         # disabled, the bug is elsewhere (e.g., Quest hooks or save_kv).
         if os.environ.get("ICMS_SKIP_APPLY") == "1":
             return None
+        # _capture: when not None, multi-rid batching path. Append the
+        # would-be-set IcmsFetchState here as (req_idx, key_cache,
+        # value_cache, new_bt, new_sl, new_seq_len) and skip the actual
+        # set_active() call so the caller can aggregate per-rid states
+        # into one multi-row state per layer. KV scatter side effects
+        # (main_key.index_copy_) still happen — only set_active is
+        # deferred.
         # Per-line wall-time instrumentation, gated by ICMS_LINE_TIMING=1.
         # Captures the Python-side wall time of every step including
         # H2D tensor creations, dict/list ops, and tensor casts. Used
@@ -3781,13 +3903,17 @@ class _Worker:
 
                 if os.environ.get("ICMS_SKIP_BT_OVERRIDE") != "1":
                     from vllm.v1.attention import icms_fetch_state
-                    icms_fetch_state.set_active(icms_fetch_state.IcmsFetchState(
+                    _state_fast = icms_fetch_state.IcmsFetchState(
                         key_cache=main_key,
                         value_cache=main_value,
                         block_table=rs._apply_cached_new_bt,
                         seq_lens=rs._apply_cached_new_sl,
                         max_seq_len=rs._apply_cached_max_seq_len,
-                    ))
+                    )
+                    if _capture is not None:
+                        _capture.append((req_idx, _state_fast))
+                    else:
+                        icms_fetch_state.set_active(_state_fast)
                 return True
 
         # ── Fetch selected pages' KV from ICMS sink → GPU blocks ──
@@ -4448,13 +4574,17 @@ class _Worker:
         # correctness during debugging.
         if os.environ.get("ICMS_SKIP_BT_OVERRIDE") != "1":
             from vllm.v1.attention import icms_fetch_state
-            icms_fetch_state.set_active(icms_fetch_state.IcmsFetchState(
+            _state_slow = icms_fetch_state.IcmsFetchState(
                 key_cache=main_key,
                 value_cache=main_value,
                 block_table=new_bt,
                 seq_lens=new_sl,
                 max_seq_len=new_seq_len,
-            ))
+            )
+            if _capture is not None:
+                _capture.append((req_idx, _state_slow))
+            else:
+                icms_fetch_state.set_active(_state_slow)
         _lt("after_set_active")
 
         # Populate the per-stride apply cache for the next reuse layers.
@@ -4859,7 +4989,12 @@ class _Worker:
         # on_step_start when every active request's stored prefix
         # already covers its complete-group count. Symmetric across TP
         # ranks because it's derived from broadcast metadata.
-        if self._skip_extract:
+        # Multi-rid path (ICMS_ALLOW_BATCH=1): the global short-circuit
+        # is too coarse — one non-skip rid in a batch should not force
+        # extract for the skip-eligible rids. Skip the early-return
+        # here; the plan-builder below filters per-rid via
+        # self._skip_extract_rids instead.
+        if self._skip_extract and not _allow_batch():
             if _diag_n13:
                 logger.info("[diag-extract] rank=%d layer=%s SKIP=N2_skip_extract",
                             self._tp_rank, layer_name)
@@ -4916,7 +5051,6 @@ class _Worker:
         # Block size from the KV cache tensor.
         block_size = k_cache.shape[1]
 
-        # With batch=1 (C3), process only the first request.
         # block_table may be a tensor on GPU; move to CPU for indexing.
         if isinstance(block_table, torch.Tensor):
             bt_cpu = block_table.cpu()
@@ -4927,19 +5061,48 @@ class _Worker:
         else:
             sl_cpu = seq_lens
 
-        # Find the first active request.
-        rid = None
-        rs = None
-        for r, s in self._requests.items():
-            rid = r
-            rs = s
-            break
-        if rs is None or not rs.chain:
+        # Build the per-rid plan. Single-rid path (legacy): only the
+        # first active request, row 0. Multi-rid path (ICMS_ALLOW_BATCH
+        # =1): walk batch positions in self._last_step_requests order
+        # so both TP ranks symmetrically reach every collective.
+        plan: list = []  # list of (rid, rs, req_idx_in_bt)
+        if _allow_batch() and self._last_step_requests:
+            for batch_idx, prs in enumerate(self._last_step_requests):
+                rid_i = prs.request_id
+                if rid_i in self._skip_extract_rids:
+                    continue
+                rs_i = self._requests.get(rid_i)
+                if rs_i is None or not rs_i.chain:
+                    continue
+                plan.append((rid_i, rs_i, batch_idx))
+        else:
+            # Legacy: first active request, row 0.
+            for r, s in self._requests.items():
+                if s is None or not s.chain:
+                    continue
+                plan.append((r, s, 0))
+                break
+        if not plan:
             return
 
-        # Number of blocks for this request.
-        if hasattr(sl_cpu, '__len__') and len(sl_cpu) > 0:
-            seq_len = int(sl_cpu[0]) if isinstance(sl_cpu[0], (int, float, torch.Tensor)) else 0
+        # Process each rid's new blocks. At TP>1, AllGather fires once
+        # per rid (per layer); both ranks iterate plan in identical
+        # order (derived from broadcast metadata) so collective ordering
+        # is symmetric. Future optimization: stack per-rid K/V then
+        # AllGather once per layer (Phase B).
+        for rid, rs, bt_row_idx in plan:
+            self._extract_one_rid(layer_idx, layer_name, k_cache, v_cache,
+                                  bt_cpu, sl_cpu, block_size, rid, rs,
+                                  bt_row_idx, t0)
+        return
+
+    def _extract_one_rid(self, layer_idx, layer_name, k_cache, v_cache,
+                         bt_cpu, sl_cpu, block_size, rid, rs, bt_row_idx,
+                         t0):
+        # Number of blocks for this rid.
+        if hasattr(sl_cpu, '__len__') and len(sl_cpu) > bt_row_idx:
+            seq_len = int(sl_cpu[bt_row_idx]) if isinstance(
+                sl_cpu[bt_row_idx], (int, float, torch.Tensor)) else 0
         else:
             seq_len = 0
         if seq_len <= 0:
@@ -4949,7 +5112,7 @@ class _Worker:
         # BUG-N1 fix: under prefix elision (TP>1 + ICMS), vLLM only
         # allocates the trailing slice of the block table, but seq_lens
         # still reports the full prompt length. Trailing slots in
-        # bt_cpu[0, k:] hold stale IDs from another request's
+        # bt_cpu[row, k:] hold stale IDs from another request's
         # allocation; indexing k_cache by those produces a CUDA OOB
         # that surfaces as a device-side assert at the next .cpu().
         # Clamp num_blocks to the actually-allocated row width so we
@@ -4967,9 +5130,9 @@ class _Worker:
         else:
             return
 
-        # Extract the request's block IDs from the block table.
+        # Extract this rid's block IDs from the block table row.
         if bt_cpu.ndim >= 2:
-            req_block_ids = bt_cpu[0, :num_blocks].tolist()
+            req_block_ids = bt_cpu[bt_row_idx, :num_blocks].tolist()
         else:
             req_block_ids = bt_cpu[:num_blocks].tolist()
 
