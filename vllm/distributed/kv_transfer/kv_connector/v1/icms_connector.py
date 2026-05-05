@@ -764,6 +764,12 @@ class IcmsConnector(KVConnectorBase_V1):
         self._model_name: str  = extra.get("icms_model_name", "")
         self._k: int           = int(extra.get("icms_k", 16))
         self._budget: float    = float(extra.get("icms_budget", 0.2))
+        # Cross-budget KV reuse (2026-05-05): per-call budget override
+        # poked by `experiments/accuracy_bench_icms.py` via
+        # llm.collective_rpc(_set_icms_budget, args=(b,)) so the bench can
+        # sweep multiple budgets against ONE LLM instead of rebuilding
+        # the model per budget. None = use init-time `icms_budget`.
+        self._budget_override: float | None = None
         self._stats_level: int = int(extra.get("icms_stats_level", 1))
         self._log_selections: bool = bool(extra.get("icms_log_selections", False))
         self._score_stride: int = int(extra.get("icms_score_stride", 6))
@@ -936,6 +942,8 @@ class IcmsConnector(KVConnectorBase_V1):
         quest_query = kwargs.get("quest_query")
         next_layer_idx = kwargs.get("next_layer_idx")
         budget = kwargs.get("budget", self._budget)
+        if self._budget_override is not None:
+            budget = self._budget_override
         quest_stats = kwargs.get("quest_stats")
         quest_all_pages = kwargs.get("quest_all_pages", False)
         quest_reuse_selection = kwargs.get("quest_reuse_selection", False)
@@ -5852,21 +5860,26 @@ class _Worker:
         # Unregister from adaptive bandwidth allocator.
         if self._adaptive_allocator is not None:
             self._adaptive_allocator.unregister_request(request_id)
-            # Tell the BF2 to drop its matching demand entry. Best-effort:
-            # connection close + the server's on_closed cleanup is the
-            # safety net for crashed / SIGKILL'd ranks. Wrapped in
-            # try/except so a transport hiccup never blocks request
-            # teardown. Only rank 0 has an issuing client at TP>1.
-            if self._client is not None and (
-                    self._tp_size <= 1 or self._tp_rank == 0):
-                try:
-                    icms_rid = self._icms_request_id(request_id, 0)
-                    self._client.request_finished(icms_rid)
-                except Exception as e:
-                    logger.debug(
-                        "request_finished RPC failed for rid=%s: %s "
-                        "(harmless; on_closed will GC the entry)",
-                        request_id, e)
+
+        # Fire RequestFinished to the server unconditionally so it can
+        # release this rid's per-conn sink slot (and, at TP>1, walk
+        # tp_groups_ to release peer ranks' slots — see handlers.cc:2290).
+        # 2026-05-05 fix: was previously nested inside the
+        # adaptive_allocator gate above, which meant adaptive_bandwidth=False
+        # (bench default) silently skipped the RPC. Result: server slot map
+        # accumulated across rids → 217 [sink-slots] warnings on a
+        # TP=1 4-ex run, and the TP=2 fan-out leak fix #4 had nothing to
+        # release because rank 0 never sent the frame.
+        if self._client is not None and (
+                self._tp_size <= 1 or self._tp_rank == 0):
+            try:
+                icms_rid = self._icms_request_id(request_id, 0)
+                self._client.request_finished(icms_rid)
+            except Exception as e:
+                logger.debug(
+                    "request_finished RPC failed for rid=%s: %s "
+                    "(harmless; on_closed will GC the entry)",
+                    request_id, e)
 
     # ─── direct helper API (backward compat with smoke tests) ────────────
 
