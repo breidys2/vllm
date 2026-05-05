@@ -107,13 +107,12 @@ except ImportError:
     _HAVE_ARRIVAL_POLLER = False
 
 # ─── constants ───────────────────────────────────────────────────────────
-# TODO(batching): _SINK_SLOTS=4 caps in-flight Score/FetchAll RPCs at 4
-# concurrent operations. Fine for batch=1 perf-sweep workloads, but blocks
-# under heavy batching when more than 4 requests in a step want a fresh
-# Score/Fetch (acquire() will spin-wait on slot release). Should be
-# parameterised (env or kv_connector_extra_config) before serving traffic
-# with max_num_seqs > 4. (Audit 2026-04-26.)
-_SINK_SLOTS = 4           # C8: number of pre-allocated sink slots
+# Legacy default for `icms_sink_slots`. The actual slot count is now
+# read from extra_config["icms_sink_slots"] in _Worker.__init__ and
+# defaults to max(1, scheduler_config.max_num_seqs) when
+# ICMS_ALLOW_BATCH=1, else 1. Kept here for back-compat in case any
+# external caller still references this symbol.
+_SINK_SLOTS = 4           # legacy default (replaced by extra_config knob)
 _GROUP_BLOCKS = GROUP_PAGES  # blocks per group (= pages per group = 32)
 
 
@@ -536,7 +535,22 @@ class _RequestState:
 # ═══════════════════════════════════════════════════════════════════════════
 
 class _SinkSlotPool:
-    """Pre-allocated fixed-size sink partitioned into N slots."""
+    """Pre-allocated fixed-size sink partitioned into N slots.
+
+    NOTE (2026-05-05): the per-RPC slot allocation API
+    (acquire/release/offset_for_slot) is currently DORMANT — the server
+    chose its own offsets within the registered sink in 60913a126 (Apr
+    2026), so the connector no longer hands out client-side slots.
+    The pool object survives because:
+      (a) `n_slots` documents the connector's expectation of how many
+          concurrent in-flight RPCs the sink can hold (used at sink
+          sizing time to multiply total_sink by n_slots).
+      (b) The acquire/release API is preserved (now Semaphore-backed,
+          not spin-wait) so a future re-introduction of client-side
+          slot allocation doesn't have to re-plumb the call sites.
+    The Semaphore replaces the prior spin-wait so saturated callers
+    block on a kernel primitive instead of a busy-loop.
+    """
 
     def __init__(self, sink: Sink, slot_bytes: int, n_slots: int):
         self.sink = sink
@@ -544,19 +558,18 @@ class _SinkSlotPool:
         self.n_slots = n_slots
         self._free: list[int] = list(range(n_slots))
         self._lock = threading.Lock()
+        self._sem = threading.Semaphore(n_slots)
 
     def acquire(self) -> int:
         """Get a free slot index. Blocks if none available."""
-        while True:
-            with self._lock:
-                if self._free:
-                    return self._free.pop()
-            # Spin briefly — with N=4 and at most 2 in flight this rarely triggers.
-            threading.Event().wait(0.0001)
+        self._sem.acquire()
+        with self._lock:
+            return self._free.pop()
 
     def release(self, slot: int):
         with self._lock:
             self._free.append(slot)
+        self._sem.release()
 
     def offset_for_slot(self, slot: int) -> int:
         return slot * self.slot_bytes
@@ -587,23 +600,37 @@ class _WritePipeline:
     def __init__(self, name: str = "icms-writes"):
         self._q: "_queue.Queue" = _queue.Queue()
         self._pending = 0
+        # B2 (2026-05-05): per-rid task counter so on_request_finished can
+        # drain only the finishing rid's pending tasks instead of the
+        # entire pipeline. Each submit increments every rid in `rids`;
+        # task completion decrements them. drain_rid(X) waits on X's
+        # count alone. At N=1 this collapses to the legacy global drain.
+        self._rid_pending: dict[str, int] = {}
         self._cv = threading.Condition()
         self._stop = False
         self._t = threading.Thread(
             target=self._loop, name=name, daemon=True)
         self._t.start()
 
-    def submit(self, fn, tag: str = ""):
+    def submit(self, fn, tag: str = "", rids: "list[str] | None" = None):
+        rid_list = list(rids) if rids else []
         with self._cv:
             self._pending += 1
-        self._q.put((fn, tag))
+            for r in rid_list:
+                self._rid_pending[r] = self._rid_pending.get(r, 0) + 1
+        self._q.put((fn, tag, rid_list))
 
     def _loop(self):
         while True:
             item = self._q.get()
             if item is None:  # poison
                 return
-            fn, tag = item
+            # Back-compat: legacy 2-tuple form (fn, tag).
+            if len(item) == 2:
+                fn, tag = item
+                rid_list = []
+            else:
+                fn, tag, rid_list = item
             try:
                 fn()
             except Exception:
@@ -611,7 +638,15 @@ class _WritePipeline:
             finally:
                 with self._cv:
                     self._pending -= 1
-                    if self._pending == 0:
+                    for r in rid_list:
+                        n = self._rid_pending.get(r, 0) - 1
+                        if n <= 0:
+                            self._rid_pending.pop(r, None)
+                        else:
+                            self._rid_pending[r] = n
+                    if self._pending == 0 or rid_list:
+                        # Wake every drainer; each rechecks its own
+                        # predicate (per-rid or global).
                         self._cv.notify_all()
 
     def pending(self) -> int:
@@ -628,6 +663,35 @@ class _WritePipeline:
                 return True
             deadline = time.monotonic() + timeout
             while self._pending > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cv.wait(timeout=remaining)
+            return True
+
+    def drain_rid(self, rid: str,
+                   timeout: float | None = None) -> bool:
+        """Block until tasks involving `rid` are all complete.
+
+        Tasks that don't touch this rid are NOT awaited — the legacy
+        full-pipeline drain forced a finishing rid to wait for in-flight
+        writes of unrelated still-active rids. With per-rid tagging
+        added at submit() time, this is the right semantic for
+        on_request_finished. Returns False on timeout.
+
+        Falls back to global drain when no submit ever tagged this rid
+        (e.g., the rid finished without any writes, or the caller
+        passed rids=None).
+        """
+        with self._cv:
+            if rid not in self._rid_pending:
+                return True
+            if timeout is None:
+                while self._rid_pending.get(rid, 0) > 0:
+                    self._cv.wait()
+                return True
+            deadline = time.monotonic() + timeout
+            while self._rid_pending.get(rid, 0) > 0:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return False
@@ -693,6 +757,21 @@ class IcmsConnector(KVConnectorBase_V1):
         # checked as a fallback for shell-based benches.
         self._fetch_all_post_score: bool = bool(
             extra.get("fetch_all_post_score", False))
+        # B1 (2026-05-05): sink-size multiplier for concurrent in-flight
+        # Score / FetchAll RPCs. Today the server allocates sink offsets
+        # internally, so the connector's only job is to register a sink
+        # large enough for `icms_sink_slots` concurrent dumps. Default is
+        # 1 (preserves pre-batching behavior). Under ICMS_ALLOW_BATCH=1
+        # the connector defaults to scheduler_config.max_num_seqs so
+        # batched fetches don't collide on offsets. Explicit override
+        # via extra_config["icms_sink_slots"] takes precedence.
+        _scheduler_cfg = getattr(vllm_config, "scheduler_config", None)
+        _max_num_seqs = (int(getattr(_scheduler_cfg, "max_num_seqs", 1) or 1)
+                         if _scheduler_cfg is not None else 1)
+        _default_sink_slots = (max(1, _max_num_seqs)
+                               if _allow_batch() else 1)
+        self._sink_slots: int = max(1, int(
+            extra.get("icms_sink_slots", _default_sink_slots)))
         self._adaptive_bandwidth: bool = bool(extra.get("adaptive_bandwidth", False))
         self._link_bandwidth_bps: float = float(extra.get(
             "link_bandwidth_bps", 25e9 / 8))  # default 25 Gbps (BF2)
@@ -756,6 +835,7 @@ class IcmsConnector(KVConnectorBase_V1):
                 gpu_device=self._gpu_device,
                 fetch_all_post_score=self._fetch_all_post_score,
                 shmem_name=self._shmem_name,
+                sink_slots=self._sink_slots,
             )
 
     # ══════════════════════════════════════════════════════════════════════
@@ -1395,7 +1475,8 @@ class _Worker:
                  gpu_direct: bool = False,
                  gpu_device: str = "cuda:0",
                  fetch_all_post_score: bool = False,
-                 shmem_name: str = ""):
+                 shmem_name: str = "",
+                 sink_slots: int = 1):
         self._socket_path = socket_path
         self._use_rdma = use_rdma
         self._rdma_server_host = rdma_server_host
@@ -1406,6 +1487,12 @@ class _Worker:
         self._shmem_name = shmem_name  # non-empty → use ShmemIcmsClient
         self._model_name = model_name
         self._k = k
+        # B1 (2026-05-05): plumbed from IcmsConnector.__init__ via
+        # extra_config["icms_sink_slots"]. _connect() multiplies the
+        # registered sink size by this so the server's offset allocator
+        # can dispatch N concurrent Score/FetchAll RPCs without
+        # collisions. Default 1 = legacy single-rid sink size.
+        self._sink_slots: int = max(1, int(sink_slots))
         # FAPS gate. Take the connector-init value (kv_connector_extra_config),
         # but allow ICMS_FETCH_ALL_POST_SCORE=1 in env to opt in too — keeps
         # the legacy shell-env benches working without code changes.
@@ -1658,7 +1745,8 @@ class _Worker:
                 ack = self._client.hello(self._model_name,
                                          tp_rank=self._tp_rank,
                                          tp_size=self._tp_size,
-                                         deployment_id=self._deployment_id)
+                                         deployment_id=self._deployment_id,
+                                         sink_slot_count=self._sink_slots)
                 break  # success
             except Exception as _e:  # broad: any connect/hello failure
                 if _attempt == _max_attempts - 1:
@@ -1737,7 +1825,12 @@ class _Worker:
         # CUDA OOB assertion.
         per_layer_bytes = self._k * self._geom.kv_page_bytes
         sink_layers = max(self._score_stride, int(self._geom.num_layers))
-        total_sink = sink_layers * per_layer_bytes
+        # B1: scale the sink to hold `_sink_slots` concurrent dumps.
+        # Default _sink_slots=1 preserves legacy behavior; under
+        # ICMS_ALLOW_BATCH=1 it defaults to max_num_seqs so the server's
+        # offset allocator has room for N parallel Score / FetchAll
+        # writes without colliding.
+        total_sink = sink_layers * per_layer_bytes * self._sink_slots
         # Allocate a per-layer ready-flag sink (one u32 per model layer)
         # alongside the main KV sink. The server flips slots via small
         # RDMA writes and the connector polls them to overlap compute
@@ -1761,14 +1854,16 @@ class _Worker:
         else:
             sink = self._client.register_sink(total_sink)
             sink_desc = "host"
-        self._sink_pool = _SinkSlotPool(sink, per_layer_bytes, _SINK_SLOTS)
+        self._sink_pool = _SinkSlotPool(sink, per_layer_bytes,
+                                          self._sink_slots)
         self._sink_per_layer_bytes = per_layer_bytes
         logger.info(
             "IcmsConnector worker: connected to %s, model=%s, "
-            "sink=%s %d layers × %d B/layer = %d B total, score_stride=%d",
+            "sink=%s %d layers × %d B/layer × %d slots = %d B total, "
+            "score_stride=%d, allow_batch=%s",
             transport_desc, self._model_name, sink_desc,
-            self._score_stride, per_layer_bytes, total_sink,
-            self._score_stride,
+            sink_layers, per_layer_bytes, self._sink_slots, total_sink,
+            self._score_stride, _allow_batch(),
         )
 
     def _rank_chain(self, chain):
@@ -4696,7 +4791,8 @@ class _Worker:
             self._do_deferred_extract_and_flush(
                 snap_caches, snap_meta, snap_rids)
 
-        self._write_pipeline.submit(_task, tag="wait_for_save")
+        self._write_pipeline.submit(_task, tag="wait_for_save",
+                                     rids=snap_rids)
 
         # Optional measurement mode: block until this prefill's writes
         # complete before returning. Default behavior leaves writes async
@@ -5576,18 +5672,25 @@ class _Worker:
         # 17-25 s drain times during the 2026-04-27 mistral quality run
         # plus headroom for the larger budgets.
         t0 = time.perf_counter()
-        ok = self._write_pipeline.drain(timeout=90.0)
+        # B2 (2026-05-05): per-rid drain. Pre-batching, this used to
+        # `drain()` the entire pipeline, forcing a finishing rid to wait
+        # on still-active rids' writes. With submit() now tagging tasks
+        # by rid, drain_rid() awaits only this rid's tasks; tasks that
+        # don't touch this rid are left running for their owners.
+        # At N=1 / single-rid path this collapses to the legacy
+        # behavior (only one rid in flight).
+        ok = self._write_pipeline.drain_rid(request_id, timeout=90.0)
         drain_us = (time.perf_counter() - t0) * 1e6
         if not ok:
             logger.warning(
-                "on_request_finished: write-pipeline drain TIMED OUT "
-                "(>90s, %d tasks pending); request-finish proceeding — "
-                "some writes may be lost.",
-                self._write_pipeline.pending())
+                "on_request_finished: write-pipeline drain_rid TIMED OUT "
+                "(>90s, rid=%s, %d tasks pending globally); "
+                "request-finish proceeding — some writes may be lost.",
+                request_id, self._write_pipeline.pending())
         elif drain_us > 1000:
             logger.info(
-                "on_request_finished: write-pipeline drain took %.1f ms",
-                drain_us / 1000.0)
+                "on_request_finished: write-pipeline drain_rid(%s) took %.1f ms",
+                request_id, drain_us / 1000.0)
 
         rs = self._requests.get(request_id)
         if rs is None:
