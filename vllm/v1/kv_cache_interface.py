@@ -107,9 +107,8 @@ class FullAttentionSpec(AttentionSpec):
     attention_chunk_size: int | None = None
 
     cache_dtype_str: str | None = None
-    """Optional KV cache dtype string for sub-byte quantization (e.g.
-    'kivi_4bit'). When set, page_size_bytes is computed by the quantization
-    method instead of the standard dtype-based calculation."""
+    """Optional KV cache dtype string. Reserved for future use; currently
+    unused on paper paths."""
 
     def __post_init__(self):
         if self.head_size_v is None:
@@ -185,17 +184,6 @@ class FullAttentionSpec(AttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
-        if self.cache_dtype_str is not None:
-            from vllm.v1.attention.ops.kv_quant import (
-                get_kv_quant_method,
-                is_kv_quant_dtype,
-            )
-            if is_kv_quant_dtype(self.cache_dtype_str):
-                qm = get_kv_quant_method(self.cache_dtype_str)
-                if qm is not None:
-                    return qm.page_size_bytes(
-                        self.block_size, self.num_kv_heads, self.head_size
-                    )
         return (
             self.block_size
             * self.num_kv_heads

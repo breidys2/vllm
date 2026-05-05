@@ -28,8 +28,6 @@ CacheDType = Literal[
     "fp8_e5m2",
     "fp8_inc",
     "fp8_ds_mla",
-    "kivi_4bit",
-    "kivi_2bit",
 ]
 MambaDType = Literal["auto", "float32", "float16"]
 MambaCacheMode = Literal["all", "align", "none"]
@@ -181,21 +179,6 @@ class CacheConfig:
     'native' (vLLM native CPU offloading), 'lmcache'.
     KV offloading is only activated when kv_offloading_size is set."""
 
-    kv_quant_group_size: int = 0
-    """Group size for sub-byte KV cache quantization (kivi_4bit, kivi_2bit).
-    Each group of elements shares a single fp16 scale factor.
-    0 (default) means use head_size as the group size, giving one scale per
-    head per token. Smaller values (e.g. 32, 64) give finer granularity at the
-    cost of slightly more scale storage overhead."""
-
-    kv_quant_residual_length: int = 0
-    """Number of most-recent tokens per layer to keep in bf16 (residual
-    buffer) when using sub-byte KV cache quantization.  0 (default) disables
-    the residual buffer — all tokens are quantized immediately.  When > 0,
-    the last R tokens are stored in a bf16 side-buffer and spliced back into
-    the dequantized cache during attention, avoiding the quantize→dequantize
-    round-trip for the most recently generated tokens."""
-
     # -- InfiniGen (OSDI '24) configuration ----------------------------------
 
     infinigen_enabled: bool = False
@@ -322,14 +305,6 @@ class CacheConfig:
                 "memory footprint and boosts the performance. "
                 "Meanwhile, it may cause accuracy drop without a proper "
                 "scaling factor."
-            )
-        elif cache_dtype.startswith("kivi_"):
-            bits = "2-bit" if "2bit" in cache_dtype else "4-bit"
-            logger.info(
-                "Using KIVI %s quantization for KV cache. This significantly "
-                "reduces GPU memory footprint but may cause accuracy "
-                "degradation, especially for long multi-turn conversations.",
-                bits,
             )
         return cache_dtype
 
