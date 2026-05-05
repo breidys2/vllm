@@ -1673,6 +1673,17 @@ class _Worker:
         # main-thread Score/FetchAll don't race with background WriteGroup.
         self._write_pipeline = _WritePipeline()
 
+        # 2026-05-05 async-Score dispatch pool (option 2 of the Score
+        # overlap analysis). At TP=1 + ICMS_ALLOW_BATCH=1, the per-layer
+        # score-dispatch loop fires N rids' _score_one_request calls
+        # concurrently on this pool so the async-capable IcmsClient
+        # actually overlaps the underlying RPCs. Sized for the worst
+        # observed batch (max_num_seqs ≤ 8 today). At TP>1 the path is
+        # never taken (NCCL collective ordering would deadlock).
+        import concurrent.futures as _cf
+        self._score_dispatch_pool = _cf.ThreadPoolExecutor(
+            max_workers=8, thread_name_prefix="icms-score")
+
         # TTFT-breakdown instrumentation. Per-request phase timestamps +
         # per-hook accumulators collected across the prefill critical path
         # (on_step_start → wait_for_layer × 48 → wait_for_pending_writes).
@@ -2731,11 +2742,38 @@ class _Worker:
                     per_request_q[rid] = quest_query[start:end]
 
         # Score each request with its own Q slice.
-        for req_idx, rid, rs in requests_to_score:
-            q_for_request = per_request_q.get(rid, quest_query)
-            self._score_one_request(
-                rid, rs, req_idx, next_layer_idx, q_for_request,
-                budget, stats, connector_meta)
+        # Async batching (2026-05-05): at TP=1 and N>=2 batched rids,
+        # fire all N _score_one_request calls on a thread pool so their
+        # underlying score RPCs actually overlap on the wire. The
+        # async-capable IcmsClient (option 2 refactor) demuxes the N
+        # replies by request_id, so each thread's `client.score()`
+        # blocks only on its OWN reply rather than serializing through
+        # the legacy per-RPC lock. Skipped at TP>1 because the
+        # _score_one_request body issues NCCL AllGather + broadcast
+        # collectives whose ordering must match across ranks — running
+        # them concurrently from N threads would risk a deadlock.
+        if (_allow_batch() and self._tp_size == 1
+                and len(requests_to_score) >= 2
+                and hasattr(self._client, "score_async")):
+            pool = self._score_dispatch_pool
+            futs = []
+            for req_idx, rid, rs in requests_to_score:
+                q_for_request = per_request_q.get(rid, quest_query)
+                futs.append(pool.submit(
+                    self._score_one_request,
+                    rid, rs, req_idx, next_layer_idx, q_for_request,
+                    budget, stats, connector_meta))
+            # Block on every thread; the first exception (if any)
+            # propagates to the caller — same semantics as the serial
+            # loop's exception path.
+            for f in futs:
+                f.result()
+        else:
+            for req_idx, rid, rs in requests_to_score:
+                q_for_request = per_request_q.get(rid, quest_query)
+                self._score_one_request(
+                    rid, rs, req_idx, next_layer_idx, q_for_request,
+                    budget, stats, connector_meta)
 
         # ICMS_FETCH_ALL_POST_SCORE=1: after the per-request Score loop
         # populates pending_scores with the K-page sparse selection,
