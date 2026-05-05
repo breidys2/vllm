@@ -619,48 +619,6 @@ class FlashAttentionImpl(AttentionImpl):
         # Cache the batch invariant result for use in forward passes
         self.batch_invariant_enabled = vllm_is_batch_invariant()
 
-        # Initialize InfiniGen context if enabled
-        self._infinigen_enabled = False
-        self._infinigen_stats = None
-        try:
-            from vllm.config import get_current_vllm_config
-            _vllm_cfg = get_current_vllm_config()
-            self._infinigen_enabled = getattr(
-                _vllm_cfg.cache_config, "infinigen_enabled", False
-            )
-            if self._infinigen_enabled and getattr(
-                _vllm_cfg.cache_config, "infinigen_stats_enabled", False
-            ):
-                from vllm.v1.attention.ops.infinigen_stats import (
-                    InfiniGenStats,
-                )
-                self._infinigen_stats = InfiniGenStats(enabled=True)
-        except Exception:
-            pass
-
-        # Initialize Quest context if enabled
-        self._quest_enabled = False
-        self._quest_stats = None
-        self._quest_page_size = 16
-        try:
-            from vllm.config import get_current_vllm_config
-            _vllm_cfg2 = get_current_vllm_config()
-            self._quest_enabled = getattr(
-                _vllm_cfg2.cache_config, "quest_enabled", False
-            )
-            self._quest_page_size = getattr(
-                _vllm_cfg2.cache_config, "quest_page_size", 16
-            )
-            if self._quest_enabled and getattr(
-                _vllm_cfg2.cache_config, "quest_stats_enabled", False
-            ):
-                from vllm.v1.attention.ops.infinigen_stats import (
-                    InfiniGenStats,
-                )
-                self._quest_stats = InfiniGenStats(enabled=True)
-        except Exception:
-            pass
-
         # Initialize sub-byte KV quantization if applicable
         self._kv_quant_method = None
         if self.kv_cache_dtype.startswith("kivi_"):
@@ -800,77 +758,6 @@ class FlashAttentionImpl(AttentionImpl):
         else:
             key_cache, value_cache = kv_cache.unbind(0)
 
-        # InfiniGen sparse KV path: when InfiniGen prefetch has loaded
-        # only a subset of token positions, the key/value caches contain
-        # valid data only at those positions.  The block_table is already
-        # set up to reference the prefetched blocks, so no additional
-        # remapping is needed here — the standard FlashAttention path
-        # handles the paged layout correctly.  This comment marks the
-        # integration point where future optimisations (e.g., gathering
-        # into a dense buffer for better memory locality) can be added.
-        #
-        # When InfiniGen is active with budget < 1.0, the attention
-        # over the selected subset approximates full attention.  At
-        # budget = 1.0, all tokens are loaded and results are exact.
-        infinigen_active = (
-            self._infinigen_enabled
-            and hasattr(attn_metadata, "infinigen_token_mask")
-            and attn_metadata.infinigen_token_mask is not None
-        )
-        if infinigen_active:
-            # The token mask is available for tracing / profiling.
-            # In the dense-gather optimisation path, we would:
-            #   1. Gather selected K/V into a contiguous buffer
-            #   2. Build a compact block table
-            #   3. Adjust seq_lens to reflect the reduced token count
-            # For now, the standard paged path handles the prefetched
-            # subset correctly since only prefetched blocks are mapped.
-
-            # Record KV fetch metrics if stats collection is enabled
-            if self._infinigen_stats is not None:
-                mask = attn_metadata.infinigen_token_mask
-                tokens_cached = mask.numel()
-                tokens_selected = int(mask.sum().item())
-                # Estimate bytes: tokens_selected × (K+V) × heads × head_dim × dtype
-                kv_bytes_estimate = (
-                    tokens_selected * 2 * key_cache.shape[-2]
-                    * key_cache.shape[-1] * key_cache.element_size()
-                )
-                self._infinigen_stats.record_kv_fetch(
-                    layer_idx=0,  # layer idx from attn_metadata if available
-                    tokens_cached=tokens_cached,
-                    tokens_selected=tokens_selected,
-                    kv_bytes=kv_bytes_estimate,
-                )
-
-        # Quest sparse KV path: similar to InfiniGen but operates at page
-        # granularity (S=16 tokens per page).  When Quest prefetch loads
-        # only the top-K most important pages, the block_table references
-        # only those blocks.  The standard paged FlashAttention path
-        # handles this correctly since only prefetched blocks are mapped.
-        quest_active = (
-            self._quest_enabled
-            and hasattr(attn_metadata, "quest_page_mask")
-            and attn_metadata.quest_page_mask is not None
-        )
-        if quest_active:
-            if self._quest_stats is not None:
-                mask = attn_metadata.quest_page_mask
-                num_pages = mask.numel()
-                pages_selected = int(mask.sum().item())
-                tokens_cached = num_pages * self._quest_page_size
-                tokens_selected = pages_selected * self._quest_page_size
-                kv_bytes_estimate = (
-                    tokens_selected * 2 * key_cache.shape[-2]
-                    * key_cache.shape[-1] * key_cache.element_size()
-                )
-                self._quest_stats.record_kv_fetch(
-                    layer_idx=0,
-                    tokens_cached=tokens_cached,
-                    tokens_selected=tokens_selected,
-                    kv_bytes=kv_bytes_estimate,
-                )
-
         if self.kv_cache_dtype.startswith("fp8"):
             # queries are quantized in the attention layer
             dtype = FlashAttentionBackend.get_fp8_dtype_for_flashattn(
@@ -913,6 +800,29 @@ class FlashAttentionImpl(AttentionImpl):
                 # scheduler_metadata=None → FA3 dynamic scheduling.
                 # Benchmarked: no performance impact on H100 up to 64K.
                 scheduler_metadata = None
+                # ICMS_DIAG_AGG: log shapes right before the FA kernel so
+                # we can correlate "batch_size must be equal to
+                # batch_size_k" crashes with the actual tensor sizes
+                # passed in. Only fires for the icms-state path so we
+                # don't pollute logs from the cold path.
+                import os as _os_diag
+                if _os_diag.environ.get("ICMS_DIAG_AGG") == "1":
+                    nat_bt = attn_metadata.block_table
+                    nat_sl = attn_metadata.seq_lens
+                    cu_q = attn_metadata.query_start_loc
+                    from vllm.logger import init_logger as _init_logger
+                    _logger_diag = _init_logger("icms.diag-agg-fa")
+                    _logger_diag.info(
+                        "[diag-agg-fa] layer=%s icms_bt=%s icms_sl=%s "
+                        "nat_bt=%s nat_sl=%s cu_q=%s max_seqlen_q=%s "
+                        "max_seqlen_k=%s",
+                        getattr(layer, "layer_name", "?"),
+                        tuple(block_table.shape),
+                        tuple(seqused_k.shape),
+                        tuple(nat_bt.shape),
+                        tuple(nat_sl.shape),
+                        tuple(cu_q.shape) if hasattr(cu_q, "shape") else "?",
+                        max_seqlen_q, max_seqlen_k)
 
             # ICMS_DIAG_ATTN: log block_table summary and seq_lens at the
             # attention call site so we can compare cold vs warm paths.

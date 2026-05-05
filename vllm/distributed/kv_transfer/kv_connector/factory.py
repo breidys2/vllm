@@ -186,12 +186,6 @@ KVConnectorFactory.register_connector(
 )
 
 KVConnectorFactory.register_connector(
-    "OffloadingConnector",
-    "vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector",
-    "OffloadingConnector",
-)
-
-KVConnectorFactory.register_connector(
     "DecodeBenchConnector",
     "vllm.distributed.kv_transfer.kv_connector.v1.decode_bench_connector",
     "DecodeBenchConnector",

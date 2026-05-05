@@ -185,13 +185,25 @@ def _tp_broadcast_score_reply(reply, tp_rank: int, tp_size: int):
     # Header: [status, trie_walk_ns, summary_read_ns, score_ns,
     #          sink_write_ns, cache_hit, concurrent_requests,
     #          server_ingest_to_ready_ns, effective_supply_bps,
-    #          num_pages]  — 10 i64 slots.
+    #          request_id, num_pages]  — 11 i64 slots.
     # Bug fix (2026-04-30): added effective_supply_bps (slot 8) to match
     # the protocol's two-sided adaptive-bandwidth wire format. Without
     # this, the dataclass reconstruction at the end of this function
     # raised "ScoreReply.__init__() missing effective_supply_bps" on
     # every TP>1 broadcast and Score replies never reached non-rank-0
     # workers — wedging decode at iter 1 with shm_broadcast timeouts.
+    # 2026-05-05 (v5): added request_id (slot 9). Without it, the
+    # broadcast-side ScoreReply reconstruction misses the new field
+    # and raises "missing 1 required positional argument: 'request_id'"
+    # — same failure mode as the 2026-04-30 fix above.
+    # request_id is a 64-bit unsigned value (hash output of
+    # _icms_request_id). torch.int64 has range [-2^63, 2^63), so any
+    # u64 with bit 63 set overflows when packed via int(...). Reinterpret
+    # through signed int64 here and on the receive side: the bit pattern
+    # round-trips, only the int's sign flips for high half-range values.
+    def _u64_to_i64(v: int) -> int:
+        v &= 0xFFFFFFFFFFFFFFFF
+        return v if v < (1 << 63) else v - (1 << 64)
     if tp_rank == 0 and reply is not None:
         n_pages = len(reply.page_ids)
         hdr = torch.tensor([
@@ -204,16 +216,21 @@ def _tp_broadcast_score_reply(reply, tp_rank: int, tp_size: int):
             int(reply.concurrent_requests),
             int(reply.server_ingest_to_ready_ns),
             int(reply.effective_supply_bps),
+            _u64_to_i64(int(getattr(reply, "request_id", 0))),
             int(n_pages),
         ], dtype=torch.int64, device=dev)
     else:
-        hdr = torch.zeros(10, dtype=torch.int64, device=dev)
+        hdr = torch.zeros(11, dtype=torch.int64, device=dev)
     dist.broadcast(hdr, src=tp_group.first_rank, group=dev_group)
 
-    n_pages = int(hdr[9].item())
+    def _i64_to_u64(v: int) -> int:
+        return v if v >= 0 else v + (1 << 64)
+
+    n_pages = int(hdr[10].item())
     if n_pages == 0:
         from icms_client.protocol import ScoreReply
         return ScoreReply(
+            request_id=_i64_to_u64(int(hdr[9])),
             status=int(hdr[0]), trie_walk_ns=int(hdr[1]),
             summary_read_ns=int(hdr[2]), score_ns=int(hdr[3]),
             sink_write_ns=int(hdr[4]), cache_hit=bool(hdr[5]),
@@ -238,6 +255,7 @@ def _tp_broadcast_score_reply(reply, tp_rank: int, tp_size: int):
 
     from icms_client.protocol import ScoreReply
     return ScoreReply(
+        request_id=_i64_to_u64(int(hdr[9])),
         status=int(hdr[0]), trie_walk_ns=int(hdr[1]),
         summary_read_ns=int(hdr[2]), score_ns=int(hdr[3]),
         sink_write_ns=int(hdr[4]), cache_hit=bool(hdr[5]),
@@ -2414,7 +2432,15 @@ class _Worker:
                         "[diag-faps] fast-path MISS rid=%s layer=%d",
                         rid[:8], next_layer_idx)
                 return
-            reply, reuse_offsets = reuse_entry
+            # Tuple grew from 2- to 3-element on 2026-05-05 (added
+            # req_idx) to fix the multi-rid stride-reuse path that was
+            # defaulting req_idx=0 for the second rid. Accept both
+            # shapes; old 2-element entries fall back to the caller's
+            # req_idx (correct in this slow-path entry which has it).
+            if len(reuse_entry) == 3:
+                reply, reuse_offsets, _stored_req_idx = reuse_entry
+            else:
+                reply, reuse_offsets = reuse_entry
             promoted = copy.copy(reply)
             promoted.sink_offsets = reuse_offsets
             with self._score_lock:
@@ -2548,8 +2574,11 @@ class _Worker:
                 reuse_offsets = [off + delta * per_layer_bytes
                                  for off in reply.sink_offsets]
                 with self._score_lock:
+                    # 3-tuple now carries req_idx so on_layer_reuse can
+                    # restore the correct batch position per-rid
+                    # (multi-rid stride-reuse fix, 2026-05-05).
                     self._pending_reuse.setdefault(reuse_attn, {})[rid] = (
-                        reply, reuse_offsets)
+                        reply, reuse_offsets, req_idx)
             rs._fetch_all_complete = True
             if os.environ.get("ICMS_DIAG_FAPS") == "1":
                 logger.info(
@@ -2584,16 +2613,28 @@ class _Worker:
         if reuse_data is None:
             self._slack_probe_pre_hook(next_layer_idx)
             return
-        # reuse_data is dict[rid → (reply, reuse_offsets)]
+        # reuse_data is dict[rid → (reply, reuse_offsets, req_idx)]
+        # (3-element tuple as of 2026-05-05; older 2-element entries
+        # are still accepted for back-compat with the previous-layer-
+        # lookup fallback).
         with self._score_lock:
             pending = self._pending_scores.setdefault(attn_layer_name, {})
-            for rid, (reply, reuse_offsets) in reuse_data.items():
+            for rid, entry in reuse_data.items():
+                if len(entry) == 3:
+                    reply, reuse_offsets, req_idx = entry
+                else:
+                    # Legacy 2-tuple. Fall back to the previous layer's
+                    # popped-dict lookup; if that's gone (always at
+                    # multi-rid because wait_for_layer pops eagerly),
+                    # default to 0. The 2-tuple write sites have all
+                    # been migrated above, so this branch should not
+                    # fire post-2026-05-05; kept defensively.
+                    reply, reuse_offsets = entry
+                    orig = self._pending_scores.get(
+                        f"model.layers.{next_layer_idx - 1}.self_attn.attn", {})
+                    req_idx = orig.get(rid, (None, 0))[1] if orig else 0
                 reuse_reply = copy.copy(reply)
                 reuse_reply.sink_offsets = reuse_offsets
-                # Preserve req_idx from the original score result.
-                orig = self._pending_scores.get(
-                    f"model.layers.{next_layer_idx - 1}.self_attn.attn", {})
-                req_idx = orig.get(rid, (None, 0))[1] if orig else 0
                 pending[rid] = (reuse_reply, req_idx)
         self._slack_probe_pre_hook(next_layer_idx)
 
@@ -3361,8 +3402,10 @@ class _Worker:
                     reuse_offsets = [off + delta * per_layer_bytes
                                      for off in reply.sink_offsets]
                     with self._score_lock:
+                        # 3-tuple carries req_idx (multi-rid fix,
+                        # 2026-05-05). See companion site at line ~2569.
                         self._pending_reuse.setdefault(reuse_attn, {})[rid] = (
-                            reply, reuse_offsets)
+                            reply, reuse_offsets, req_idx)
             elif os.environ.get("ICMS_DIAG_FAPS") == "1":
                 logger.info(
                     "[diag-faps] score-path FAPS-gate skip rid=%s layer=%d "
@@ -3784,7 +3827,12 @@ class _Worker:
         # int32 typically; .clone() preserves dtype/device.
         combined_bt = natural_bt.clone()
         combined_sl = natural_sl.clone()
+        # ICMS_DIAG_AGG=1: log per-call shapes + per-rid req_idx so we
+        # can pinpoint the "batch_size must be equal to batch_size_k"
+        # crash that surfaces after a few batches at TP=2 (2026-05-05).
+        _diag_agg = os.environ.get("ICMS_DIAG_AGG", "0") == "1"
         # Per-row override.
+        skipped: list = []
         for req_idx, state in captures:
             trim_row = state.block_table  # [1, k+c] tensor
             if trim_row.dim() == 2:
@@ -3793,6 +3841,8 @@ class _Worker:
             if (req_idx < combined_bt.shape[0]
                     and k_plus_c <= combined_bt.shape[1]):
                 combined_bt[req_idx, :k_plus_c] = trim_row
+            else:
+                skipped.append((req_idx, k_plus_c))
             trim_sl = state.seq_lens
             if trim_sl.dim() >= 1:
                 trim_sl_val = trim_sl[0]
@@ -3805,6 +3855,19 @@ class _Worker:
         max_seq_len = int(getattr(am, "max_seq_len", 0))
         # KV pointers are per-layer constants; all captures share them.
         head_state = captures[0][1]
+        if _diag_agg:
+            cap_summary = [(int(req_idx),
+                            tuple(state.block_table.shape),
+                            tuple(state.seq_lens.shape))
+                           for req_idx, state in captures]
+            logger.info(
+                "[diag-agg] tp=%d layer=%s nat_bt=%s nat_sl=%s "
+                "combined_bt=%s combined_sl=%s max_seq_len=%d "
+                "captures=%s skipped=%s",
+                self._tp_rank, layer_name,
+                tuple(natural_bt.shape), tuple(natural_sl.shape),
+                tuple(combined_bt.shape), tuple(combined_sl.shape),
+                max_seq_len, cap_summary, skipped)
         icms_fetch_state.set_active(icms_fetch_state.IcmsFetchState(
             key_cache=head_state.key_cache,
             value_cache=head_state.value_cache,
