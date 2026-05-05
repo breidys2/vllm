@@ -7,13 +7,14 @@ After layer L's forward pass completes, the hook:
   1. Extracts the post-attention residual stream h_L.
   2. Computes LayerNorm_{L+1}(h_L) using layer L+1's actual RMSNorm weights.
   3. Projects through layer L+1's actual Q weight matrix → exact Q_{L+1}.
-  4. Scores per-page metadata via QuestPageSelector.select_pages().
+  4. Forwards Q_{L+1} to the page selector / KV connector.
   5. Triggers an async CPU→GPU prefetch of the selected pages.
 
-Unlike InfiniGen's rehearsal which uses partial weights (approximate),
-Quest computes the **exact** Q projection for the next layer.  The cost
-is one RMSNorm + one matmul per layer, which is negligible compared to
-attention over thousands of tokens.
+The hook computes the **exact** Q projection for the next layer. Cost
+is one RMSNorm + one matmul per layer — negligible compared to attention
+over thousands of tokens. Page selection itself happens externally
+(e.g. BF2-side in ICMS); this module only handles the Q-projection
+plumbing.
 
 Usage:
     hook_manager = QuestHookManager(
@@ -43,21 +44,22 @@ class QuestHookManager:
     """Manages forward hooks on decoder layers for Quest page prefetch.
 
     Attributes:
-        page_selector: The QuestPageSelector instance.
-        budget_computer: The DynamicBudgetComputer instance (from
-            ``infinigen_budget.py``, reused).
+        page_selector: Optional in-process page selector (None when
+            scoring is delegated externally, e.g. BF2-side in ICMS).
+        budget_computer: Optional in-process budget computer.
         num_layers: Number of decoder layers.
-        kv_connector: Reference to the OffloadingConnector.
-        stats: Optional PrefetchStats for timing (reused).
+        kv_connector: Reference to the active KV connector
+            (e.g. IcmsConnector).
+        stats: Optional stats collector for timing.
     """
 
     def __init__(
         self,
-        page_selector: Any,  # QuestPageSelector
-        budget_computer: Any,  # DynamicBudgetComputer
+        page_selector: Any,
+        budget_computer: Any,
         num_layers: int,
         kv_connector: Any | None = None,
-        stats: Any | None = None,  # PrefetchStats
+        stats: Any | None = None,
         cpu_scoring: bool = True,
     ):
         self.page_selector = page_selector

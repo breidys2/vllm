@@ -3043,7 +3043,7 @@ class _Worker:
                     rid, next_layer_idx)
 
         # Marshal query to fp32 numpy, mean-pooling Q heads per KV-head
-        # group for GQA (matching QuestPageSelector.compute_page_scores).
+        # group for GQA.
         geom = self._geom
         if isinstance(quest_query, torch.Tensor):
             # ── DIAGNOSTIC: log forward batch size at the first scored layer.

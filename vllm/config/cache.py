@@ -179,68 +179,6 @@ class CacheConfig:
     'native' (vLLM native CPU offloading), 'lmcache'.
     KV offloading is only activated when kv_offloading_size is set."""
 
-    # -- InfiniGen (OSDI '24) configuration ----------------------------------
-
-    infinigen_enabled: bool = False
-    """Enable InfiniGen-style token-selective KV cache loading.  When True,
-    the KV cache is stored in CPU memory and only essential entries are
-    prefetched to GPU per-layer during decode, guided by a lightweight
-    rehearsal mechanism."""
-
-    infinigen_budget: float = 0.2
-    """Base token selection budget as a fraction of total cached tokens.
-    E.g. 0.2 means prefetch the top 20% of tokens per layer."""
-
-    infinigen_alpha: float = 5.0
-    """Threshold scaling factor for dynamic budget computation.  Higher
-    values make the selection more aggressive (fewer tokens selected)."""
-
-    infinigen_dynamic_budget: bool = True
-    """Enable per-layer dynamic budgets.  When True, the budget for each
-    layer adapts to the attention sparsity of that layer.  When False,
-    ``infinigen_budget`` is used uniformly across all layers."""
-
-    infinigen_capacity: float = 1.0
-    """CPU cache capacity as a fraction of total KV cache size.  1.0 means
-    the full KV cache is retained in CPU memory."""
-
-    infinigen_svd_path: str | None = None
-    """Path to pre-computed SVD skewing matrices (produced by
-    scripts/infinigen_svd_setup.py).  When None, rehearsal uses raw
-    (un-skewed) partial weight columns."""
-
-    infinigen_partial_weight_ratio: float = 0.1
-    """Fraction of Q/K weight columns used for rehearsal speculation.
-    Lower values = faster rehearsal but less accurate token selection."""
-
-    infinigen_stats_enabled: bool = False
-    """Enable per-layer runtime statistics collection for InfiniGen.
-    Records rehearsal latency, fetch latency, forward pass latency,
-    tokens selected, and bytes fetched per layer per step."""
-
-    # -- Quest (ICML '24) configuration --------------------------------------
-
-    quest_enabled: bool = False
-    """Enable Quest-style page-level KV cache loading.  When True,
-    per-page min/max key metadata stays GPU-resident and only the most
-    important pages are prefetched from CPU to GPU per layer."""
-
-    quest_page_size: int = 16
-    """Number of tokens per page for Quest metadata (S in the paper).
-    Metadata overhead is 2/S of the key cache size (12.5% for S=16)."""
-
-    quest_budget: float = 0.2
-    """Base fraction of pages to select per layer."""
-
-    quest_alpha: float = 5.0
-    """Threshold scaling factor for dynamic budget computation."""
-
-    quest_dynamic_budget: bool = True
-    """Enable per-layer dynamic budget based on score distribution."""
-
-    quest_stats_enabled: bool = False
-    """Enable per-layer runtime statistics collection for Quest."""
-
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -268,22 +206,6 @@ class CacheConfig:
             "num_cpu_blocks",
             # WIP feature toggle not impacting compiled graph shape
             "kv_sharing_fast_prefill",
-            # InfiniGen runtime knobs — don't affect compiled graph shape
-            "infinigen_enabled",
-            "infinigen_budget",
-            "infinigen_alpha",
-            "infinigen_dynamic_budget",
-            "infinigen_capacity",
-            "infinigen_svd_path",
-            "infinigen_partial_weight_ratio",
-            "infinigen_stats_enabled",
-            # Quest runtime knobs — don't affect compiled graph shape
-            "quest_enabled",
-            "quest_page_size",
-            "quest_budget",
-            "quest_alpha",
-            "quest_dynamic_budget",
-            "quest_stats_enabled",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors

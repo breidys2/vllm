@@ -306,9 +306,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             from vllm.v1.attention.ops.quest_hooks import QuestHookManager
 
             # Create a no-op budget computer that returns the configured
-            # budget.  The actual QuestPageSelector lives on the worker
-            # side (CPU-resident), so the hook only needs to compute Q
-            # and forward it.
+            # budget.  Page selection is performed BF2-side by the ICMS
+            # storage server, so the hook only needs to compute Q and
+            # forward it.
             quest_budget = float(extra.get("quest_budget", 0.2))
 
             class ConstantBudget:
