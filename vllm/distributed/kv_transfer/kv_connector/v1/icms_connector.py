@@ -5881,6 +5881,21 @@ class _Worker:
                     "(harmless; on_closed will GC the entry)",
                     request_id, e)
 
+        # Per-rid Evict (replaces server's --allocator-auto-reset bulk wipe).
+        # Each rank fires for its own rank-namespaced chain — chains are
+        # written per-rank during Phase 1, so cleanup is per-rank too.
+        # Server's handle_evict drops trie nodes + frees JBOF + updates LRU
+        # for the specified chain only — no race against sibling rids whose
+        # chains live elsewhere in the trie.
+        if self._client is not None and rs.chain:
+            try:
+                self._client.evict(self._rank_chain(rs.chain))
+            except Exception as e:
+                logger.debug(
+                    "evict RPC failed for rid=%s: %s "
+                    "(harmless; on_closed / shutdown evict is the backstop)",
+                    request_id, e)
+
     # ─── direct helper API (backward compat with smoke tests) ────────────
 
     def direct_write_group(self, request_id: str, chain: list[int],
