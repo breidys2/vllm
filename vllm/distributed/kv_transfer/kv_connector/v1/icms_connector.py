@@ -1904,7 +1904,15 @@ class _Worker:
         )
 
     def _rank_chain(self, chain):
-        """Apply this worker's rank tag to an outbound chain (TP sharding)."""
+        """Apply this worker's rank tag to an outbound chain (TP sharding).
+
+        At TP=1 the tag is degenerate (single rank, no cross-rank trie
+        conflict to prevent), so we skip it — keeps the wire chains free
+        of synthetic prefix entries that have no associated KV data and
+        would otherwise cause WriteGroup byte-count mismatches in v6.
+        """
+        if self._tp_size <= 1:
+            return list(chain) if chain is not None else chain
         return _rank_tagged_chain(self._tp_rank, chain)
 
     def _get_stored_context_groups(self, chain: list[int]) -> int:
@@ -5718,8 +5726,23 @@ class _Worker:
             if self._tp_size > 1 and self._tp_rank != 0:
                 pass  # rank>0 skips the wire write_group
             else:
+                # v6 wire. WG#1 of a rid (group_idx==0) is a fresh
+                # registration: parent=[], tail=full_rank_chain. Server
+                # routes to insert() which handles cross-rid prefix
+                # split + ref bumping. WG#k>1 is streaming extension:
+                # parent=rank_chain[:-1], tail=[last]. Server routes to
+                # extend() with swap-on-extend semantics. Both keep
+                # per-rid contribution to each node at +1, so one Evict
+                # at request-finish frees the whole chain.
+                rank_chain = self._rank_chain(chain_prefix)
+                if group_idx == 0:
+                    parent_chain = []
+                    new_tail_groups = list(rank_chain)
+                else:
+                    parent_chain = rank_chain[:-1]
+                    new_tail_groups = [rank_chain[-1]]
                 self._client.write_group(
-                    self._rank_chain(chain_prefix),
+                    parent_chain, new_tail_groups,
                     bytes(buf.summary_blob), bytes(buf.kv_blob),
                     pages_in_group=pages,
                 )
@@ -5895,6 +5918,24 @@ class _Worker:
                     "evict RPC failed for rid=%s: %s "
                     "(harmless; on_closed / shutdown evict is the backstop)",
                     request_id, e)
+            # Prune _stored_chain_groups of entries that overlap with the
+            # just-evicted chain. Without this, a later rid sharing a
+            # prefix would consult the ledger, see "N groups stored",
+            # and skip its own writes — but the trie was just emptied.
+            # Result: Score returns ENOENT ("ledger claims groups stored
+            # but trie has none"). Conservative: drop any entry whose
+            # chain shares ANY prefix with the just-evicted chain.
+            evicted = list(rs.chain)
+            def _shares_prefix(a, b):
+                n = min(len(a), len(b))
+                for i in range(n):
+                    if a[i] != b[i]:
+                        return False
+                return n > 0
+            self._stored_chain_groups = [
+                (sc, n) for (sc, n) in self._stored_chain_groups
+                if not _shares_prefix(evicted, sc)
+            ]
 
     # ─── direct helper API (backward compat with smoke tests) ────────────
 
@@ -5906,9 +5947,14 @@ class _Worker:
         # Option W: only rank 0 RPCs; other ranks no-op but keep local state.
         if self._tp_size > 1 and self._tp_rank != 0:
             return None
-        return self._client.write_group(self._rank_chain(chain),
-                                         summary_blob, kv_blob,
-                                         pages_in_group=_GROUP_BLOCKS)
+        # v6 wire: direct write is always a fresh registration
+        # (parent=[], tail=full chain). Used by smoke tests that put
+        # a complete chain in one shot.
+        rank_chain = self._rank_chain(chain)
+        return self._client.write_group(
+            [], list(rank_chain),
+            summary_blob, kv_blob,
+            pages_in_group=_GROUP_BLOCKS)
 
     def direct_score(self, request_id: str, chain: list[int],
                       layer: int, query: torch.Tensor, k: int):
