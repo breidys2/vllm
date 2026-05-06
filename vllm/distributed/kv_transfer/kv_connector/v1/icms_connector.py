@@ -306,6 +306,20 @@ class IcmsConnectorMetadata(KVConnectorMetadata):
     # authoritative `_stored_chains` so both worker ranks see the
     # same flag — symmetric across TP, no AllGather risk.
     skip_extract_rids: set[str] = field(default_factory=set)
+    # 2026-05-06: scheduler-side stored_groups lookup, ferried via
+    # metadata to the worker. The worker's local `_stored_chain_groups`
+    # ledger is populated only when the deferred write pipeline's
+    # `_record_stored_groups` runs (and via on_request_finished).
+    # At turn N+1's first `on_step_start`, that ledger is racy —
+    # turn N's pipeline may not have committed yet — so the worker's
+    # `_get_stored_context_groups` returns 0 → `_score_one_request`
+    # early-returns at `total_pages == 0` → turn N+1's prefill Score
+    # NEVER fires with the question's Q. The scheduler's
+    # `_stored_chains` is up-to-date because it drains
+    # `_stored_chain_queue` at the top of `build_meta`. Pass the
+    # authoritative value here so the worker doesn't have to consult
+    # its own potentially-stale cache.
+    stored_groups_by_rid: dict[str, int] = field(default_factory=dict)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -814,6 +828,11 @@ class IcmsConnector(KVConnectorBase_V1):
         # GPUDirect RDMA: server writes KV directly into GPU HBM.
         self._gpu_direct: bool = bool(extra.get("icms_gpu_direct", False))
         self._gpu_device: str = extra.get("icms_gpu_device", "cuda:0")
+        # CUDA-IPC sink for the local mem-backend (Phase 1 of
+        # docs/cuda_ipc_local_sink_plan_2026-05-05.md). Mutually exclusive
+        # with --rdma. Set by the bench via --ipc-gpu-sink.
+        self._local_gpu_direct: bool = bool(
+            extra.get("icms_local_gpu_direct", False)) and not self._use_rdma
 
         # ICMS is designed as an external KV backing store: turn-end drop
         # is the intended default, and cross-turn prefix hits are served
@@ -860,6 +879,7 @@ class IcmsConnector(KVConnectorBase_V1):
                 fetch_all_post_score=self._fetch_all_post_score,
                 shmem_name=self._shmem_name,
                 sink_slots=self._sink_slots,
+                local_gpu_direct=self._local_gpu_direct,
             )
 
     # ══════════════════════════════════════════════════════════════════════
@@ -1276,6 +1296,10 @@ class _Scheduler:
                 # into the upcoming forward yet.
                 continue
             stored_groups = self._lookup_stored_prefix(chain)
+            if stored_groups > 0:
+                # Ferry the authoritative scheduler-side value to the
+                # worker so it doesn't consult its racy local cache.
+                meta.stored_groups_by_rid[prs.request_id] = stored_groups
             if stored_groups >= complete_groups_after:
                 meta.skip_extract_rids.add(prs.request_id)
         return meta
@@ -1502,13 +1526,22 @@ class _Worker:
                  gpu_device: str = "cuda:0",
                  fetch_all_post_score: bool = False,
                  shmem_name: str = "",
-                 sink_slots: int = 1):
+                 sink_slots: int = 1,
+                 local_gpu_direct: bool = False):
         self._socket_path = socket_path
         self._use_rdma = use_rdma
         self._rdma_server_host = rdma_server_host
         self._rdma_port = rdma_port
         self._rdma_ib_dev = rdma_ib_dev
         self._gpu_direct = gpu_direct
+        # CUDA-IPC sink for the local mem-backend (Phase 1 of
+        # docs/cuda_ipc_local_sink_plan_2026-05-05.md). Mutually exclusive
+        # with --rdma; only takes effect when the connector talks to a
+        # spawned mem-backend icms_server. When True, the connector
+        # implicitly enables gpu_direct semantics on the apply path.
+        self._local_gpu_direct = bool(local_gpu_direct) and not use_rdma
+        if self._local_gpu_direct:
+            self._gpu_direct = True
         self._gpu_device = gpu_device
         self._shmem_name = shmem_name  # non-empty → use ShmemIcmsClient
         self._model_name = model_name
@@ -1888,12 +1921,34 @@ class _Worker:
             sink = self._client.register_gpu_sink(
                 total_sink, gpu_dev, flag_slots=flag_slots)
             sink_desc = f"gpu_direct({gpu_dev})"
+        elif self._local_gpu_direct:
+            # Phase-1 CUDA-IPC sink for the local mem-backend. No flag
+            # sink (Phase 1 reply is synchronous; flag-poll only ships
+            # with RDMA where ready-flags ride the same QP). The IPC
+            # sink reports is_gpu_direct=True so the apply path's
+            # gpu_direct branch fires unchanged.
+            sink = self._client.register_cuda_ipc_sink(total_sink, gpu_dev)
+            sink_desc = f"cuda_ipc({gpu_dev})"
         else:
             sink = self._client.register_sink(total_sink)
             sink_desc = "host"
         self._sink_pool = _SinkSlotPool(sink, per_layer_bytes,
                                           self._sink_slots)
         self._sink_per_layer_bytes = per_layer_bytes
+        if os.environ.get("ICMS_DIAG_TP_SINK", "0") == "1":
+            try:
+                _peek_init = bytes(sink.mm[0:16]).hex()
+                logger.info(
+                    "[diag-tp-sink-init] rank=%d pid=%d shm_name=%s "
+                    "sink_id=%s kv_bytes=%d init_head16=%s",
+                    self._tp_rank, os.getpid(),
+                    getattr(sink, "name", "?"),
+                    getattr(sink, "sink_id", -1),
+                    getattr(sink, "_kv_data_size", -1),
+                    _peek_init)
+            except Exception as _diag_e:
+                logger.warning(
+                    "[diag-tp-sink-init] peek failed: %s", _diag_e)
         logger.info(
             "IcmsConnector worker: connected to %s, model=%s, "
             "sink=%s %d layers × %d B/layer × %d slots = %d B total, "
@@ -1904,16 +1959,20 @@ class _Worker:
         )
 
     def _rank_chain(self, chain):
-        """Apply this worker's rank tag to an outbound chain (TP sharding).
+        """Pass-through. Trie chains are rank-agnostic at every TP.
 
-        At TP=1 the tag is degenerate (single rank, no cross-rank trie
-        conflict to prevent), so we skip it — keeps the wire chains free
-        of synthetic prefix entries that have no associated KV data and
-        would otherwise cause WriteGroup byte-count mismatches in v6.
+        Historical: at TP>1 we used to prepend a per-rank tag to namespace
+        chains in the global trie. That predates the Option-W server-side
+        fan-out design (only rank 0 talks to the wire; the server fans
+        out sink bytes to every rank's sink). With rank-0-only writes
+        there is no cross-rank trie conflict to prevent, and the synthetic
+        prefix has no associated KV bytes so it broke the v6 per-tail
+        byte accounting in WriteGroup. Removing it also lets a chain
+        written at TP=2 be readable at TP=1 (and vice versa). The
+        _rank_tag / _rank_tagged_chain helpers remain in this module
+        for the moment but are unused — slated for cleanup.
         """
-        if self._tp_size <= 1:
-            return list(chain) if chain is not None else chain
-        return _rank_tagged_chain(self._tp_rank, chain)
+        return list(chain) if chain is not None else chain
 
     def _get_stored_context_groups(self, chain: list[int]) -> int:
         """Find the longest stored chain prefix matching the given chain.
@@ -2321,14 +2380,25 @@ class _Worker:
                 sorted(meta.skip_extract_rids),
                 "; ".join(req_summaries))
         for rid, chain in meta.new_chains.items():
-            n_stored = self._get_stored_context_groups(chain)
+            # Prefer the scheduler-side value when present. The worker's
+            # `_stored_chain_groups` ledger races: turn N's pipeline may
+            # not have committed by turn N+1's first on_step_start. The
+            # scheduler's `_stored_chains` is drained from
+            # `_stored_chain_queue` at build_meta entry, so it reflects
+            # everything the worker has actually flushed.
+            sched_n = (meta.stored_groups_by_rid.get(rid, 0)
+                       if hasattr(meta, "stored_groups_by_rid")
+                       else 0)
+            local_n = self._get_stored_context_groups(chain)
+            n_stored = max(sched_n, local_n)
             rs = self._requests.setdefault(rid, _RequestState(request_id=rid))
             rs.stored_groups = n_stored
             if os.environ.get("ICMS_DIAG_N13", "0") == "1":
                 logger.info(
                     "[diag-step] rank=%d new_chain rid=%s chain_len=%d "
-                    "stored_groups=%d", self._tp_rank, rid, len(chain),
-                    n_stored)
+                    "stored_groups=%d (sched=%d local=%d)",
+                    self._tp_rank, rid, len(chain),
+                    n_stored, sched_n, local_n)
         for rid, chain in meta.new_chains.items():
             rs = self._requests.setdefault(rid, _RequestState(request_id=rid))
             rs.chain = chain
@@ -2355,6 +2425,11 @@ class _Worker:
         on the same connection is FIFO-ordered behind the preload on
         the reactor, so it's guaranteed to hit the cache.
         """
+        # Option W: only rank 0 talks to the wire. Score is also rank-0-only,
+        # so a rank-N>0 preload would populate a cache entry that nothing
+        # ever reads — wasted work + duplicate frames on the server.
+        if self._tp_size > 1 and self._tp_rank != 0:
+            return
         try:
             icms_rid = self._icms_request_id(request_id, 0)
             self._client.preload(request_id=icms_rid,
@@ -2503,25 +2578,56 @@ class _Worker:
                 self._adaptive_allocator.compute_supply_bps_for(rid))
 
         t_start = time.perf_counter()
+        reply = None
         try:
-            reply = self._client.fetch_all(
-                request_id=icms_rid,
-                chain=self._rank_chain(rs.chain),
-                layer=next_layer_idx,
-                sink=self._sink_pool.sink,
-                reuse_through_layer=reuse_through,
-                # Reply-early: server ships the FetchAll reply as soon as
-                # page_ids are known; Phase-2 KV writes + per-layer flag
-                # flips run in background so the GPU forward pass overlaps
-                # with the transfer. Note: reply's sink_write_ns /
-                # server_ingest_to_ready_ns are reported as 0 in this
-                # mode — the transfer wall-time shows up as the sum of
-                # per-layer wait_spin on the client side.
-                use_flags=(os.environ.get("ICMS_REPLY_EARLY", "1") == "1"),
-                demand_bps=ab_demand_bps,
-                compute_supply_bps=ab_compute_supply_bps,
-            )
+            # Audit B1 fix (2026-05-06): rank-gate the RPC. Server's
+            # drain-time fan-out replicates rank-0's sink to every peer
+            # rank, so non-zero ranks don't need the wire round-trip —
+            # they just need the reply tuple (page_ids, sink_offsets, …)
+            # to populate _pending_scores / _pending_reuse identically.
+            # Mirrors Score's gate at on_layer_score (line ~3298).
+            if self._tp_size > 1 and self._tp_rank != 0:
+                reply = None
+            else:
+                reply = self._client.fetch_all(
+                    request_id=icms_rid,
+                    chain=self._rank_chain(rs.chain),
+                    layer=next_layer_idx,
+                    sink=self._sink_pool.sink,
+                    reuse_through_layer=reuse_through,
+                    # Reply-early: server ships the FetchAll reply as soon
+                    # as page_ids are known; Phase-2 KV writes + per-layer
+                    # flag flips run in background so the GPU forward pass
+                    # overlaps with the transfer. Note: reply's
+                    # sink_write_ns / server_ingest_to_ready_ns are
+                    # reported as 0 in this mode — the transfer wall-time
+                    # shows up as the sum of per-layer wait_spin on the
+                    # client side.
+                    use_flags=(os.environ.get("ICMS_REPLY_EARLY", "1") == "1"),
+                    demand_bps=ab_demand_bps,
+                    compute_supply_bps=ab_compute_supply_bps,
+                )
             t_end = time.perf_counter()
+            # Broadcast reply across ranks (outside the RPC call so a
+            # rank-0 failure still reaches the collective on every rank).
+            if self._tp_size > 1:
+                try:
+                    reply = _tp_broadcast_score_reply(
+                        reply, self._tp_rank, self._tp_size)
+                except Exception:
+                    logger.exception(
+                        "fetch_all broadcast failed rank=%d layer=%d",
+                        self._tp_rank, next_layer_idx)
+                    reply = None
+            if reply is None:
+                # Rank-0 RPC failed (or broadcast erred). Record a miss
+                # so stats stay consistent and skip post-processing —
+                # _pending_scores stays empty for this layer/rid and the
+                # downstream wait_for_layer will fall through.
+                self.stats.record_score(
+                    (t_end - t_start) * 1e6, False, [], next_layer_idx,
+                )
+                return
             rs._last_storage_concurrent = getattr(
                 reply, 'concurrent_requests', 0)
             # Adaptive-bandwidth: stash the storage-side effective supply
@@ -2773,6 +2879,39 @@ class _Worker:
             for req_idx, (rid, rs) in enumerate(self._requests.items()):
                 if rs.chain:
                     requests_to_score.append((req_idx, rid, rs))
+
+        _diag_se_n = getattr(self, "_diag_score_entry_count", 0)
+        if (os.environ.get("ICMS_DIAG_SCORE_ENTRY", "0") == "1"
+                and _diag_se_n < 5):
+            self._diag_score_entry_count = _diag_se_n + 1
+            try:
+                _meta_n_reqs = (
+                    len(connector_meta.requests)
+                    if connector_meta is not None
+                       and isinstance(connector_meta, IcmsConnectorMetadata)
+                       and connector_meta.requests is not None
+                    else -1)
+                _meta_new_chains_n = (
+                    len(connector_meta.new_chains)
+                    if connector_meta is not None
+                       and isinstance(connector_meta, IcmsConnectorMetadata)
+                       and connector_meta.new_chains is not None
+                    else -1)
+                _self_reqs_n = len(self._requests)
+                _self_reqs_with_chain = sum(
+                    1 for rs in self._requests.values() if rs.chain)
+                _last_chain_n = len(getattr(self, "_last_chain_for_rid", {}))
+                logger.info(
+                    "[diag-score-entry] rank=%d tp_size=%d layer=%d "
+                    "meta_n_reqs=%d meta_new_chains=%d self_requests=%d "
+                    "self_with_chain=%d last_chain_for_rid_n=%d "
+                    "requests_to_score=%d",
+                    self._tp_rank, self._tp_size, next_layer_idx,
+                    _meta_n_reqs, _meta_new_chains_n, _self_reqs_n,
+                    _self_reqs_with_chain, _last_chain_n,
+                    len(requests_to_score))
+            except Exception as _e:
+                logger.warning("diag-score-entry failed: %s", _e)
 
         if not requests_to_score:
             return
@@ -3061,6 +3200,21 @@ class _Worker:
         # Marshal query to fp32 numpy, mean-pooling Q heads per KV-head
         # group for GQA.
         geom = self._geom
+        _diag_q_n = getattr(self, "_diag_q_shape_count", 0)
+        if (isinstance(quest_query, torch.Tensor)
+                and os.environ.get("ICMS_DIAG_Q_SHAPE", "0") == "1"
+                and _diag_q_n < 30):
+            self._diag_q_shape_count = _diag_q_n + 1
+            try:
+                logger.info(
+                    "[diag-q-shape] n=%d rank=%d tp_size=%d rid=%s "
+                    "layer=%d is_decode=%s prefill_done=%s q.shape=%s",
+                    _diag_q_n, self._tp_rank, self._tp_size, rid,
+                    next_layer_idx,
+                    is_decode, getattr(self, "_prefill_done", "?"),
+                    tuple(quest_query.shape))
+            except Exception as _e:
+                logger.warning("diag-q-shape failed: %s", _e)
         if isinstance(quest_query, torch.Tensor):
             # ── DIAGNOSTIC: log forward batch size at the first scored layer.
             # quest_query.shape[0] is the actual number of forward tokens
@@ -3267,6 +3421,86 @@ class _Worker:
             # (Legacy sync mode kept the force-ready here.)
             sink = self._sink_pool.sink
             _ = sink
+            if (os.environ.get("ICMS_DIAG_TP_SINK", "0") == "1"
+                    and reply.sink_offsets):
+                try:
+                    _off0 = int(reply.sink_offsets[0])
+                    _peek = bytes(sink.mm[_off0:_off0 + 16]).hex()
+                    _sink_name = getattr(sink, "name", "?")
+                    _sink_id = getattr(sink, "sink_id", -1)
+                    logger.info(
+                        "[diag-tp-sink-read] rank=%d pid=%d rid=%s layer=%d "
+                        "n_pids=%d n_offsets=%d off0=%d sink_kv_bytes=%d "
+                        "shm_name=%s sink_id=%d head16=%s",
+                        self._tp_rank, os.getpid(), rid, next_layer_idx,
+                        len(reply.page_ids), len(reply.sink_offsets),
+                        _off0, sink._kv_data_size,
+                        _sink_name, _sink_id, _peek)
+                except Exception as _diag_e:
+                    logger.warning(
+                        "[diag-tp-sink-read] peek failed: %s", _diag_e)
+            # First-Score chain-state diag: log chain length, flushed_local,
+            # and any per-rid bookkeeping that affects what Score can see.
+            # If chain doesn't cover all pages of the prefill, server can
+            # only score a prefix → returned page IDs cap at chain-len.
+            if (os.environ.get("ICMS_DIAG_PAGE_IDS", "")
+                    and not getattr(self, "_diag_chain_state_fired", False)):
+                self._diag_chain_state_fired = True
+                try:
+                    logger.info(
+                        "[diag-chain-state] rank=%d tp_size=%d rid=%s "
+                        "layer=%d chain_len=%d flushed_local=%d "
+                        "stored_groups=%d num_groups_written=%d "
+                        "k_requested=%d total_pages=%d",
+                        self._tp_rank, self._tp_size, rid, next_layer_idx,
+                        len(rs.chain), int(getattr(rs, "flushed_local", -1)),
+                        int(getattr(rs, "stored_groups", -1)),
+                        int(getattr(rs, "num_groups_written", -1)),
+                        k, total_pages)
+                except Exception as _e:
+                    logger.warning("diag-chain-state failed: %s", _e)
+            # First-Score page_ids fingerprint + full dump. Lets us
+            # compare which pages Score selected across TP=1 / TP=2.
+            # Dumps the FULL set of page_ids to a JSON file so we can
+            # check membership of any specific page (e.g. the needle's
+            # page) without parsing log lines.
+            _diag_pids_path = os.environ.get("ICMS_DIAG_PAGE_IDS", "")
+            if (_diag_pids_path
+                    and not getattr(self, "_diag_page_ids_fired", False)):
+                self._diag_page_ids_fired = True
+                try:
+                    import json as _json
+                    _pids = list(int(p) for p in reply.page_ids)
+                    _sorted_pids = sorted(_pids)
+                    _hash = 0
+                    for _p in _sorted_pids:
+                        _hash = (_hash * 31 + _p) & 0xFFFFFFFFFFFFFFFF
+                    out_path = (_diag_pids_path
+                                if _diag_pids_path != "1"
+                                else f"/tmp/icms_diag_pids_tp{self._tp_size}_"
+                                     f"r{self._tp_rank}_pid{os.getpid()}.json")
+                    # Also dump scores for distribution analysis.
+                    _scores = [float(s) for s in reply.scores]
+                    _pid_score = list(zip(_pids, _scores))
+                    with open(out_path, "w") as f:
+                        _json.dump({
+                            "tp_rank": self._tp_rank,
+                            "tp_size": self._tp_size,
+                            "rid": rid,
+                            "layer": next_layer_idx,
+                            "n_pids": len(_pids),
+                            "pids_sorted_hash": f"{_hash:016x}",
+                            "pids_sorted": _sorted_pids,
+                            "pid_score_unsorted": _pid_score,
+                        }, f)
+                    logger.info(
+                        "[diag-page-ids] rank=%d tp_size=%d rid=%s "
+                        "layer=%d n_pids=%d head[:8]=%s tail[:8]=%s "
+                        "sorted_hash=%016x dumped=%s",
+                        self._tp_rank, self._tp_size, rid, next_layer_idx,
+                        len(_pids), _pids[:8], _pids[-8:], _hash, out_path)
+                except Exception as _e:
+                    logger.warning("diag-page-ids failed: %s", _e)
             # Stash storage-side concurrent request count for adaptive budget.
             rs._last_storage_concurrent = getattr(
                 reply, 'concurrent_requests', 0)
@@ -4067,6 +4301,22 @@ class _Worker:
                     if self._tp_size > 1 and not per_rank_slice:
                         nkv_local = geom.num_kv_heads // self._tp_size
                         start = self._tp_rank * nkv_local
+                        if (os.environ.get("ICMS_DIAG_TP_APPLY", "0") == "1"
+                                and not getattr(self, "_diag_tp_apply_fast_fired", False)):
+                            try:
+                                _pre = bytes(k_pages[0, 0, 0].view(torch.uint8).cpu().numpy().tobytes()[:16]).hex()
+                                _sl = k_pages[:, :, start:start + nkv_local, :].contiguous()
+                                _post = bytes(_sl[0, 0, 0].view(torch.uint8).cpu().numpy().tobytes()[:16]).hex()
+                                logger.info(
+                                    "[diag-tp-apply-fast] rank=%d nkv_total=%d "
+                                    "nkv_local=%d start=%d k_pages_shape=%s "
+                                    "pre_slice_h0_b16=%s post_slice_h%d_b16=%s",
+                                    self._tp_rank, geom.num_kv_heads,
+                                    nkv_local, start, list(k_pages.shape),
+                                    _pre, start, _post)
+                                self._diag_tp_apply_fast_fired = True
+                            except Exception as _e:
+                                logger.warning("diag-tp-apply-fast failed: %s", _e)
                         k_pages = k_pages[:, :, start:start + nkv_local, :].contiguous()
                         v_pages = v_pages[:, :, start:start + nkv_local, :].contiguous()
                     main_key.index_copy_(0, phys_blocks_dev, k_pages)
@@ -4584,6 +4834,22 @@ class _Worker:
                 if self._tp_size > 1 and not per_rank_slice:
                     nkv_local = geom.num_kv_heads // self._tp_size
                     start = self._tp_rank * nkv_local
+                    if (os.environ.get("ICMS_DIAG_TP_APPLY", "0") == "1"
+                            and not getattr(self, "_diag_tp_apply_fired", False)):
+                        try:
+                            _pre = bytes(k_pages[0, 0, 0].view(torch.uint8).cpu().numpy().tobytes()[:16]).hex()
+                            _sl = k_pages[:, :, start:start + nkv_local, :].contiguous()
+                            _post = bytes(_sl[0, 0, 0].view(torch.uint8).cpu().numpy().tobytes()[:16]).hex()
+                            logger.info(
+                                "[diag-tp-apply-slow] rank=%d nkv_total=%d "
+                                "nkv_local=%d start=%d k_pages_shape=%s "
+                                "pre_slice_h0_b16=%s post_slice_h%d_b16=%s",
+                                self._tp_rank, geom.num_kv_heads,
+                                nkv_local, start, list(k_pages.shape),
+                                _pre, start, _post)
+                            self._diag_tp_apply_fired = True
+                        except Exception as _e:
+                            logger.warning("diag-tp-apply-slow failed: %s", _e)
                     k_pages = k_pages[:, :, start:start + nkv_local, :].contiguous()
                     v_pages = v_pages[:, :, start:start + nkv_local, :].contiguous()
 
@@ -4686,6 +4952,44 @@ class _Worker:
                 k_t = k_buf.clone().to(device=device)
                 v_t = v_buf.clone().to(device=device)
                 if self._tp_size > 1 and not per_rank_slice:
+                    if (os.environ.get("ICMS_DIAG_TP_APPLY", "0") == "1"
+                            and not getattr(self, "_diag_tp_apply_host_fired", False)):
+                        # set flag UNCONDITIONALLY to ensure single-shot
+                        self._diag_tp_apply_host_fired = True
+                        try:
+                            # k_t shape: (PAGE_TOKENS, num_kv_heads_full, head_dim)
+                            _h0_sum = k_t[0, 0, :].float().sum().item()
+                            _h_local_sum = k_t[0, head_start, :].float().sum().item()
+                            _post = k_t[:, head_start:head_start + nkv_local, :]
+                            _post_h0_sum = _post[0, 0, :].float().sum().item()
+                            # Block-table comparison: log this rid's bt row
+                            # head + the phys_block we're about to scatter to
+                            try:
+                                _bt_row_head = bt[req_idx, :8].cpu().tolist()
+                                _bt_row_tail = (bt[req_idx, max(0, bt.shape[1]-8):].cpu().tolist()
+                                                if bt.shape[1] > 8 else [])
+                                _bt_row_len = int(bt.shape[1])
+                                _phys_block = int(bt[req_idx, pid])
+                                _seq_len_dbg = int(seq_len) if seq_len is not None else -1
+                            except Exception:
+                                _bt_row_head = _bt_row_tail = []
+                                _bt_row_len = _phys_block = _seq_len_dbg = -1
+                            logger.info(
+                                "[diag-tp-apply-host] rank=%d nkv_total=%d "
+                                "nkv_local=%d head_start=%d k_t_shape=%s "
+                                "k_t[0,0,:].sum=%.4f "
+                                "k_t[0,head_start=%d,:].sum=%.4f "
+                                "post[0,0,:].sum=%.4f post_shape=%s "
+                                "first_pid=%d phys_block=%d bt_row_len=%d "
+                                "seq_len=%d bt[head]=%s bt[tail]=%s",
+                                self._tp_rank, geom.num_kv_heads,
+                                nkv_local, head_start, list(k_t.shape),
+                                _h0_sum, head_start, _h_local_sum,
+                                _post_h0_sum, list(_post.shape),
+                                pid, _phys_block, _bt_row_len, _seq_len_dbg,
+                                _bt_row_head, _bt_row_tail)
+                        except Exception as _e:
+                            logger.warning("diag-tp-apply-host failed: %s", _e)
                     # Slice to this rank's KV-head range BEFORE the copy.
                     k_t = k_t[:, head_start:head_start + nkv_local, :]
                     v_t = v_t[:, head_start:head_start + nkv_local, :]
@@ -5723,8 +6027,16 @@ class _Worker:
         try:
             # Option W: only rank 0 sends to the server. All ranks still
             # update local bookkeeping (_record_stored_groups etc.) below.
+            _diag_tp_write = os.environ.get("ICMS_DIAG_TP_WRITE", "0") == "1"
             if self._tp_size > 1 and self._tp_rank != 0:
-                pass  # rank>0 skips the wire write_group
+                if _diag_tp_write:
+                    logger.info(
+                        "[diag-tp-write] rank=%d SKIP rid=%s gidx=%d "
+                        "chain_prefix_len=%d partial=%s pages=%d "
+                        "summary_bytes=%d kv_bytes=%d",
+                        self._tp_rank, request_id, group_idx,
+                        len(chain_prefix), partial, pages,
+                        len(buf.summary_blob), len(buf.kv_blob))
             else:
                 # v6 wire. WG#1 of a rid (group_idx==0) is a fresh
                 # registration: parent=[], tail=full_rank_chain. Server
@@ -5741,6 +6053,20 @@ class _Worker:
                 else:
                     parent_chain = rank_chain[:-1]
                     new_tail_groups = [rank_chain[-1]]
+                if _diag_tp_write:
+                    _ck_first = rank_chain[0] if rank_chain else None
+                    _ck_last = rank_chain[-1] if rank_chain else None
+                    logger.info(
+                        "[diag-tp-write] rank=%d WRITE rid=%s gidx=%d "
+                        "tp_size=%d chain_len=%d ck_first=%s ck_last=%s "
+                        "parent_len=%d tail_len=%d pages=%d "
+                        "summary_bytes=%d kv_bytes=%d partial=%s",
+                        self._tp_rank, request_id, group_idx,
+                        self._tp_size, len(rank_chain),
+                        _ck_first, _ck_last,
+                        len(parent_chain), len(new_tail_groups),
+                        pages, len(buf.summary_blob),
+                        len(buf.kv_blob), partial)
                 self._client.write_group(
                     parent_chain, new_tail_groups,
                     bytes(buf.summary_blob), bytes(buf.kv_blob),

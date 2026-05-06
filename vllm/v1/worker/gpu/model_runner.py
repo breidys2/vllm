@@ -288,18 +288,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         sent to the KV connector for CPU-side page scoring and selective
         prefetch.
         """
-        try:
-            from vllm.v1.kv_offload.quest import QuestOffloadingSpec
-        except ImportError:
-            return
-
         # Check if we're using Quest offloading.
         kv_transfer_config = self.vllm_config.kv_transfer_config
         if kv_transfer_config is None:
+            logger.info(
+                "Quest hooks: skipped (no kv_transfer_config)")
             return
 
         extra = kv_transfer_config.kv_connector_extra_config or {}
         if "quest_budget" not in extra and "quest_page_size" not in extra:
+            logger.info(
+                "Quest hooks: skipped (no quest_budget/quest_page_size in "
+                "kv_connector_extra_config)")
             return
 
         try:
@@ -330,32 +330,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
             # Select budget computer: adaptive (bandwidth-based) or constant.
-            # The adaptive allocator is owned by QuestOffloadingSpec and shared
-            # via get_adaptive_allocator() — it tracks concurrent request demand
-            # and returns budget = min(1, bandwidth / total_demand).
+            # Adaptive path duck-types: any object reachable as
+            # connector_worker.spec with a get_adaptive_allocator() callable
+            # is treated as the bandwidth source.
             budget_computer = ConstantBudget()
             if extra.get("adaptive_bandwidth", False):
-                # Retrieve the shared allocator from the spec.  The spec is
-                # reachable through the connector worker that was already
-                # initialised before this hook registration runs.
                 try:
-                    from vllm.v1.kv_offload.quest import QuestOffloadingSpec
                     connector_worker = getattr(
                         kv_connector_ref, "connector_worker", None)
                     spec = getattr(connector_worker, "spec", None)
-                    if isinstance(spec, QuestOffloadingSpec):
-                        allocator = spec.get_adaptive_allocator()
-                        if allocator is not None:
-                            budget_computer = allocator
-                            logger.info(
-                                "Quest hooks: using AdaptiveBandwidthAllocator"
-                            )
-                        else:
-                            logger.warning(
-                                "adaptive_bandwidth=True but allocator is None; "
-                                "falling back to ConstantBudget(%.2f)",
-                                quest_budget,
-                            )
+                    get_alloc = getattr(spec, "get_adaptive_allocator", None)
+                    allocator = get_alloc() if callable(get_alloc) else None
+                    if allocator is not None:
+                        budget_computer = allocator
+                        logger.info(
+                            "Quest hooks: using AdaptiveBandwidthAllocator")
+                    else:
+                        logger.warning(
+                            "adaptive_bandwidth=True but no allocator "
+                            "available on connector spec; falling back to "
+                            "ConstantBudget(%.2f)", quest_budget)
                 except Exception:
                     logger.warning(
                         "Failed to retrieve AdaptiveBandwidthAllocator; "
@@ -409,6 +403,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     single_layer_scoring,
                     extra.get("adaptive_bandwidth", False),
                 )
+            else:
+                logger.warning(
+                    "Quest hooks: register_%s returned 0 — ICMS Score will "
+                    "NOT fire and the bench will fall through to dense "
+                    "attention. Check decoder-layer detection.",
+                    "callbacks" if use_registry else "hooks")
         except Exception:
             logger.warning(
                 "Failed to register Quest hooks", exc_info=True
