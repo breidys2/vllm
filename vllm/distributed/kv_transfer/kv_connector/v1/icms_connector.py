@@ -6230,38 +6230,32 @@ class _Worker:
                     "(harmless; on_closed will GC the entry)",
                     request_id, e)
 
-        # Per-rid Evict (replaces server's --allocator-auto-reset bulk wipe).
-        # Each rank fires for its own rank-namespaced chain — chains are
-        # written per-rank during Phase 1, so cleanup is per-rank too.
-        # Server's handle_evict drops trie nodes + frees JBOF + updates LRU
-        # for the specified chain only — no race against sibling rids whose
-        # chains live elsewhere in the trie.
-        if self._client is not None and rs.chain:
-            try:
-                self._client.evict(self._rank_chain(rs.chain))
-            except Exception as e:
-                logger.debug(
-                    "evict RPC failed for rid=%s: %s "
-                    "(harmless; on_closed / shutdown evict is the backstop)",
-                    request_id, e)
-            # Prune _stored_chain_groups of entries that overlap with the
-            # just-evicted chain. Without this, a later rid sharing a
-            # prefix would consult the ledger, see "N groups stored",
-            # and skip its own writes — but the trie was just emptied.
-            # Result: Score returns ENOENT ("ledger claims groups stored
-            # but trie has none"). Conservative: drop any entry whose
-            # chain shares ANY prefix with the just-evicted chain.
-            evicted = list(rs.chain)
-            def _shares_prefix(a, b):
-                n = min(len(a), len(b))
-                for i in range(n):
-                    if a[i] != b[i]:
-                        return False
-                return n > 0
-            self._stored_chain_groups = [
-                (sc, n) for (sc, n) in self._stored_chain_groups
-                if not _shares_prefix(evicted, sc)
-            ]
+        # No per-rid Evict here.
+        #
+        # Eviction is a 3-layer design:
+        #   1. Local LRU on the data node — reactive memory-pressure
+        #      handler invoked from WriteGroup when the allocator OOMs
+        #      (handlers.cc lru_evict_oldest). Always on, refcount-aware
+        #      so shared prefixes survive.
+        #   2. Explicit kEvict RPC — server-side API for callers with
+        #      global visibility (handlers.cc handle_evict).
+        #   3. Distributed KV cache manager (future) — the upstream
+        #      caller of (2). Tracks chain references across data nodes
+        #      and drives explicit evictions.
+        #
+        # The connector is a worker, not the global manager. It cannot
+        # see whether a chain is still referenced elsewhere (e.g., turn-1
+        # of a NIAH bench example finishing while turn-2 is about to
+        # start with the same haystack prefix). Firing per-rid Evict here
+        # broke the dedup-skip optimization in extract_and_record:
+        # the local ledger said "N groups stored" but the server-side
+        # trie had just been emptied → Score returned ENOENT.
+        #
+        # Until (3) lands, capacity is handled by (1) alone. crashed-
+        # client / clean-shutdown cleanup is handled by on_closed
+        # server-side. Bench-level explicit cleanup, if needed, should
+        # call client.evict(chain) AFTER all budget iterations for an
+        # example complete — not at every per-rid request_finished.
 
     # ─── direct helper API (backward compat with smoke tests) ────────────
 
