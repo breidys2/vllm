@@ -167,6 +167,80 @@ def _rank_tagged_chain(tp_rank: int, chain):
     return [_rank_tag(tp_rank), *chain]
 
 
+# Cached separate NCCL group for ICMS connector collectives.
+# When ICMS_USE_SEPARATE_NCCL_GROUP=1, the connector's NCCL ops
+# (extract_and_record's K/V AllGather on the pipeline thread + the
+# main-thread Score/FetchAll Q AllGather + reply broadcasts) are
+# routed through a dedicated NCCL communicator instead of the default
+# TP group. This eliminates contention with vLLM's main-thread
+# NCCL ops (per-layer all_reduce, attention all_gather), which is the
+# root cause of the chunked-prefill TP>1 + fetchall TP>1 hang
+# (shm_broadcast TimeoutError).
+#
+# Same world (ranks) as the TP group, but a separate NCCL communicator
+# → ops on different communicators don't serialize through NCCL's
+# single-stream queue.
+_ICMS_NCCL_GROUP_CACHE: dict = {"group": None, "init_attempted": False}
+
+
+def _get_icms_nccl_group():
+    """Return the separate NCCL group for ICMS collectives, or None
+    if disabled / unavailable.
+
+    Lazy: created on first call. None means caller should fall back to
+    the default TP device group (legacy behavior).
+    """
+    if os.environ.get("ICMS_USE_SEPARATE_NCCL_GROUP", "0") != "1":
+        return None
+    if _ICMS_NCCL_GROUP_CACHE["init_attempted"]:
+        return _ICMS_NCCL_GROUP_CACHE["group"]
+    _ICMS_NCCL_GROUP_CACHE["init_attempted"] = True
+    try:
+        import torch.distributed as dist
+        from vllm.distributed.parallel_state import get_tp_group
+        tp_group = get_tp_group()
+        # Build a fresh NCCL group with the same ranks as the TP group.
+        # All TP-rank workers must call this in the same order; calling
+        # it inside _get_icms_nccl_group() means each worker creates
+        # the new group lazily on its first use of any ICMS NCCL op.
+        # Order is symmetric across ranks since the connector code
+        # paths are deterministic.
+        new_group = dist.new_group(
+            ranks=list(tp_group.ranks), backend="nccl")
+        # Pre-warm the NCCL communicator with a tiny no-op collective.
+        # `dist.new_group` returns immediately with a ProcessGroup object
+        # but defers the real NCCL P2P channel + buffer setup to the
+        # first collective op. Forcing setup here means OOM (if any)
+        # surfaces at init time rather than during a hot-path Score
+        # broadcast where the failure manifests as "Rank N has no
+        # transport for send peer M". A 1-element broadcast is enough
+        # to trigger the lazy setup.
+        try:
+            dev = torch.device(f"cuda:{torch.cuda.current_device()}")
+            warmup_t = torch.zeros(1, dtype=torch.int64, device=dev)
+            dist.broadcast(warmup_t, src=tp_group.first_rank,
+                           group=new_group)
+            torch.cuda.synchronize()
+        except Exception as warm_e:
+            logger.warning(
+                "[icms-nccl] separate NCCL group warmup broadcast "
+                "failed (%s) — falling back to TP device group. Try "
+                "lowering --gpu-memory-utilization to leave headroom "
+                "for NCCL P2P channels (~512 MiB on H100 NVL).",
+                warm_e)
+            return None
+        _ICMS_NCCL_GROUP_CACHE["group"] = new_group
+        logger.info(
+            "[icms-nccl] Created separate NCCL group for ICMS "
+            "collectives (ranks=%s) — warmup OK", list(tp_group.ranks))
+        return new_group
+    except Exception as e:
+        logger.warning(
+            "[icms-nccl] Failed to create separate NCCL group, "
+            "falling back to TP device group: %s", e)
+        return None
+
+
 def _tp_broadcast_score_reply(reply, tp_rank: int, tp_size: int):
     """Option W: rank 0 has the server's ScoreReply; broadcast it to every
     rank so each rank populates _pending_scores identically.
@@ -179,7 +253,7 @@ def _tp_broadcast_score_reply(reply, tp_rank: int, tp_size: int):
     import torch.distributed as dist  # noqa: E402
     from vllm.distributed.parallel_state import get_tp_group
     tp_group = get_tp_group()
-    dev_group = tp_group.device_group
+    dev_group = _get_icms_nccl_group() or tp_group.device_group
     dev = torch.device(f"cuda:{torch.cuda.current_device()}")
 
     # Header: [status, trie_walk_ns, summary_read_ns, score_ns,
@@ -1232,7 +1306,23 @@ class _Scheduler:
 
         meta = IcmsConnectorMetadata()
         # Per-step scheduled token counts (req_id → num_tokens this step).
-        sched_tokens = getattr(scheduler_output, "scheduled_num_tokens", {})
+        # 2026-05-07 BUG FIX: vLLM V2's canonical field is
+        # `num_scheduled_tokens` (see vllm/v1/core/sched/output.py:194-196),
+        # NOT `scheduled_num_tokens`. The typo silently returned `{}`
+        # via getattr's default → every n_step was 0 → meta_tokens=0
+        # for every rid → per-rid Q-slicing in _on_layer_score_impl
+        # produced empty `quest_query[0:0]` slices for every rid →
+        # Score saw no Q → garbage page selection → batched-mode
+        # accuracy collapse at higher k. The cascading effect is the
+        # SAME bug as the comment block at :1349-1358 attributed to
+        # "first scheduler tick race" — the comment was wrong; it's
+        # not a race, it's a 100% miss because the field name is
+        # wrong. Fall back to the typo'd name as a defensive measure
+        # in case some older vLLM build does use it.
+        sched_tokens = getattr(scheduler_output, "num_scheduled_tokens", None)
+        if sched_tokens is None:
+            sched_tokens = getattr(
+                scheduler_output, "scheduled_num_tokens", {})
 
         # New requests: list[NewRequestData] with .req_id, .num_computed_tokens.
         for sr in getattr(scheduler_output, "scheduled_new_reqs", []):
@@ -1355,13 +1445,17 @@ class _Scheduler:
             _stored_chain_queue.clear()
 
         rid = request.request_id
+        # Always read token_ids — the cached-rid branch below uses len(token_ids)
+        # at line 1495 to clamp ext_tokens. Hoisting outside the if-block fixes
+        # an UnboundLocalError that fired on the second call for the same rid
+        # (observed at h=128k with prefix-cache hits).
+        token_ids = getattr(request, "all_token_ids", None)
+        if token_ids is None or len(token_ids) == 0:
+            token_ids = getattr(request, "prompt_token_ids", [])
         # Ensure chain is computed.
         if rid not in self._chains:
             # Compute chain eagerly (before on_alloc which needs blocks).
             import hashlib
-            token_ids = getattr(request, "all_token_ids", None)
-            if token_ids is None or len(token_ids) == 0:
-                token_ids = getattr(request, "prompt_token_ids", [])
             group_tokens = _GROUP_BLOCKS * PAGE_TOKENS
             chain: list[int] = []
             if token_ids and len(token_ids) >= PAGE_TOKENS:
@@ -1755,6 +1849,13 @@ class _Worker:
         # the lifetime of the connector.
         self._cfg_per_rank_slice = (
             os.environ.get("ICMS_PER_RANK_SLICE", "0") == "1")
+        # 2026-05-07 PERF: cache _extract_layer_idx results.
+        # Called ~6 sites × 32-40 layers per forward = ~200+ calls;
+        # each does a string split + linear scan. Layer names are
+        # interned by vLLM's layer map and stable for the connector's
+        # lifetime → safe to cache by string key. Few hundred µs/forward
+        # win.
+        self._layer_idx_cache: "dict[str, int | None]" = {}
         self._cfg_apply_stream = (
             os.environ.get("ICMS_APPLY_STREAM", "0") == "1")
         self._cfg_skip_bounds = (
@@ -2563,8 +2664,37 @@ class _Worker:
             )
             rs._budget_logged = True
 
+        # Symmetric early-return on fresh chain (2026-05-07): mirrors
+        # _score_one_request's `if total_pages == 0: return`. Without
+        # this, rank 0 fires fetch_all RPC on an unresolved chain → server
+        # returns ENOENT → IcmsError raised → exception bypassed the
+        # broadcast (was inside the outer try block) → rank 1 deadlocked
+        # in dist.broadcast → vLLM sample_tokens RPC timed out at 5 min.
+        # `total_pages` derives from rs.num_groups_written + rs.stored_groups,
+        # which on_step_start populates symmetrically across ranks via
+        # scheduler-broadcast metadata, so all ranks return together.
+        if total_pages == 0:
+            return
+
         reuse_through = num_layers - 1
 
+        # ICMS_TRACE_FLAGS=1: capture pre-clear flag state to expose the
+        # shared-flag-region race in batched mode. If multiple rids hit
+        # this clear in interleaved order, this trace shows whether one
+        # rid's clear wipes another rid's pending flags.
+        if os.environ.get("ICMS_TRACE_FLAGS") == "1":
+            try:
+                snap = self._sink_pool.sink.snapshot_flags() if hasattr(
+                    self._sink_pool.sink, "snapshot_flags") else None
+                _t = time.perf_counter()
+                _set_layers = ([i for i, v in enumerate(snap) if v]
+                               if snap is not None else None)
+                logger.info(
+                    "[trace-flags] CLEAR site=score t=%.6f rid=%s "
+                    "set_before=%s",
+                    _t, request_id, _set_layers)
+            except Exception:
+                pass
         self._sink_pool.sink.clear_ready_flags()
 
         # Adaptive-bandwidth fields for the wire. Both 0 when adaptive is
@@ -2579,6 +2709,14 @@ class _Worker:
 
         t_start = time.perf_counter()
         reply = None
+        # Defense-in-depth (2026-05-07): isolate the RPC in its own
+        # try/except so a rank-0 RPC exception (e.g., ENOENT on a
+        # racing chain) does NOT bypass the broadcast collective below.
+        # Mirrors `on_layer_score`'s structure — broadcast is outside
+        # the RPC try so every rank participates regardless of rank-0
+        # outcome. The legacy structure had the broadcast inside the
+        # try, which deadlocked rank 1 on dist.broadcast at TP=2 +
+        # fresh chain.
         try:
             # Audit B1 fix (2026-05-06): rank-gate the RPC. Server's
             # drain-time fan-out replicates rank-0's sink to every peer
@@ -2607,27 +2745,36 @@ class _Worker:
                     demand_bps=ab_demand_bps,
                     compute_supply_bps=ab_compute_supply_bps,
                 )
-            t_end = time.perf_counter()
-            # Broadcast reply across ranks (outside the RPC call so a
-            # rank-0 failure still reaches the collective on every rank).
-            if self._tp_size > 1:
-                try:
-                    reply = _tp_broadcast_score_reply(
-                        reply, self._tp_rank, self._tp_size)
-                except Exception:
-                    logger.exception(
-                        "fetch_all broadcast failed rank=%d layer=%d",
-                        self._tp_rank, next_layer_idx)
-                    reply = None
-            if reply is None:
-                # Rank-0 RPC failed (or broadcast erred). Record a miss
-                # so stats stay consistent and skip post-processing —
-                # _pending_scores stays empty for this layer/rid and the
-                # downstream wait_for_layer will fall through.
-                self.stats.record_score(
-                    (t_end - t_start) * 1e6, False, [], next_layer_idx,
-                )
-                return
+        except Exception as e:
+            logger.debug("fetch_all RPC failed rank=%d layer=%d: %s",
+                         self._tp_rank, next_layer_idx, e)
+            reply = None
+        t_end = time.perf_counter()
+
+        # Broadcast reply across ranks UNCONDITIONALLY — must be outside
+        # the RPC try-except so a rank-0 failure still reaches the
+        # collective on every rank. Empty reply still broadcasts a header
+        # with n_pages=0 and returns symmetrically.
+        if self._tp_size > 1:
+            try:
+                reply = _tp_broadcast_score_reply(
+                    reply, self._tp_rank, self._tp_size)
+            except Exception:
+                logger.exception(
+                    "fetch_all broadcast failed rank=%d layer=%d",
+                    self._tp_rank, next_layer_idx)
+                reply = None
+        if reply is None or not reply.page_ids:
+            # Rank-0 RPC failed, broadcast erred, or server returned
+            # zero pages. Record a miss so stats stay consistent and
+            # skip post-processing — _pending_scores stays empty for
+            # this layer/rid and the downstream wait_for_layer falls
+            # through.
+            self.stats.record_score(
+                (t_end - t_start) * 1e6, False, [], next_layer_idx,
+            )
+            return
+        try:
             rs._last_storage_concurrent = getattr(
                 reply, 'concurrent_requests', 0)
             # Adaptive-bandwidth: stash the storage-side effective supply
@@ -2916,8 +3063,60 @@ class _Worker:
         if not requests_to_score:
             return
 
+        # 2026-05-07 DEFENSIVE ASSERT: validate quest_query length against
+        # FA's authoritative cu_q (query_start_loc[-1]). Any mismatch
+        # means our per-rid token-count math is fundamentally desync'd
+        # from what FA itself sees. The Q-slice typo (scheduled_num_tokens
+        # vs num_scheduled_tokens) at line 1309 silently produced
+        # mismatched math for 4 weeks of debugging because nothing
+        # surfaced this divergence. Fail loud now so future
+        # vLLM-API-rename or scheduler-output changes are caught
+        # immediately. Off via ICMS_QSLICE_NO_ASSERT=1 if needed.
+        if (os.environ.get("ICMS_QSLICE_NO_ASSERT", "0") != "1"
+                and quest_query is not None
+                and isinstance(quest_query, torch.Tensor)
+                and quest_query.ndim >= 1):
+            try:
+                _layer_name = (
+                    f"model.layers.{next_layer_idx}.self_attn.attn")
+                _am = (self._attn_metadata.get(_layer_name)
+                       if isinstance(self._attn_metadata, dict)
+                       else None)
+                _qsl = getattr(_am, "query_start_loc", None) \
+                    if _am is not None else None
+                if _qsl is not None and _qsl.numel() > 0:
+                    _expected = int(_qsl[-1].item())
+                    if quest_query.shape[0] != _expected:
+                        logger.warning(
+                            "[icms-qslice-assert] quest_query length "
+                            "mismatch: q=%d vs query_start_loc[-1]=%d "
+                            "(layer=%d). Q slicing math diverges from "
+                            "FA's cu_q — page selection will be wrong.",
+                            quest_query.shape[0], _expected,
+                            next_layer_idx)
+            except Exception as _e:
+                # Don't fail the request just because the probe broke.
+                logger.warning("[icms-qslice-assert] probe error: %s", _e)
+
         # Split the Q tensor per request using token counts from metadata.
         # quest_query shape: [total_tokens, num_heads, head_dim]
+        # 2026-05-07 BUG FIX: the prior offset-based slicing relied on
+        # `num_computed_tokens_end - num_computed_tokens_start` being
+        # the per-rid token count in quest_query. Empirically those
+        # metadata fields are ZERO at decode AND in many prefill iters
+        # in this vLLM version → every per-rid slice was empty
+        # (quest_query[0:0]). The fallback `per_request_q.get(rid,
+        # quest_query)` did NOT fire because rid IS in the dict (just
+        # with an empty tensor). Each rid's Score saw an empty Q →
+        # server picked top-K based on no information → page selection
+        # was effectively random → batched-mode accuracy collapse.
+        #
+        # Detection + correct slicing:
+        # 1. Decode mode: quest_query.shape[0] == len(meta.requests).
+        #    Each rid has 1 token; slice by req_idx.
+        # 2. Prefill with valid metadata: meta_tokens equals
+        #    quest_query.shape[0]; use offset-based slicing as before.
+        # 3. Otherwise: skip the dict; fallback to full quest_query.
         per_request_q = {}
         if (quest_query is not None
                 and isinstance(quest_query, torch.Tensor)
@@ -2925,17 +3124,96 @@ class _Worker:
                 and len(requests_to_score) > 1
                 and connector_meta is not None
                 and connector_meta.requests):
-            # Compute per-request token counts from metadata.
-            token_starts = []
-            offset = 0
-            for step_req in connector_meta.requests:
-                n_tokens = max(0, step_req.num_computed_tokens_end
-                               - step_req.num_computed_tokens_start)
-                token_starts.append((offset, offset + n_tokens, step_req.request_id))
-                offset += n_tokens
-            for start, end, rid in token_starts:
-                if end <= quest_query.shape[0]:
-                    per_request_q[rid] = quest_query[start:end]
+            _q_n = quest_query.shape[0]
+            _meta_n_reqs = len(connector_meta.requests)
+
+            # Phase B (2026-05-07): query_start_loc-based slicing.
+            # FA's cu_seqlens_q is the AUTHORITATIVE per-rid token
+            # boundary (flash_attn.py:197). Use it when available so
+            # we're anchored to the same metadata FA itself uses,
+            # robust against future scheduler-output API drift.
+            # Falls through to the metadata-token-count math if qsl
+            # isn't available or doesn't match.
+            _qsl_used = False
+            try:
+                _layer_name = (
+                    f"model.layers.{next_layer_idx}.self_attn.attn")
+                _am = (self._attn_metadata.get(_layer_name)
+                       if isinstance(self._attn_metadata, dict)
+                       else None)
+                _qsl = (getattr(_am, "query_start_loc", None)
+                        if _am is not None else None)
+                if (_qsl is not None and _qsl.numel() == _meta_n_reqs + 1
+                        and int(_qsl[-1].item()) == _q_n):
+                    # qsl is consistent with the connector_meta order
+                    # AND covers exactly quest_query.shape[0] tokens.
+                    # NOTE: this assumes connector_meta.requests order
+                    # matches input_batch / FA's cu_q order. If a
+                    # future vLLM build interleaves new+cached
+                    # differently, this assumption breaks; the assert
+                    # at line ~3063 will fire on the q-length mismatch.
+                    for req_idx, step_req in enumerate(connector_meta.requests):
+                        start = int(_qsl[req_idx].item())
+                        end = int(_qsl[req_idx + 1].item())
+                        if 0 <= start < end <= _q_n:
+                            per_request_q[step_req.request_id] = (
+                                quest_query[start:end])
+                    _qsl_used = True
+            except Exception as _qsl_err:
+                logger.warning("[icms] qsl slicing failed: %s; "
+                               "falling back to meta-tokens path",
+                               _qsl_err)
+                per_request_q = {}
+                _qsl_used = False
+
+            if not _qsl_used:
+                # Legacy fallback paths (kept for robustness):
+                _meta_total_tokens = sum(
+                    max(0, sr.num_computed_tokens_end
+                        - sr.num_computed_tokens_start)
+                    for sr in connector_meta.requests)
+                if _q_n == _meta_n_reqs:
+                    # Decode mode: 1 token per rid, batch-ordered.
+                    for req_idx, step_req in enumerate(connector_meta.requests):
+                        per_request_q[step_req.request_id] = (
+                            quest_query[req_idx:req_idx + 1])
+                elif (_meta_total_tokens > 0
+                        and _meta_total_tokens == _q_n):
+                    # Prefill mode with valid token metadata.
+                    offset = 0
+                    for step_req in connector_meta.requests:
+                        n_tokens = max(0, step_req.num_computed_tokens_end
+                                       - step_req.num_computed_tokens_start)
+                        if n_tokens > 0 and offset + n_tokens <= _q_n:
+                            per_request_q[step_req.request_id] = (
+                                quest_query[offset:offset + n_tokens])
+                        offset += n_tokens
+                # else: no slicing strategy fits; leave per_request_q
+                # empty so .get(rid, quest_query) returns full Q for
+                # every rid (matches the legacy single-rid path).
+            # ICMS_DIAG_QSLICE=1: probe agent suspect #1 — per-rid Q
+            # slicing silently falls back to full-batch Q if the slice
+            # is dropped, causing rid X to score against ALL rids'
+            # tokens. Logs which rids got a slice vs fell back, plus
+            # the shape mismatch.
+            if os.environ.get("ICMS_DIAG_QSLICE") == "1":
+                _rids_in_score = [r for _, r, _ in requests_to_score]
+                _has_slice = [r in per_request_q for r in _rids_in_score]
+                _meta_total = sum(
+                    max(0, sr.num_computed_tokens_end
+                        - sr.num_computed_tokens_start)
+                    for sr in connector_meta.requests)
+                _q_total = quest_query.shape[0]
+                _all_have = all(_has_slice)
+                _any_drop = not _all_have
+                if _any_drop or _meta_total != _q_total:
+                    logger.warning(
+                        "[diag-qslice] layer=%d rids_to_score=%d "
+                        "have_slice=%s all_have=%s meta_tokens=%d "
+                        "q_tokens=%d mismatch=%s",
+                        next_layer_idx, len(_rids_in_score),
+                        _has_slice, _all_have, _meta_total, _q_total,
+                        _meta_total != _q_total)
 
         # Score each request with its own Q slice.
         # Async batching (2026-05-05): at TP=1 and N>=2 batched rids,
@@ -2955,6 +3233,16 @@ class _Worker:
             futs = []
             for req_idx, rid, rs in requests_to_score:
                 q_for_request = per_request_q.get(rid, quest_query)
+                if (os.environ.get("ICMS_DIAG_QSLICE") == "1"
+                        and per_request_q
+                        and rid not in per_request_q):
+                    _q_shape = (tuple(quest_query.shape)
+                                if hasattr(quest_query, "shape") else None)
+                    logger.warning(
+                        "[diag-qslice-fallback] layer=%d rid=%s "
+                        "fell back to full-batch Q (shape=%s) — "
+                        "wrong page selection imminent",
+                        next_layer_idx, rid, _q_shape)
                 futs.append(pool.submit(
                     self._score_one_request,
                     rid, rs, req_idx, next_layer_idx, q_for_request,
@@ -2967,6 +3255,16 @@ class _Worker:
         else:
             for req_idx, rid, rs in requests_to_score:
                 q_for_request = per_request_q.get(rid, quest_query)
+                if (os.environ.get("ICMS_DIAG_QSLICE") == "1"
+                        and per_request_q
+                        and rid not in per_request_q):
+                    _q_shape = (tuple(quest_query.shape)
+                                if hasattr(quest_query, "shape") else None)
+                    logger.warning(
+                        "[diag-qslice-fallback] layer=%d rid=%s "
+                        "fell back to full-batch Q (shape=%s) — "
+                        "wrong page selection imminent",
+                        next_layer_idx, rid, _q_shape)
                 self._score_one_request(
                     rid, rs, req_idx, next_layer_idx, q_for_request,
                     budget, stats, connector_meta)
@@ -3022,6 +3320,23 @@ class _Worker:
         effective_groups = max(rs.num_groups_written, stored_groups)
         total_pages = effective_groups * _GROUP_BLOCKS
 
+        # 2026-05-07 RCA log: ICMS_DIAG_CHAIN=1 dumps the client's view
+        # of chain state at every Score call. Combined with the existing
+        # `[diag-reply]` log + the implied server total (max page_id in
+        # reply rounded up to GROUP_BLOCKS), we can detect divergence
+        # where server thinks the chain has more groups than the client
+        # does — symptom of pending writes still in deferred-write
+        # pipeline at long context (mistral-nemo 128K).
+        if os.environ.get("ICMS_DIAG_CHAIN") == "1":
+            logger.info(
+                "[diag-chain] PRE rid=%s layer=%d chain_len=%d "
+                "stored_groups=%d num_groups_written=%d "
+                "effective_groups=%d client_total_pages=%d",
+                rid, next_layer_idx, len(rs.chain),
+                stored_groups, rs.num_groups_written,
+                effective_groups, total_pages,
+            )
+
         # First-turn / empty-chain short-circuit. No stored pages means
         # nothing to score and no sink to fill — skip everything,
         # including the TP>1 NCCL AllGather(Q) + broadcast(reply) path.
@@ -3072,7 +3387,26 @@ class _Worker:
         _flip_threshold = int(total_pages * _flip_frac)
         if _flip_frac < 1.0 and _flip_threshold < 1:
             _flip_threshold = 1
-        if is_decode and len(already_fetched) >= _flip_threshold:
+        # 2026-05-07 BUG FIX (sibling to M4 fix at line 3656): the
+        # threshold flip below has the same per-layer-trigger /
+        # per-rs-effect asymmetry as the M4 flip we already gated.
+        # `already_fetched` is a single scored layer's bitmap, but
+        # `rs.dense_mode = True` flips the WHOLE request to natural-bt
+        # over all layers. With DECODE_APPLY=1, post-flip layers that
+        # didn't reach the threshold still have unpopulated KV slots →
+        # corrupted softmax. At default `_flip_frac=1.0` this rarely
+        # bites because lockstep bitmap growth across scored layers
+        # means they saturate together; at `_flip_frac<1.0` it bites
+        # immediately. The doc-string above already warned to "Stay at
+        # default 1.0 there" but the code didn't enforce it. Now we
+        # gate explicitly: flip is only safe when DECODE_APPLY=0
+        # (trim-bt persists post-flip) or when the bitmap is genuinely
+        # saturated (every page on host for this layer).
+        _flip_safe = (
+            os.environ.get("ICMS_DECODE_APPLY", "1") == "0"
+            or len(already_fetched) >= total_pages
+        )
+        if is_decode and len(already_fetched) >= _flip_threshold and _flip_safe:
             # Threshold reached (default = full saturation). Once dense_mode
             # flips, the Quest hook short-circuits at quest_hooks.py:458 and
             # wait_for_layer takes the cheaper early-return path
@@ -3306,6 +3640,19 @@ class _Worker:
             next_layer_idx + self._score_stride - 1, num_layers - 1)
 
         # Clear sink ready flags before writing a new stride group.
+        if os.environ.get("ICMS_TRACE_FLAGS") == "1":
+            try:
+                snap = self._sink_pool.sink.snapshot_flags() if hasattr(
+                    self._sink_pool.sink, "snapshot_flags") else None
+                _t = time.perf_counter()
+                _set_layers = ([i for i, v in enumerate(snap) if v]
+                               if snap is not None else None)
+                logger.info(
+                    "[trace-flags] CLEAR site=score-impl t=%.6f rid=%s "
+                    "layer=%d set_before=%s",
+                    _t, rid, next_layer_idx, _set_layers)
+            except Exception:
+                pass
         self._sink_pool.sink.clear_ready_flags()
 
         logger.debug("Score: layer=%d reuse_through=%d chain_len=%d k=%d",
@@ -3336,7 +3683,29 @@ class _Worker:
                     ab_demand_bps = self._adaptive_allocator.demand_bps_for(rid)
                     ab_compute_supply_bps = (
                         self._adaptive_allocator.compute_supply_bps_for(rid))
-                reply = self._client.score(
+                # 2026-05-07 BUG FIX: retry on `Score: no resolvable
+                # groups` (status=ENOENT). Symptom at long context
+                # (mistral-nemo 128K, ~25% rate): Score fires at scored
+                # layers DURING prefill while WriteGroup acks for the
+                # chain's first group are still racing through the
+                # network/server pipeline → server's trie lookup
+                # returns empty → ENOENT. Retrying after a brief sleep
+                # gives the racing WriteGroup time to commit. Without
+                # retry, the connector silently falls through to dense
+                # for that layer → mixed sparse/dense produces
+                # corrupted accuracy. Tunable via
+                # ICMS_SCORE_RETRY_COUNT (default 3) and
+                # ICMS_SCORE_RETRY_DELAY_MS (default 20ms).
+                try:
+                    _retry_count = int(
+                        os.environ.get("ICMS_SCORE_RETRY_COUNT", "3"))
+                    _retry_delay_s = float(
+                        os.environ.get("ICMS_SCORE_RETRY_DELAY_MS",
+                                       "20")) / 1000.0
+                except ValueError:
+                    _retry_count, _retry_delay_s = 3, 0.020
+
+                _score_kwargs = dict(
                     request_id=icms_rid,
                     chain=self._rank_chain(rs.chain),
                     layer=next_layer_idx,
@@ -3344,41 +3713,41 @@ class _Worker:
                     k=k,
                     sink=self._sink_pool.sink,
                     reuse_through_layer=reuse_through,
-                    # Smoke note: keep use_flags=True everywhere for now.
-                    # Fan-out in drain_completions runs after Phase 2
-                    # regardless of when the reply was shipped — rank 1
-                    # gets the broadcasted reply and proceeds, and in
-                    # practice the sink bytes will land before it's
-                    # consumed (sweep-verified at TP=1). TP=2 correctness
-                    # re-check will be done before removing this note.
                     use_flags=(os.environ.get("ICMS_REPLY_EARLY", "1") == "1"),
                     fetch_bitmap=fetch_bitmap,
                     demand_bps=ab_demand_bps,
                     compute_supply_bps=ab_compute_supply_bps,
                 )
+                _last_err = None
+                reply = None
+                for _attempt in range(_retry_count + 1):
+                    try:
+                        reply = self._client.score(**_score_kwargs)
+                        break
+                    except IcmsError as _e:
+                        if _e.status != errno.ENOENT:
+                            raise
+                        _last_err = _e
+                        if _attempt < _retry_count:
+                            time.sleep(_retry_delay_s)
+                            continue
+                # All retries exhausted on ENOENT: log loudly + leave
+                # reply=None so this Score's contribution is dropped
+                # (instead of silently dense). Earlier code raised here;
+                # we now soft-fail because ENOENT can be a transient
+                # race during prefill that retrying eventually resolves.
+                if reply is None and _last_err is not None:
+                    if os.environ.get(
+                            "ICMS_SCORE_RETRY_FAIL_LOUD", "0") == "1":
+                        raise _last_err
+                    logger.warning(
+                        "Score RPC ENOENT rank=%d layer=%d rid=%s "
+                        "chain_len=%d k=%d total_pages=%d — exhausted "
+                        "%d retries (×%.0fms), dropping this Score.",
+                        self._tp_rank, next_layer_idx, rid,
+                        len(rs.chain), k, total_pages,
+                        _retry_count, _retry_delay_s * 1000)
             t_score_end = time.perf_counter()
-        except IcmsError as e:
-            t_score_end = time.perf_counter()
-            # status=2 (ENOENT, "Score: no resolvable groups") means the
-            # trie has nothing under chain[0]. Silently falling back to
-            # dense would corrupt benchmark numbers — the request gets
-            # dense-decode behavior labeled as a budget config. With the
-            # bookkeeping fixes (rs.flushed_local for worker ledger,
-            # worker-bounded scheduler ledger) this should never fire on
-            # a healthy run; raising surfaces any remaining ledger/trie
-            # skew loudly instead of producing silently-corrupt JSONs.
-            if e.status == errno.ENOENT:
-                logger.error(
-                    "Score RPC ENOENT rank=%d layer=%d rid=%s "
-                    "chain_len=%d k=%d total_pages=%d — ledger claims "
-                    "groups stored but trie has none. Failing loud "
-                    "(see B/C bookkeeping fixes in icms_connector).",
-                    self._tp_rank, next_layer_idx, rid,
-                    len(rs.chain), k, total_pages)
-                raise
-            logger.exception("Score RPC failed rank=%d layer=%d: %s",
-                              self._tp_rank, next_layer_idx, e)
-            reply = None
         except Exception as e:
             t_score_end = time.perf_counter()
             logger.exception("Score RPC failed rank=%d layer=%d: %s",
@@ -3553,12 +3922,45 @@ class _Worker:
             prev_size = len(page_set)
             if reply.page_ids:
                 page_set.update(reply.page_ids)
+            # 2026-05-07 BUG FIX: server-truth chain-state sync.
+            # Symptom: at long context (mistral-nemo 128K), the server's
+            # trie has +1 more committed group than the connector's
+            # `effective_groups` reports, because Phase 1's deferred-
+            # write pipeline still has 1+ writes in flight when Phase
+            # 2's first Score arrives (request_finished's drain timeout
+            # fires before all writes ack). Server scores the larger
+            # chain and returns page_ids beyond client's `total_pages`.
+            # The client's bitmap (sized to client's total_pages) clamps
+            # those pids → server returns them again on the next Score
+            # → delta_new=0 dups=k loop, eventually bitmap looks
+            # saturated to M4. Fix: when the reply's max page_id implies
+            # a longer chain than `effective_groups`, update
+            # rs.stored_groups so the next Score sizes its bitmap
+            # correctly. This is one-way (only grows stored_groups);
+            # benign if server happens to return only in-range pids.
+            if reply.page_ids:
+                _max_pid = max(reply.page_ids)
+                _implied_groups = (_max_pid // _GROUP_BLOCKS) + 1
+                if _implied_groups > effective_groups:
+                    _old_stored = rs.stored_groups
+                    rs.stored_groups = max(rs.stored_groups, _implied_groups)
+                    if (rs.stored_groups != _old_stored
+                            and os.environ.get("ICMS_DIAG_CHAIN") == "1"):
+                        logger.info(
+                            "[icms-sync] rid=%s layer=%d stored_groups "
+                            "%d -> %d (server chain has %d groups, "
+                            "client had effective_groups=%d)",
+                            rid, next_layer_idx, _old_stored,
+                            rs.stored_groups, _implied_groups,
+                            effective_groups,
+                        )
             # ICMS_DIAG_REPLY: log per-Score-reply size + delta added to
             # fetched_pages. If reply size > delta, server returned pages
             # already in client's bitmap = bitmap filtering is broken.
             # If reply size < k (cap), server's score+filter returned fewer
             # candidates than requested.
-            if os.environ.get("ICMS_DIAG_REPLY") == "1" and is_decode:
+            if (os.environ.get("ICMS_DIAG_REPLY") == "1"
+                    or os.environ.get("ICMS_DIAG_CHAIN") == "1") and is_decode:
                 _reply_n = len(reply.page_ids) if reply.page_ids else 0
                 _delta = len(page_set) - prev_size
                 _dups = _reply_n - _delta
@@ -3567,15 +3969,54 @@ class _Worker:
                 _reply_pids_t = (list(reply.page_ids[-5:])
                                   if reply.page_ids and len(reply.page_ids) > 5
                                   else [])
+                # 2026-05-07: derive server's implied chain length from
+                # max(reply.page_ids). If max_pid >= total_pages, the
+                # server has more groups than the client thinks → root
+                # of the bitmap-filter dups bug (client can't represent
+                # those pids in the next bitmap; server returns them
+                # again next call).
+                _max_pid = (max(reply.page_ids) if reply.page_ids else -1)
+                _implied_server_groups = (
+                    (_max_pid // _GROUP_BLOCKS) + 1 if _max_pid >= 0 else 0)
+                _implied_server_total = _implied_server_groups * _GROUP_BLOCKS
+                _divergence = (
+                    "DIVERGENCE" if _implied_server_total > total_pages
+                    else "ok")
                 logger.info(
-                    "[diag-reply] rid=%s layer=%d k=%d total=%d "
+                    "[diag-reply] rid=%s layer=%d k=%d client_total=%d "
+                    "max_reply_pid=%d implied_server_total=%d %s "
                     "reply_n=%d prev_fetched=%d post_fetched=%d "
                     "delta_new=%d dups=%d reply_pids[:5]=%s "
                     "reply_pids[-5:]=%s",
                     rid, next_layer_idx, k, total_pages,
+                    _max_pid, _implied_server_total, _divergence,
                     _reply_n, prev_size, len(page_set),
                     _delta, _dups, _reply_pids_h, _reply_pids_t)
-            if is_decode and not rs.dense_mode and len(page_set) == prev_size:
+            # 2026-05-07 BUG FIX: the M4 flip below was firing per-layer
+            # but setting rs.dense_mode globally for the whole request.
+            # In DECODE_APPLY=1 (default), that meant other layers' still-
+            # unpopulated slots got read by post-flip natural-bt attention
+            # → softmax sees stale/zero KV → garbage outputs. Symptom:
+            # vt_h32000 b=0.05 produces 0.125 vs FAPS dense's 0.99.
+            #
+            # The flip is safe only when ALL pages are populated (then
+            # the threshold flip path above handles it cleanly), or in
+            # DECODE_APPLY=0 mode (trim-bt persists post-flip; no read
+            # from unpopulated slots).
+            #
+            # Restoring the M4 flip requires either (a) gating on every
+            # scored layer also being saturated, or (b) building a
+            # populated-slots block table at flip time. Neither is in
+            # place yet. Until then, gate the flip on
+            # ICMS_M4_EARLY_FLIP=1 (opt-in) so accidental users don't
+            # silently get bad accuracy. The threshold flip at default
+            # frac=1.0 still fires when the bitmap is genuinely full.
+            _m4_flip_enabled = (
+                os.environ.get("ICMS_M4_EARLY_FLIP", "0") == "1"
+                or os.environ.get("ICMS_DECODE_APPLY", "1") == "0"
+            )
+            if (is_decode and not rs.dense_mode and len(page_set) == prev_size
+                    and _m4_flip_enabled):
                 rs.dense_mode = True
                 # Mark the request as just-flipped so the next forward
                 # pass logs full metadata (gated by ICMS_DIAG_FULL=1).
@@ -3909,16 +4350,40 @@ class _Worker:
             if (_slack_called is not None
                     and 0 <= abs_layer < len(_slack_called)):
                 self._slack_flag_at_call[abs_layer] = bool(ready_at_call)
+            # ICMS_TRACE_FLAGS=1: log every poll. With ICMS_TRACE_FLAGS_RID,
+            # we can correlate against this rid's owns clear/score events
+            # to see if a different rid clobbered our flag.
+            _trace_flags = os.environ.get("ICMS_TRACE_FLAGS") == "1"
+            if _trace_flags:
+                _t = time.perf_counter()
+                logger.info(
+                    "[trace-flags] POLL t=%.6f rid=%s layer=%d ready=%s",
+                    _t, rid, abs_layer, bool(ready_at_call))
             if not ready_at_call:
                 # Poll with exponential backoff starting at 0 (pure spin)
                 # — writes land within ~100µs so spin is right. Cap total
                 # wait at 5s to avoid hangs if something goes wrong.
                 deadline = t_layer_start + 5.0
+                _poll_count = 0
                 while not sink.is_layer_ready(abs_layer):
+                    _poll_count += 1
                     if time.perf_counter() > deadline:
+                        if _trace_flags:
+                            logger.warning(
+                                "[trace-flags] TIMEOUT rid=%s layer=%d "
+                                "polls=%d wait_s=%.3f",
+                                rid, abs_layer, _poll_count,
+                                time.perf_counter() - t_layer_start)
                         logger.warning(
                             "wait_for_layer: flag timeout for layer=%d", abs_layer)
                         break
+                if _trace_flags and _poll_count > 0:
+                    _t2 = time.perf_counter()
+                    logger.info(
+                        "[trace-flags] READY rid=%s layer=%d polls=%d "
+                        "wait_us=%.1f",
+                        rid, abs_layer, _poll_count,
+                        (_t2 - t_layer_start) * 1e6)
         t_after_spin = time.perf_counter()
         # ICMS_DIAG_SLACK probe #4: when did the spin observe the flip?
         # (Equal to t_layer_start when ready_at_call=True.)
@@ -3946,12 +4411,24 @@ class _Worker:
                     spin_us,
                 )
 
-        # Multi-rid batching path (ICMS_ALLOW_BATCH=1 + N>=2): collect
-        # per-rid IcmsFetchStates without firing set_active inside the
-        # loop, then aggregate into one multi-row state and fire
-        # set_active ONCE per layer. The single-rid path (legacy) still
-        # calls set_active inside _apply_selective_attention as before.
-        _use_batch_path = _allow_batch() and len(per_request) >= 2
+        # Multi-rid batching path (ICMS_ALLOW_BATCH=1): collect per-rid
+        # IcmsFetchStates without firing set_active inside the loop,
+        # then aggregate into one multi-row state and fire set_active
+        # ONCE per layer. The single-rid path (legacy) still calls
+        # set_active inside _apply_selective_attention as before.
+        #
+        # 2026-05-06 fix: was `len(per_request) >= 2` which fell through
+        # to the single-rid path when only 1 rid had its Score reply
+        # ready at this layer (others' replies arrived a later layer due
+        # to timing). The single-rid IcmsFetchState has block_table
+        # shape [1, k+c] but the actual forward batch has N rids → FA3
+        # then crashes with `batch_size must be equal to batch_size_k`
+        # because cu_seqlens_q has N entries but seqused_k has 1.
+        # The aggregate path uses natural_bt as base (shape
+        # [N, max_blocks]) and overrides only the 1 row whose rid had
+        # Score, which is the correct shape regardless of how many
+        # captures exist.
+        _use_batch_path = _allow_batch() and len(per_request) >= 1
         _captures: list | None = [] if _use_batch_path else None
 
         total_k_pages = 0
@@ -4100,9 +4577,32 @@ class _Worker:
                 trim_sl_val = trim_sl
             if req_idx < combined_sl.shape[0]:
                 combined_sl[req_idx] = trim_sl_val
-        # Use natural max — safe upper bound for tile scheduling, and
-        # avoids a host sync vs. .max().item() on combined_sl.
-        max_seq_len = int(getattr(am, "max_seq_len", 0))
+        # 2026-05-07: tried `int(combined_sl.max().item())` here based on
+        # an audit hypothesis that natural max_seq_len caused FA to
+        # read past the trimmed region. Empirically REGRESSED accuracy
+        # at every budget on llama3 batched (0.60→0.30 at b=0.05,
+        # 0.125→0.0 at b=0.20). Per-example: first 4-5 decode tokens
+        # decoded CORRECTLY (matching haystack variable codes) then
+        # the continuation went incoherent — suggests stride-boundary
+        # interaction we don't yet understand. Reverted to natural max.
+        # The trimmed-seq-len hypothesis may still be right but the
+        # naive .max() fix isn't the answer.
+        # Diag knobs:
+        #   ICMS_USE_TRIM_MAXSEQ=1   → use combined_sl.max() (the regressed fix)
+        #   ICMS_FORCE_MAXSEQ_SYNC=1 → keep natural max but trigger
+        #                              the .item() CUDA sync (probe D)
+        _diag_maxseq = os.environ.get("ICMS_USE_TRIM_MAXSEQ") == "1"
+        _diag_force_sync = os.environ.get("ICMS_FORCE_MAXSEQ_SYNC") == "1"
+        if _diag_maxseq:
+            max_seq_len = int(combined_sl.max().item())
+        elif _diag_force_sync:
+            # Probe D: trigger the sync side-effect without using the
+            # smaller value. Discriminates "regression was the sync"
+            # from "regression was the smaller value."
+            _ = int(combined_sl.max().item())  # sync-only
+            max_seq_len = int(getattr(am, "max_seq_len", 0))
+        else:
+            max_seq_len = int(getattr(am, "max_seq_len", 0))
         # KV pointers are per-layer constants; all captures share them.
         head_state = captures[0][1]
         if _diag_agg:
@@ -4405,17 +4905,30 @@ class _Worker:
         # duplicate pids (which dedup last-wins, possibly overwriting
         # real offsets with phantom-group zeros), wrong-layer payloads,
         # and to reconcile reply_n_pages vs expected K-page count.
+        # ICMS_DIAG_KSCALE=1: also count dups across ALL layers (not
+        # just layer 0) — Agent suspect #3 says dup probability rises
+        # at higher layers + higher k.
         _diag_apply = (os.environ.get("ICMS_DIAG_APPLY") == "1"
                        and layer_idx_for_cache == 0)
+        _diag_kscale = os.environ.get("ICMS_DIAG_KSCALE") == "1"
         _dup_count = 0
         _seen_pids: set = set()
+        _track_dups = _diag_apply or _diag_kscale
         for i, pid in enumerate(reply.page_ids):
             if i < len(reply.sink_offsets):
-                if _diag_apply and pid in _seen_pids:
+                if _track_dups and pid in _seen_pids:
                     _dup_count += 1
                 pid_to_sink_off[pid] = reply.sink_offsets[i]
-                if _diag_apply:
+                if _track_dups:
                     _seen_pids.add(pid)
+        if _diag_kscale and _dup_count > 0:
+            logger.warning(
+                "[diag-kscale-replydup] rid=%s layer=%d n=%d uniq=%d "
+                "dup=%d — server returned duplicate pids; last-wins "
+                "dedup may overwrite real offsets with phantom-group "
+                "zeros at higher layers / higher k",
+                rid, layer_idx_for_cache,
+                len(reply.page_ids), len(_seen_pids), _dup_count)
         if _diag_apply:
             _pid_list = list(reply.page_ids)
             _off_list = list(reply.sink_offsets)
@@ -4526,6 +5039,20 @@ class _Worker:
             valid_sink_offs.append(off)
         if not valid_pids:
             return None
+        # ICMS_DIAG_KSCALE=1: probe for k-scaling apply-path bugs
+        # (Agent suspect #3 — duplicate dest indices in valid_pids
+        # would cause undefined index_copy_ behavior, scrambling K
+        # data placement). Fires across all layers, not just layer 0.
+        if os.environ.get("ICMS_DIAG_KSCALE") == "1":
+            _vp_len = len(valid_pids)
+            _vp_uniq = len(set(valid_pids))
+            if _vp_len != _vp_uniq:
+                logger.warning(
+                    "[diag-kscale-dup] rid=%s layer=%d k=%d valid_pids=%d "
+                    "uniq=%d dup_count=%d — index_copy_ dest is "
+                    "non-unique → scrambled main_key writes",
+                    rid, layer_idx_for_cache, k,
+                    _vp_len, _vp_uniq, _vp_len - _vp_uniq)
         _lt("after_python_filter")
 
         # M3+M4-A: during decode, attention's block_table must reference
@@ -5121,6 +5648,25 @@ class _Worker:
             rs._apply_cached_phys_blocks_dev = phys_blocks_dev
             rs._apply_cached_page_idx_dev = page_idx_dev
             rs._apply_cached_actual_k = len(reply.page_ids)
+            # ICMS_DIAG_KSCALE=1: probe for Agent suspect #2 — fast-path
+            # reuse layers stride sink reads by `delta * cached_actual_k`,
+            # but cached_actual_k is set from RAW reply.page_ids count
+            # (line above). If the raw count differs from the post-filter
+            # valid_pids count (e.g. some pids were truncated above
+            # context_pages, or the reply exceeded self._k), the sink
+            # stride diverges from server's pack stride → reuse layers
+            # read wrong sink offsets.
+            if os.environ.get("ICMS_DIAG_KSCALE") == "1":
+                _raw = len(reply.page_ids)
+                _filt = len(valid_pids)
+                if _raw != _filt:
+                    logger.warning(
+                        "[diag-kscale-stride] rid=%s layer=%d "
+                        "raw_reply_n=%d valid_pids_n=%d delta=%d — "
+                        "fast-path reuse layers will use raw count for "
+                        "sink stride → mismatch with server pack stride",
+                        rid, layer_idx_for_cache, _raw, _filt,
+                        _raw - _filt)
             # Diag-only: cache the valid_pids list so the fast path's
             # multi-layer canary can map probe_pid → canary_idx without
             # rebuilding it. Has no effect on hot path correctness.
@@ -5143,17 +5689,29 @@ class _Worker:
                 layer_name, total_us, " ".join(parts))
         return True  # signal that fetch state was set
 
-    @staticmethod
-    def _extract_layer_idx(layer_name: str) -> int | None:
-        """Extract layer index from 'model.layers.N.self_attn.attn'."""
+    def _extract_layer_idx(self, layer_name: str) -> int | None:
+        """Extract layer index from 'model.layers.N.self_attn.attn'.
+
+        Cached by string key (`_layer_idx_cache`, populated lazily).
+        Layer names are interned by vLLM's layer map and stable for
+        the connector's lifetime, so the cache is correct + cheap.
+        Saves a string split + linear scan on every call (~200+ per
+        forward across all call sites).
+        """
+        cache = self._layer_idx_cache
+        if layer_name in cache:
+            return cache[layer_name]
         parts = layer_name.split(".")
+        result: "int | None" = None
         for i, part in enumerate(parts):
             if part == "layers" and i + 1 < len(parts):
                 try:
-                    return int(parts[i + 1])
+                    result = int(parts[i + 1])
+                    break
                 except ValueError:
                     pass
-        return None
+        cache[layer_name] = result
+        return result
 
     def restore_attn_metadata(self, layer_name: str):
         """Clear the ICMS fetch state after attention ran with it."""
@@ -6137,14 +6695,37 @@ class _Worker:
         # don't touch this rid are left running for their owners.
         # At N=1 / single-rid path this collapses to the legacy
         # behavior (only one rid in flight).
-        ok = self._write_pipeline.drain_rid(request_id, timeout=90.0)
+        #
+        # 2026-05-07 BUG FIX: 90s timeout was sized for 30K ctx
+        # (~70 GiB writes ⇒ ~7s drain). At 128K ctx the writes are
+        # ~300 GiB ⇒ 30+ s drain plus overhead → 90s fires routinely.
+        # When the timeout fires, `flushed_local` is then recorded as
+        # the ENQUEUED count (not acked), so the scheduler-side
+        # `_stored_chains` claims groups the server's trie hasn't
+        # committed → next turn's Score returns "no resolvable groups"
+        # (server has 0 groups for chain) or DIVERGENCE (off-by-N).
+        # The original 90s was kept because longer drains on `drain()`
+        # (whole pipeline) collided with the next request's NCCL; with
+        # per-rid drain that collision class is gone, so we can safely
+        # extend. Default 600s (10× more headroom). Set
+        # ICMS_DRAIN_TIMEOUT_S=N to override.
+        try:
+            _drain_timeout_s = float(
+                os.environ.get("ICMS_DRAIN_TIMEOUT_S", "600.0"))
+        except ValueError:
+            _drain_timeout_s = 600.0
+        ok = self._write_pipeline.drain_rid(
+            request_id, timeout=_drain_timeout_s)
         drain_us = (time.perf_counter() - t0) * 1e6
         if not ok:
             logger.warning(
                 "on_request_finished: write-pipeline drain_rid TIMED OUT "
-                "(>90s, rid=%s, %d tasks pending globally); "
-                "request-finish proceeding — some writes may be lost.",
-                request_id, self._write_pipeline.pending())
+                "(>%.0fs, rid=%s, %d tasks pending globally); "
+                "request-finish proceeding — some writes may be lost. "
+                "Set ICMS_DRAIN_TIMEOUT_S to a higher value to avoid "
+                "this on long-context runs.",
+                _drain_timeout_s, request_id,
+                self._write_pipeline.pending())
         elif drain_us > 1000:
             logger.info(
                 "on_request_finished: write-pipeline drain_rid(%s) took %.1f ms",

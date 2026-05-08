@@ -305,15 +305,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         try:
             from vllm.v1.attention.ops.quest_hooks import QuestHookManager
 
-            # Create a no-op budget computer that returns the configured
-            # budget.  Page selection is performed BF2-side by the ICMS
-            # storage server, so the hook only needs to compute Q and
-            # forward it.
+            # Create a budget computer.  Page selection itself is performed
+            # BF2-side by the ICMS storage server, so the hook only needs to
+            # compute Q and forward it.
+            #
+            # 2026-05-07: DynamicBudget reads `IcmsConnector._budget_override`
+            # at compute time so per-call updates from the bench's
+            # `_set_icms_budget_on_worker` propagate to the Quest hook's
+            # `if budget >= 1.0: shortcut` decision (line ~529 in
+            # quest_hooks.py).  The previous closure-captured `quest_budget`
+            # was stuck at LLM-init value, so swapping budgets via
+            # collective_rpc never reached the all-pages shortcut and
+            # budget=1.0 silently routed through Score+apply instead of
+            # the FetchAll fast path.
             quest_budget = float(extra.get("quest_budget", 0.2))
-
-            class ConstantBudget:
-                def compute_budget(self, **kwargs):
-                    return quest_budget
 
             num_layers = (
                 self.vllm_config.model_config.hf_config.num_hidden_layers
@@ -325,15 +330,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if hasattr(self.kv_connector, "kv_connector"):
                 kv_connector_ref = self.kv_connector.kv_connector
 
+            class DynamicBudget:
+                def __init__(self, default_budget, connector_ref):
+                    self._default = default_budget
+                    self._connector = connector_ref
+
+                def compute_budget(self, **kwargs):
+                    if self._connector is not None:
+                        override = getattr(
+                            self._connector, "_budget_override", None)
+                        if override is not None:
+                            return float(override)
+                    return self._default
+
             single_layer_scoring = bool(
                 extra.get("quest_single_layer_scoring", False)
             )
 
-            # Select budget computer: adaptive (bandwidth-based) or constant.
+            # Select budget computer: adaptive (bandwidth-based) or dynamic.
             # Adaptive path duck-types: any object reachable as
             # connector_worker.spec with a get_adaptive_allocator() callable
             # is treated as the bandwidth source.
-            budget_computer = ConstantBudget()
+            budget_computer = DynamicBudget(quest_budget, kv_connector_ref)
             if extra.get("adaptive_bandwidth", False):
                 try:
                     connector_worker = getattr(
