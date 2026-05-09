@@ -357,13 +357,28 @@ class Gemma3Model(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        # Quest layer-callback dispatchers — same pattern as llama.py /
+        # qwen3_moe.py. Without these calls the Quest hook registry is
+        # attached to the model but is never invoked, so on_layer_score
+        # never fires for gemma-3 (registration succeeds + 62 layers
+        # detected, yet total_score_calls stays 0 → bench's silent-fallback
+        # guard trips). 2026-05-09.
+        from vllm.v1.attention.ops.quest_layer_callbacks import (  # noqa: E402
+            fire_post_layer,
+            fire_pre_layer,
+        )
+        for layer_idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
+            fire_pre_layer(self, layer_idx, positions, hidden_states, residual)
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 residual,
                 **kwargs,
             )
+            fire_post_layer(self, layer_idx, positions, hidden_states, residual)
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}

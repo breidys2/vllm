@@ -526,7 +526,16 @@ class QuestHookManager:
             num_layers=self.num_layers,
         )
 
-        if budget >= 1.0 and self.allow_all_pages_shortcut:
+        # ICMS_DISABLE_ALL_PAGES_SHORTCUT=1: when set, b>=1.0 falls
+        # through to the regular Score+select-K path with K=total_pages
+        # instead of the FetchAll shortcut. Use to localize the
+        # 2026-05-08 bug where qwen3 niah_multikey_2 b=1.0=0.067 <
+        # b=0.50=0.400 — if this env knob recovers b=1.0 ≈ dense, the
+        # bug is in the FetchAll path; if not, it's elsewhere.
+        import os as _os_aps
+        _aps_disabled = (
+            _os_aps.environ.get("ICMS_DISABLE_ALL_PAGES_SHORTCUT", "0") == "1")
+        if budget >= 1.0 and self.allow_all_pages_shortcut and not _aps_disabled:
             # Baseline pipelined path: transfer ALL pages for the next
             # layer without computing Q or scoring.  This gives the
             # baseline full compute/IO overlap (layer-pipelined) without
@@ -700,7 +709,12 @@ class QuestHookManager:
         # FetchAll shortcut (Config B's path): fire once; subsequent
         # layers' post-hook shortcut also fires, which is harmless under
         # quest_all_pages=True. Matches _on_layer_complete semantics.
-        if budget >= 1.0 and self.allow_all_pages_shortcut:
+        # ICMS_DISABLE_ALL_PAGES_SHORTCUT=1 also disables this layer-0
+        # entry-point — see _on_layer_complete for rationale.
+        import os as _os_aps0
+        _aps0_disabled = (
+            _os_aps0.environ.get("ICMS_DISABLE_ALL_PAGES_SHORTCUT", "0") == "1")
+        if budget >= 1.0 and self.allow_all_pages_shortcut and not _aps0_disabled:
             if self.kv_connector is not None:
                 try:
                     self.kv_connector.save_kv_layer(

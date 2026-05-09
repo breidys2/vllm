@@ -341,6 +341,42 @@ def _tp_broadcast_score_reply(reply, tp_rank: int, tp_size: int):
         sink_offsets=offs.cpu().tolist(),
     )
 
+def _tp_broadcast_bool(value: bool, tp_rank: int, tp_size: int) -> bool:
+    """Broadcast rank-0's bool to every rank. Used by `_flush_group` to
+    propagate WriteGroup success/failure so all ranks bump
+    `flushed_local`/`num_groups_written` symmetrically.
+
+    TP=1 → returns the input (no collective). TP>1 → tiny i64 broadcast
+    over the same NCCL group as `_tp_broadcast_score_reply`. Cost:
+    ~few microseconds; called once per `_flush_group` (≤ K per request).
+
+    Failure mode: if the broadcast itself raises (e.g., NCCL channel
+    not warmed yet), we conservatively return False so all ranks treat
+    it as a write failure. Better to skip a bump symmetrically than to
+    diverge. Pre-2026-05-08 this divergence (rank-0 raise on
+    write_group → rank-0 skips bump, rank-1 doesn't) was the TP=2
+    multi-rid hang root cause; see project_tp2_writegroup_asymmetry_2026-05-07.
+    """
+    if tp_size <= 1:
+        return value
+    import torch.distributed as dist  # noqa: E402
+    from vllm.distributed.parallel_state import get_tp_group
+    try:
+        tp_group = get_tp_group()
+        dev_group = _get_icms_nccl_group() or tp_group.device_group
+        dev = torch.device(f"cuda:{torch.cuda.current_device()}")
+        t = torch.tensor([1 if (tp_rank == 0 and value) else 0],
+                         dtype=torch.int64, device=dev)
+        dist.broadcast(t, src=tp_group.first_rank, group=dev_group)
+        return bool(int(t.item()))
+    except Exception as e:
+        logger.warning(
+            "[icms-tp] _tp_broadcast_bool failed (rank=%d): %r — "
+            "treating as False on every rank to keep ledgers symmetric",
+            tp_rank, e)
+        return False
+
+
 # Module-level queue: worker → scheduler stored-chain notifications.
 # The worker appends (chain, num_groups) after WriteGroup completes;
 # the scheduler drains it in get_num_new_matched_tokens / build_meta.
@@ -880,6 +916,9 @@ class IcmsConnector(KVConnectorBase_V1):
         _scheduler_cfg = getattr(vllm_config, "scheduler_config", None)
         _max_num_seqs = (int(getattr(_scheduler_cfg, "max_num_seqs", 1) or 1)
                          if _scheduler_cfg is not None else 1)
+        # Stash for downstream gates (e.g., write-pipeline drain default
+        # in wait_for_save — race-audit follow-up 2026-05-08).
+        self._max_num_seqs: int = _max_num_seqs
         _default_sink_slots = (max(1, _max_num_seqs)
                                if _allow_batch() else 1)
         self._sink_slots: int = max(1, int(
@@ -891,6 +930,12 @@ class IcmsConnector(KVConnectorBase_V1):
 
         # RDMA transport (replaces Unix socket + POSIX shmem).
         self._use_rdma: bool = bool(extra.get("icms_rdma", False))
+        # FetchAll RPC is only implemented in RdmaIcmsClient (the
+        # unix-socket IcmsClient and ShmemIcmsClient inherit a stub
+        # that raises NotImplementedError). Used by the b>=1.0
+        # ceiling-snap redirect + quest_hooks's allow_all_pages_shortcut
+        # to know when to fall back to Score(k=total_pages) instead.
+        self._supports_fetch_all: bool = self._use_rdma
         self._rdma_server_host: str = extra.get("icms_server_host", "sprc01")
         self._rdma_port: int = int(extra.get("icms_rdma_port", 18515))
         self._rdma_ib_dev: str = extra.get("icms_ib_dev", "mlx5_0")
@@ -955,6 +1000,14 @@ class IcmsConnector(KVConnectorBase_V1):
                 sink_slots=self._sink_slots,
                 local_gpu_direct=self._local_gpu_direct,
             )
+            # Plumb max_num_seqs through to the worker for the
+            # write-pipeline drain default in wait_for_pending_writes
+            # (line ~6485). Pre-2026-05-08 evening this attribute lived
+            # only on the outer connector and `_Worker` raised
+            # AttributeError under sync scheduling. The race-audit
+            # follow-up that introduced the gate didn't propagate the
+            # value — fixed here.
+            self._worker._max_num_seqs = self._max_num_seqs
 
     # ══════════════════════════════════════════════════════════════════════
     #  Worker-side abstract methods
@@ -1697,6 +1750,24 @@ class _Worker:
         self._geom: ModelGeometry | None = None
         self._sink_pool: _SinkSlotPool | None = None
 
+        # ICMS_QUEST_MODE=per_kv_head: lazily-allocated summaries sink
+        # (separate from the main KV sink, used only by the v8 per-head
+        # opcodes). Untouched in any other mode.
+        self._per_head_summary_sink: "Sink | None" = None
+        self._per_head_summary_sink_capacity: int = 0
+        # Once-per-process warning flags for the per-head path. Init
+        # explicitly (rather than letting `getattr(..., False)` create
+        # them lazily) so static-analysis / dir(self) introspection
+        # sees the full attribute surface — and so a typo elsewhere in
+        # the path can't accidentally create a NEW lazy attribute that
+        # silently never warns.
+        self._quest_per_head_tp_warned: bool = False
+        self._quest_per_head_client_warned: bool = False
+        # Once-per-process info log on first per-head Score call so a
+        # smoke run can confirm the path actually fired (vs silently
+        # falling through to the legacy gate's `return`).
+        self._quest_per_head_first_call_logged: bool = False
+
         # ICMS_DIAG_SLACK: optional C++ poll thread that records each
         # ready-flag's first-non-zero timestamp without holding the GIL.
         # Allocated lazily on the first slack-enabled step.
@@ -1780,6 +1851,32 @@ class _Worker:
         self._pending_scores: dict[str, dict[str, tuple]] = {}
         self._pending_reuse: dict[str, dict[str, tuple]] = {}
         self._score_lock = threading.Lock()
+        # 2026-05-08 race-audit X1 wrap-or-nullcontext gate.
+        #
+        # History: shipped a real threading.Lock first to fix the
+        # native-client tx_/rx_ buffer race (icms_client.h:8-10
+        # contract violation). Empirically REGRESSED accuracy on
+        # llama3 vt 32K batched b=0.05: control 0.260 → postfix 0.160
+        # at n=30. Background investigation 2026-05-08 found the
+        # mechanism: Score holds the lock for the full client RTT,
+        # blocking the deferred-write pipeline thread → chain-state
+        # lag GROWS, not shrinks → Score reads from a chain prefix
+        # the server hasn't fully committed → silent wrong-pages.
+        #
+        # The actual fix for the dominant ordering race lives elsewhere
+        # (BLOCK_WRITES default extended to batched mode; per-rid Event
+        # Step 2 queued). The buffer-corruption race the lock was meant
+        # to fix is real but not dominant; the C++ IcmsClient::CallGuard
+        # (icms_client.h) is the cheap defensive net — it throws on
+        # concurrent entry with no perf cost.
+        #
+        # Set ICMS_RPC_MUTEX=1 to re-enable the Python wrap for A/B
+        # testing; default is nullcontext (no-op).
+        import contextlib as _ctxlib
+        if os.environ.get("ICMS_RPC_MUTEX", "0") == "1":
+            self._rpc_lock = threading.Lock()
+        else:
+            self._rpc_lock = _ctxlib.nullcontext()
 
         # Path B: GPU KV cache tensors + per-step attn_metadata for
         # selective fetch + block table override.
@@ -1913,11 +2010,12 @@ class _Worker:
         for _attempt in range(_max_attempts):
             try:
                 self._client.connect()
-                ack = self._client.hello(self._model_name,
-                                         tp_rank=self._tp_rank,
-                                         tp_size=self._tp_size,
-                                         deployment_id=self._deployment_id,
-                                         sink_slot_count=self._sink_slots)
+                with self._rpc_lock:  # X1 (race-audit): serialize tx_/rx_
+                    ack = self._client.hello(self._model_name,
+                                             tp_rank=self._tp_rank,
+                                             tp_size=self._tp_size,
+                                             deployment_id=self._deployment_id,
+                                             sink_slot_count=self._sink_slots)
                 break  # success
             except Exception as _e:  # broad: any connect/hello failure
                 if _attempt == _max_attempts - 1:
@@ -1926,13 +2024,21 @@ class _Worker:
                     "[icms-connect] attempt %d/%d failed: %s; trying "
                     "BF2 auto-restart and retrying (tp_rank=%d)",
                     _attempt + 1, _max_attempts, _e, self._tp_rank)
-                try:
-                    from lib.bf2_runner import ensure_bf2_running  # type: ignore
-                    ensure_bf2_running(probe_host=self._rdma_server_host,
-                                        probe_port=self._rdma_port,
-                                        timeout=30.0)
-                except Exception:
-                    pass  # auto-restart helper unavailable; just retry
+                # ensure_bf2_running runs a kill_local_orphans sweep that
+                # SIGTERMs every locally-owned EngineCore/icms_server PID
+                # not in the bench's own safe-set. With multiple benches
+                # sharing a host (different GPUs), one bench's connect
+                # retry would kill the OTHER bench's EngineCore — observed
+                # 2026-05-08 with mistral-small + qwen3-128K co-located.
+                # Only run the BF2 helper when actually using BF2 (RDMA).
+                if self._use_rdma:
+                    try:
+                        from lib.bf2_runner import ensure_bf2_running  # type: ignore
+                        ensure_bf2_running(probe_host=self._rdma_server_host,
+                                            probe_port=self._rdma_port,
+                                            timeout=30.0)
+                    except Exception:
+                        pass  # auto-restart helper unavailable; just retry
                 # Re-create the client object — the previous one may have
                 # left dangling RDMA state after a failed connect.
                 if self._use_rdma:
@@ -1987,6 +2093,45 @@ class _Worker:
             self._adaptive_allocator._kv_page_bytes = self._geom.kv_page_bytes
             self._adaptive_allocator._num_layers = int(self._geom.num_layers)
 
+        # 2026-05-08 server-audit P0 startup asserts (D3, E4):
+        #
+        # D3: TP fan-out per-rank slicing in worker_pool.cc:107 requires
+        #   kv_page_bytes % tp_size == 0
+        # else the server falls through to a broadcast (full-page write
+        # to every rank) and the client only reads kv_page_bytes/tp_size
+        # bytes per page → silent data drop on the other ranks. Catches
+        # any future model whose head_dim * num_kv_heads_per_rank doesn't
+        # divide cleanly. Cheap: fires once at hello() return.
+        if self._tp_size > 1:
+            kvb = int(self._geom.kv_page_bytes)
+            if kvb % self._tp_size != 0:
+                raise RuntimeError(
+                    f"[icms-startup-assert D3] kv_page_bytes={kvb} "
+                    f"not divisible by tp_size={self._tp_size}; the "
+                    f"server's per-rank slicing falls through to a "
+                    f"broadcast and the client silently drops other "
+                    f"ranks' KV bytes. See server audit "
+                    f"project_icms_server_audit_2026-05-08.")
+        # E4: connector's apply path computes
+        #   page_idx_dev = [off // kv_page_bytes for off in valid_sink_offs]
+        # which requires sink_offset_base for slot N to be a multiple
+        # of kv_page_bytes. Server slabs are sink_size / sink_slot_count;
+        # if either divisor doesn't land cleanly, the floor div loses
+        # information → wrong sink page index → corrupted apply. Both
+        # numbers are computed from per_layer_bytes which we control
+        # here, so the assert IS expected to hold; if it ever fails
+        # we want a loud crash, not silent corruption.
+        per_layer_bytes_check = self._k * self._geom.kv_page_bytes
+        sink_layers_check = max(self._score_stride,
+                                  int(self._geom.num_layers))
+        slab_bytes_check = sink_layers_check * per_layer_bytes_check
+        if slab_bytes_check % self._geom.kv_page_bytes != 0:
+            raise RuntimeError(
+                f"[icms-startup-assert E4] sink slab "
+                f"({slab_bytes_check}) not divisible by kv_page_bytes "
+                f"({self._geom.kv_page_bytes}); off // kv_page_bytes in "
+                f"the apply path will lose precision. See server audit.")
+
         # Sink sizing: needs to hold one server Phase-2 dump at a time.
         # - Score path (stride-gated): score_stride layers × k pages.
         # - FetchAll path (B, budget=1.0): num_layers × k pages (one call
@@ -2019,8 +2164,9 @@ class _Worker:
             except Exception:
                 gpu_dev = f"cuda:{self._tp_rank}"
         if self._gpu_direct and self._use_rdma:
-            sink = self._client.register_gpu_sink(
-                total_sink, gpu_dev, flag_slots=flag_slots)
+            with self._rpc_lock:  # X1 (race-audit): serialize tx_/rx_
+                sink = self._client.register_gpu_sink(
+                    total_sink, gpu_dev, flag_slots=flag_slots)
             sink_desc = f"gpu_direct({gpu_dev})"
         elif self._local_gpu_direct:
             # Phase-1 CUDA-IPC sink for the local mem-backend. No flag
@@ -2031,7 +2177,8 @@ class _Worker:
             sink = self._client.register_cuda_ipc_sink(total_sink, gpu_dev)
             sink_desc = f"cuda_ipc({gpu_dev})"
         else:
-            sink = self._client.register_sink(total_sink)
+            with self._rpc_lock:  # X1 (race-audit): serialize tx_/rx_
+                sink = self._client.register_sink(total_sink)
             sink_desc = "host"
         self._sink_pool = _SinkSlotPool(sink, per_layer_bytes,
                                           self._sink_slots)
@@ -2111,7 +2258,22 @@ class _Worker:
         return best
 
     def _record_stored_groups(self, chain: list[int], n_groups: int):
-        """Record that n_groups were written for this chain prefix."""
+        """Record that n_groups were written for this chain prefix.
+
+        Contract: `n_groups <= len(chain)`. Each chain element is one
+        GroupHash (one per group), so the count cannot exceed the chain
+        length. The query side (`_get_stored_context_groups`) silently
+        caps at `min(n_groups, match_len)`, so any over-record beyond
+        `len(chain)` is invisible to readers — making caller bugs hard
+        to diagnose. Assert loudly here so any future contract violation
+        surfaces at record time, not buried inside a downstream query
+        cap. See project_apply_path_helper_tests_2026-05-09.md.
+        """
+        assert n_groups <= len(chain), (
+            f"_record_stored_groups: n_groups={n_groups} > len(chain)="
+            f"{len(chain)}; query side will silently cap at match_len. "
+            f"Caller is recording more groups than chain elements — "
+            f"likely a stale-chain or wrong-counter bug.")
         for i, (sc, _) in enumerate(self._stored_chain_groups):
             if sc == chain:
                 self._stored_chain_groups[i] = (chain, max(_, n_groups))
@@ -2156,8 +2318,19 @@ class _Worker:
         self._requests.clear()
         try:
             if self._sink_pool is not None:
-                self._client.unregister_sink(self._sink_pool.sink)
+                with self._rpc_lock:  # X1 (race-audit): serialize tx_/rx_
+                    self._client.unregister_sink(self._sink_pool.sink)
                 self._sink_pool.sink.close()
+            if self._per_head_summary_sink is not None:
+                try:
+                    with self._rpc_lock:  # X1 (race-audit): serialize tx_/rx_
+                        self._client.unregister_sink(
+                            self._per_head_summary_sink)
+                    self._per_head_summary_sink.close()
+                except Exception:
+                    pass
+                self._per_head_summary_sink = None
+                self._per_head_summary_sink_capacity = 0
         finally:
             self._client.close()
             self._client = None
@@ -2533,8 +2706,9 @@ class _Worker:
             return
         try:
             icms_rid = self._icms_request_id(request_id, 0)
-            self._client.preload(request_id=icms_rid,
-                                 chain=self._rank_chain(chain))
+            with self._rpc_lock:  # X1 (race-audit): serialize tx_/rx_
+                self._client.preload(request_id=icms_rid,
+                                     chain=self._rank_chain(chain))
         except Exception as e:
             logger.debug("preload failed for %s: %s", request_id, e)
 
@@ -2727,27 +2901,36 @@ class _Worker:
             if self._tp_size > 1 and self._tp_rank != 0:
                 reply = None
             else:
-                reply = self._client.fetch_all(
-                    request_id=icms_rid,
-                    chain=self._rank_chain(rs.chain),
-                    layer=next_layer_idx,
-                    sink=self._sink_pool.sink,
-                    reuse_through_layer=reuse_through,
-                    # Reply-early: server ships the FetchAll reply as soon
-                    # as page_ids are known; Phase-2 KV writes + per-layer
-                    # flag flips run in background so the GPU forward pass
-                    # overlaps with the transfer. Note: reply's
-                    # sink_write_ns / server_ingest_to_ready_ns are
-                    # reported as 0 in this mode — the transfer wall-time
-                    # shows up as the sum of per-layer wait_spin on the
-                    # client side.
-                    use_flags=(os.environ.get("ICMS_REPLY_EARLY", "1") == "1"),
-                    demand_bps=ab_demand_bps,
-                    compute_supply_bps=ab_compute_supply_bps,
-                )
+                with self._rpc_lock:  # X1 (race-audit): serialize tx_/rx_
+                    reply = self._client.fetch_all(
+                        request_id=icms_rid,
+                        chain=self._rank_chain(rs.chain),
+                        layer=next_layer_idx,
+                        sink=self._sink_pool.sink,
+                        reuse_through_layer=reuse_through,
+                        # Reply-early: server ships the FetchAll reply as soon
+                        # as page_ids are known; Phase-2 KV writes + per-layer
+                        # flag flips run in background so the GPU forward pass
+                        # overlaps with the transfer. Note: reply's
+                        # sink_write_ns / server_ingest_to_ready_ns are
+                        # reported as 0 in this mode — the transfer wall-time
+                        # shows up as the sum of per-layer wait_spin on the
+                        # client side.
+                        use_flags=(os.environ.get("ICMS_REPLY_EARLY", "1") == "1"),
+                        demand_bps=ab_demand_bps,
+                        compute_supply_bps=ab_compute_supply_bps,
+                    )
         except Exception as e:
-            logger.debug("fetch_all RPC failed rank=%d layer=%d: %s",
-                         self._tp_rank, next_layer_idx, e)
+            # 2026-05-08: keep at warning so future silent-failure
+            # regressions are visible (debug-level masked the qwen3
+            # b=1.0 corruption for ~3 weeks). Cheap log; only fires on
+            # actual exceptions.
+            logger.warning(
+                "fetch_all RPC FAILED rank=%d layer=%d type=%s status=%s "
+                "msg=%s",
+                self._tp_rank, next_layer_idx, type(e).__name__,
+                getattr(e, "status", "?"),
+                str(e)[:200])
             reply = None
         t_end = time.perf_counter()
 
@@ -2764,6 +2947,32 @@ class _Worker:
                     "fetch_all broadcast failed rank=%d layer=%d",
                     self._tp_rank, next_layer_idx)
                 reply = None
+        if os.environ.get("ICMS_DIAG_FA_TRACE") == "1":
+            logger.info(
+                "[diag-fa-trace] post-broadcast rid=%s layer=%d "
+                "total_pages=%d reply_is_none=%d n_page_ids=%d",
+                rid, next_layer_idx, total_pages,
+                int(reply is None),
+                (len(reply.page_ids) if reply is not None else -1))
+        # ICMS_STRICT_ASSERTIONS=1: convert silent-state-empty failure
+        # patterns into loud crashes. Pre-2026-05-08, fetch_all silently
+        # AttributeError'd on non-RDMA → reply=None → empty
+        # _pending_scores → corrupted KV → qwen3 b=1.0 = 0.067. This
+        # assert would have crashed on the first b=1.0 call instead of
+        # silently producing wrong output for ~3 weeks. Cheap; safe to
+        # leave on for sweeps + CI; opt-out for paper runs.
+        if (os.environ.get("ICMS_STRICT_ASSERTIONS", "0") == "1"
+                and total_pages > 0
+                and (reply is None or not reply.page_ids)):
+            raise RuntimeError(
+                f"FetchAll returned empty reply but total_pages={total_pages}; "
+                f"client={type(self._client).__name__} rid={rid} "
+                f"layer={next_layer_idx} tp_rank={self._tp_rank}. "
+                f"This usually means the transport doesn't implement "
+                f"fetch_all (use _supports_fetch_all gate) or the RPC "
+                f"silently failed (see warning log line above for the "
+                f"actual exception)."
+            )
         if reply is None or not reply.page_ids:
             # Rank-0 RPC failed, broadcast erred, or server returned
             # zero pages. Record a miss so stats stay consistent and
@@ -2856,6 +3065,52 @@ class _Worker:
                     rid[:8], next_layer_idx, len(reply.page_ids),
                     total_pages, reuse_through - next_layer_idx,
                     len(reply.sink_offsets))
+            # ICMS_DIAG_PAGE_IDS dump (FetchAll path mirror of the Score
+            # path block at ~line 3857). Lets us diff page-ID sets from
+            # FetchAll vs Score on the same prompt to localize the
+            # qwen3-specific b=1.0 corruption.
+            _diag_pids_path = os.environ.get("ICMS_DIAG_PAGE_IDS", "")
+            if (_diag_pids_path
+                    and not getattr(self, "_diag_page_ids_fa_fired", False)):
+                self._diag_page_ids_fa_fired = True
+                try:
+                    import json as _json
+                    _pids = list(int(p) for p in reply.page_ids)
+                    _sorted_pids = sorted(_pids)
+                    _hash = 0
+                    for _p in _sorted_pids:
+                        _hash = (_hash * 31 + _p) & 0xFFFFFFFFFFFFFFFF
+                    out_path = (_diag_pids_path
+                                if _diag_pids_path != "1"
+                                else f"/tmp/icms_diag_pids_FA_tp{self._tp_size}_"
+                                     f"r{self._tp_rank}_pid{os.getpid()}.json")
+                    if _diag_pids_path != "1":
+                        # When user passed a path, suffix with _FA so
+                        # FetchAll dump doesn't overwrite Score dump.
+                        _root, _ext = os.path.splitext(out_path)
+                        out_path = f"{_root}_FA{_ext or '.json'}"
+                    _scores = [float(s) for s in reply.scores]
+                    _pid_score = list(zip(_pids, _scores))
+                    with open(out_path, "w") as f:
+                        _json.dump({
+                            "src": "fetch_all",
+                            "tp_rank": self._tp_rank,
+                            "tp_size": self._tp_size,
+                            "rid": rid,
+                            "layer": next_layer_idx,
+                            "n_pids": len(_pids),
+                            "pids_sorted_hash": f"{_hash:016x}",
+                            "pids_sorted": _sorted_pids,
+                            "pid_score_unsorted": _pid_score,
+                        }, f)
+                    logger.info(
+                        "[diag-page-ids] src=fetch_all rank=%d tp_size=%d "
+                        "rid=%s layer=%d n_pids=%d head[:8]=%s tail[:8]=%s "
+                        "sorted_hash=%016x dumped=%s",
+                        self._tp_rank, self._tp_size, rid, next_layer_idx,
+                        len(_pids), _pids[:8], _pids[-8:], _hash, out_path)
+                except Exception as _e:
+                    logger.warning("diag-page-ids (fetch_all) failed: %s", _e)
         except Exception as e:
             t_end = time.perf_counter()
             self.stats.record_score(
@@ -3336,6 +3591,35 @@ class _Worker:
                 stored_groups, rs.num_groups_written,
                 effective_groups, total_pages,
             )
+        # 2026-05-08 race-audit follow-up: per-Score chain-state lag
+        # diagnostic. The agent's hypothesis is that pre-fix BLOCK_WRITES=0
+        # batched runs hit Score with `flushed_local < num_groups_written`
+        # (i.e., the deferred-write pipeline is behind the scheduler's
+        # expected committed groups), so the server returns a valid
+        # PREFIX of the chain and connector reads silent wrong-pages.
+        # With the Step 1 fix (BLOCK_WRITES default-on for batched), every
+        # Score should see lag=False. Counts kept in self.stats so we can
+        # report a final tally; line-per-Score logs only when lag fires.
+        if os.environ.get("ICMS_DIAG_CHAIN_LAG", "0") == "1":
+            _flushed = int(getattr(rs, "flushed_local", -1))
+            _expected = int(rs.num_groups_written)
+            _lag = (_flushed >= 0) and (_flushed < _expected)
+            if not hasattr(self, "_diag_chain_lag_count"):
+                self._diag_chain_lag_count = 0
+                self._diag_chain_lag_total = 0
+            self._diag_chain_lag_total += 1
+            if _lag:
+                self._diag_chain_lag_count += 1
+                logger.info(
+                    "[diag-chain-lag] LAG rid=%s layer=%d chain_len=%d "
+                    "flushed_local=%d num_groups_written=%d "
+                    "stored_groups=%d (lag_count=%d/%d=%.1f%%)",
+                    rid, next_layer_idx, len(rs.chain),
+                    _flushed, _expected, stored_groups,
+                    self._diag_chain_lag_count,
+                    self._diag_chain_lag_total,
+                    100.0 * self._diag_chain_lag_count
+                    / max(1, self._diag_chain_lag_total))
 
         # First-turn / empty-chain short-circuit. No stored pages means
         # nothing to score and no sink to fill — skip everything,
@@ -3445,6 +3729,19 @@ class _Worker:
                 total_pages, already_fetched)
             return
 
+        # ICMS_QUEST_MODE=per_kv_head — server-fetched summaries +
+        # GPU per-(KV-head) scoring + server-fetched union of selected
+        # pages, via v8 wire opcodes 25/27/29. Mirrors the existing
+        # ICMS_ORIGINAL_QUEST path (per-layer union → fed to vLLM's
+        # PagedAttention as-is) but sources summaries from the storage
+        # server instead of a local GPU stash, so it works for chains
+        # written by other requests too.
+        if os.environ.get("ICMS_QUEST_MODE", "") == "per_kv_head":
+            self._quest_per_kv_head_score_one_layer(
+                rid, rs, req_idx, next_layer_idx, quest_query, budget,
+                total_pages, already_fetched)
+            return
+
         # Determine effective budget: adaptive allocator or static.
         effective_budget = budget
         budget_source = "static"
@@ -3520,7 +3817,16 @@ class _Worker:
         # M3: in decode, the bitmap-aware Score path is what we want even
         # at budget=1.0 — kFetchAll ignores the bitmap and would re-fetch
         # everything. Skip the redirect when decoding.
-        if effective_budget >= 1.0 and total_pages > 0 and not is_decode:
+        # 2026-05-08: gate on transport support. The unix-socket and
+        # shmem IcmsClient classes don't implement fetch_all (RDMA-only
+        # path); previously this redirect silently failed leaving
+        # _pending_scores empty → corrupted KV (qwen3 niah_multikey_2
+        # b=1.0 = 0.067 vs 1.000 with shortcut off). Skip the redirect
+        # for non-RDMA transports so we fall through to the Score path
+        # below with k=total_pages, which gives the same "every page"
+        # result via scoring.
+        if (effective_budget >= 1.0 and total_pages > 0 and not is_decode
+                and getattr(self, "_supports_fetch_all", False)):
             try:
                 self._fetch_all_one_request(
                     rid, rs, req_idx, next_layer_idx, effective_budget, stats)
@@ -3588,8 +3894,21 @@ class _Worker:
                 if (local_kv_heads >= 1 and num_heads >= local_kv_heads
                         and num_heads % local_kv_heads == 0):
                     heads_per_group = num_heads // local_kv_heads
-                    q = (q.reshape(local_kv_heads, heads_per_group, head_dim)
-                          .mean(dim=1))  # [local_kv_heads, head_dim]
+                    grouped = q.reshape(
+                        local_kv_heads, heads_per_group, head_dim)
+                    pool = os.environ.get("ICMS_Q_GQA_POOL", "mean").lower()
+                    if pool == "absmax":
+                        # Pick the per-channel value with largest |q| across
+                        # heads (sign preserved). Reduces dilution when query
+                        # heads in a GQA group disagree on direction.
+                        absg = grouped.abs()
+                        idx = absg.argmax(dim=1, keepdim=True)
+                        q = grouped.gather(dim=1, index=idx).squeeze(1)
+                    elif pool == "max":
+                        q = grouped.amax(dim=1)
+                    else:  # default: mean
+                        q = grouped.mean(dim=1)
+                    # q: [local_kv_heads, head_dim]
             q = q.reshape(-1).to(dtype=torch.float32, device="cpu")
             q_np = q.contiguous().numpy()
         else:
@@ -3705,9 +4024,10 @@ class _Worker:
                 except ValueError:
                     _retry_count, _retry_delay_s = 3, 0.020
 
+                _rk_chain = self._rank_chain(rs.chain)
                 _score_kwargs = dict(
                     request_id=icms_rid,
-                    chain=self._rank_chain(rs.chain),
+                    chain=_rk_chain,
                     layer=next_layer_idx,
                     query=q_np,
                     k=k,
@@ -3718,11 +4038,34 @@ class _Worker:
                     demand_bps=ab_demand_bps,
                     compute_supply_bps=ab_compute_supply_bps,
                 )
+                # 2026-05-08 race-audit follow-up: log the chain prefix
+                # actually sent to Score. The pids-hash diag showed
+                # control returning sequential pages 0..k-1 starting at
+                # layer 6 — strong signal that the SERVER's view of the
+                # chain shrinks mid-prefill. This logs the client-side
+                # chain length sent on the wire, plus a fingerprint of
+                # the chain hashes (first/last entry). If the chain bytes
+                # are stable across layers but server returns different
+                # n_pids, the bug is server-side. If the chain bytes
+                # SHRINK across layers, it's a client-side rs.chain
+                # mutation race.
+                if os.environ.get("ICMS_DIAG_SCORE_CHAIN", "0") == "1":
+                    _ch_len = len(_rk_chain)
+                    _ch_first = _rk_chain[0] if _rk_chain else None
+                    _ch_last = _rk_chain[-1] if _rk_chain else None
+                    logger.info(
+                        "[diag-score-chain] rid=%s layer=%d k=%d "
+                        "chain_len=%d ch_first=%s ch_last=%s "
+                        "rs_chain_len=%d flushed_local=%d",
+                        rid, next_layer_idx, k, _ch_len,
+                        _ch_first, _ch_last, len(rs.chain),
+                        int(getattr(rs, "flushed_local", -1)))
                 _last_err = None
                 reply = None
                 for _attempt in range(_retry_count + 1):
                     try:
-                        reply = self._client.score(**_score_kwargs)
+                        with self._rpc_lock:  # X1 (race-audit): serialize tx_/rx_
+                            reply = self._client.score(**_score_kwargs)
                         break
                     except IcmsError as _e:
                         if _e.status != errno.ENOENT:
@@ -3775,6 +4118,26 @@ class _Worker:
             except Exception as e:
                 logger.warning("Score: reply broadcast failed: %s", e)
                 reply = None
+        # ICMS_STRICT_ASSERTIONS=1: same silent-state-empty guard as
+        # _fetch_all_one_request, but with a soft-fail allowlist. Score
+        # has a documented soft-fail on ENOENT-after-retries (see
+        # ICMS_SCORE_RETRY_FAIL_LOUD comment ~line 3850); that's a
+        # transient race during prefill, not a bug. Crash only when
+        # reply is None for an UNDOCUMENTED reason — i.e., no _last_err
+        # set, which means we hit the outer except (real exception, not
+        # ENOENT-soft-fail). Catches missing methods, broadcast bugs,
+        # silent transport failures.
+        _strict = os.environ.get("ICMS_STRICT_ASSERTIONS", "0") == "1"
+        _soft_failed = (locals().get("_last_err") is not None)
+        if (_strict and total_pages > 0 and reply is None
+                and not _soft_failed):
+            raise RuntimeError(
+                f"Score returned empty reply with no soft-fail reason; "
+                f"total_pages={total_pages} client="
+                f"{type(self._client).__name__} rid={rid} "
+                f"layer={next_layer_idx} tp_rank={self._tp_rank} k={k}. "
+                f"Check warning logs for the underlying exception."
+            )
         if reply is None:
             # Nothing to do; don't touch _pending_scores / _pending_reuse.
             self.stats.record_score(
@@ -3828,6 +4191,23 @@ class _Worker:
                         k, total_pages)
                 except Exception as _e:
                     logger.warning("diag-chain-state failed: %s", _e)
+            # 2026-05-08 race-audit follow-up: per-Score page-ID hash
+            # diagnostic (compact, every Score). Lets us compare control
+            # vs step1fix runs at the same (rid, layer) — if the hash
+            # differs systematically, the bug is upstream of apply
+            # (Score state); if hashes match but accuracy differs, the
+            # bug is in apply / attention compute. Set ICMS_DIAG_PIDS_HASH=1
+            # to emit one-line-per-Score; cheap.
+            if os.environ.get("ICMS_DIAG_PIDS_HASH", "0") == "1":
+                _pids = sorted(int(p) for p in reply.page_ids)
+                _h = 0
+                for _p in _pids:
+                    _h = (_h * 31 + _p) & 0xFFFFFFFFFFFFFFFF
+                logger.info(
+                    "[diag-pids-hash] rid=%s layer=%d k=%d n_pids=%d "
+                    "head=%s tail=%s sorted_hash=%016x",
+                    rid, next_layer_idx, k, len(_pids),
+                    _pids[:4], _pids[-4:], _h)
             # First-Score page_ids fingerprint + full dump. Lets us
             # compare which pages Score selected across TP=1 / TP=2.
             # Dumps the FULL set of page_ids to a JSON file so we can
@@ -4184,6 +4564,265 @@ class _Worker:
         self.stats.record_score(wall_us, bool(picked), picked, next_layer_idx)
         logger.debug(
             "[icms_quest] layer=%d total_pages=%d k=%d new=%d "
+            "fetched_so_far=%d wall_us=%.1f",
+            next_layer_idx, total_pages, k, len(picked),
+            len(rs.fetched_pages.get(next_layer_idx, set())), wall_us)
+
+    def _ensure_summary_sink(self, total_pages: int) -> "Sink | None":
+        """Lazy-allocate (or grow) the per-head summaries sink.
+
+        Lives on the worker, alongside `self._sink_pool.sink`. Sized for
+        `total_pages * summary_page_bytes`; doubled on first allocation
+        to amortize regrowths as the chain grows. Returns the active
+        sink or None if the underlying client doesn't have a working
+        register_sink() (RDMA / shmem clients differ — for those the
+        per-head pipeline is not supported in v1).
+        """
+        if self._client is None or self._geom is None or total_pages <= 0:
+            return None
+        needed = int(total_pages) * int(self._geom.summary_page_bytes)
+        existing = getattr(self, "_per_head_summary_sink", None)
+        capacity = getattr(self, "_per_head_summary_sink_capacity", 0)
+        if existing is not None and capacity >= needed:
+            return existing
+        try:
+            new_size = max(needed * 2, 64 * 1024)
+            with self._rpc_lock:  # X1 (race-audit): serialize tx_/rx_
+                new_sink = self._client.register_sink(new_size)
+        except Exception as e:
+            logger.warning(
+                "[icms_quest_per_head] could not allocate summaries "
+                "sink (size=%d, total_pages=%d): %r",
+                needed, total_pages, e)
+            return None
+        if existing is not None:
+            try:
+                with self._rpc_lock:  # X1 (race-audit): serialize tx_/rx_
+                    self._client.unregister_sink(existing)
+                existing.close()
+            except Exception:
+                pass
+        self._per_head_summary_sink = new_sink
+        self._per_head_summary_sink_capacity = new_size
+        return new_sink
+
+    def _quest_per_kv_head_score_one_layer(self, rid, rs, req_idx,
+                                            next_layer_idx, quest_query,
+                                            budget, total_pages,
+                                            already_fetched):
+        """ICMS_QUEST_MODE=per_kv_head path: server-fetched summaries +
+        GPU per-(KV-head) Quest scoring + server-fetched union of
+        selected pages, via v8 wire opcodes 25 / 27 / 29.
+
+        Mirrors the ICMS_ORIGINAL_QUEST shape (per-layer union → fed to
+        vLLM's PagedAttention via _pending_scores) except summaries come
+        from the server instead of a local stash. That makes this path
+        usable for chains written by other requests (cross-request
+        reuse), while ICMS_ORIGINAL_QUEST is only valid when the same
+        process wrote the chain.
+
+        TP=1 only for v1 — same constraint as ICMS_ORIGINAL_QUEST.
+
+        `req_idx` is the caller's batch slot for this rid. Stamped on
+        the synthesized `_pending_scores` entry so the apply path
+        (which slices per-rid query/block-table tensors by req_idx)
+        reads the correct slice. Pre-fix this was hardcoded to 0,
+        breaking multi-rid batches.
+        """
+        if not isinstance(quest_query, torch.Tensor) or quest_query.ndim < 2:
+            return
+        if self._tp_size > 1:
+            if not self._quest_per_head_tp_warned:
+                logger.warning(
+                    "[icms_quest_per_head] ICMS_QUEST_MODE=per_kv_head "
+                    "currently supports TP=1 only; got tp_size=%d. "
+                    "Falling through to a no-op.", self._tp_size)
+                self._quest_per_head_tp_warned = True
+            return
+        if total_pages <= 0 or self._client is None or self._geom is None:
+            return
+        # The new opcodes are not implemented for RDMA or shmem clients
+        # in v1 — they live in the unix-socket IcmsClient only. Detect
+        # by feature presence and bail with a clear log.
+        if not hasattr(self._client, "fetch_summaries_per_head"):
+            if not self._quest_per_head_client_warned:
+                logger.warning(
+                    "[icms_quest_per_head] active client (%s) lacks "
+                    "fetch_summaries_per_head; per-head mode requires "
+                    "the unix-socket IcmsClient. No-op.",
+                    type(self._client).__name__)
+                self._quest_per_head_client_warned = True
+            return
+        sum_sink = self._ensure_summary_sink(total_pages)
+        if sum_sink is None:
+            return
+        if not self._quest_per_head_first_call_logged:
+            logger.info(
+                "[icms_quest_per_head] FIRST CALL — per-head path active "
+                "(rid=%s layer=%d total_pages=%d budget=%.3f)",
+                rid[:8], next_layer_idx, total_pages, float(budget))
+            self._quest_per_head_first_call_logged = True
+
+        chain = self._rank_chain(rs.chain)
+        icms_rid = self._icms_request_id(rid, 0)
+        t0 = time.perf_counter()
+
+        # 1. Fetch per-page summaries for THIS layer.
+        try:
+            with self._rpc_lock:  # X1 (race-audit): serialize tx_/rx_
+                sum_reply = self._client.fetch_summaries_per_head(
+                    request_id=icms_rid, chain=chain, layer=next_layer_idx,
+                    sink=sum_sink, reuse_through_layer=next_layer_idx)
+        except IcmsError as e:
+            logger.warning(
+                "[icms_quest_per_head] FetchSummariesPerHead failed at "
+                "layer %d (rid=%s): %r", next_layer_idx, rid[:8], e)
+            return
+
+        P = len(sum_reply.page_ids)
+        if P == 0:
+            return
+        # Pin the page_id ordering invariant: server MUST return
+        # `page_ids = [0, 1, ..., P-1]` so that scorer-returned indices
+        # (row indices into kmin/kmax) coincide with real page IDs sent
+        # back via fetch_union_per_head. If the server's reply ever
+        # diverges from this (partial chain, page_id remapping, etc.),
+        # `picked` would mean different things to the scorer (row idx)
+        # vs the server (page id). Fail fast.
+        if (sum_reply.page_ids[0] != 0 or sum_reply.page_ids[-1] != P - 1
+                or len(sum_reply.page_ids) != P):
+            logger.warning(
+                "[icms_quest_per_head] sum_reply.page_ids violates the "
+                "[0..P-1] contract (P=%d, head=%s, tail=%s); aborting "
+                "this layer to avoid corrupted KV reads.",
+                P, sum_reply.page_ids[:4], sum_reply.page_ids[-4:])
+            return
+
+        # 2. Reshape sink bytes → (kmin, kmax) tensors on the GPU.
+        # Per-page blob layout matches record_page() at the connector
+        # write side: kmin.tobytes() ++ kmax.tobytes(), each
+        # [H_kv, D] fp16.
+        H_kv = int(self._geom.num_kv_heads)
+        D = int(self._geom.head_dim)
+        elem = int(self._geom.elem_bytes)
+        spb = int(self._geom.summary_page_bytes)
+        if elem != 2:
+            logger.warning(
+                "[icms_quest_per_head] elem_bytes=%d not supported in v1 "
+                "(fp16 only); no-op.", elem)
+            return
+        # Bulk decode summaries → [P, 2, H_kv, D] fp16 tensor on GPU.
+        # The server packs page i at sink offset slot_base + i * spb,
+        # so the bytes are contiguous in the sink starting at
+        # sum_reply.sink_offsets[0]. One bulk slice instead of P
+        # per-page memcpys — the loop was the dominant Python cost
+        # at long context (P × spb bytes; ~64 MB/layer at qwen3 128K).
+        view = sum_sink.view()
+        slot_base = int(sum_reply.sink_offsets[0])
+        total_bytes = P * spb
+        # Defensive: confirm contiguity. If a future server-side layout
+        # change ever breaks the dense [slot_base, slot_base+P*spb)
+        # invariant, fall back to per-page rather than silently
+        # scrambling KV. The compare loop is O(P) ints — noise vs the
+        # avoided memcpy.
+        if all(int(sum_reply.sink_offsets[i]) == slot_base + i * spb
+                for i in range(P)):
+            host_bytes = bytes(view[slot_base:slot_base + total_bytes])
+        else:
+            logger.warning(
+                "[icms_quest_per_head] sink_offsets are non-contiguous "
+                "(server-side layout change?); falling back to per-page "
+                "memcpy.")
+            host_buf = bytearray(total_bytes)
+            for i, off in enumerate(sum_reply.sink_offsets):
+                host_buf[i * spb:(i + 1) * spb] = bytes(view[off:off + spb])
+            host_bytes = bytes(host_buf)
+        # `host_bytes` is immutable so torch.frombuffer can wrap it
+        # without copying; .to(device) is the single H2D copy.
+        flat_cpu = torch.frombuffer(host_bytes, dtype=torch.float16,
+                                      count=P * 2 * H_kv * D).reshape(
+            P, 2, H_kv, D)
+        device = quest_query.device if quest_query.is_cuda else "cuda"
+        flat_gpu = flat_cpu.to(device=device, non_blocking=True)
+        kmin = flat_gpu[:, 0, :, :].contiguous()
+        kmax = flat_gpu[:, 1, :, :].contiguous()
+
+        # 3. Score on GPU (existing per-(KV-head) scorer; union of top-K).
+        from vllm.distributed.kv_transfer.kv_connector.v1.quest_local_scorer \
+            import quest_score_local_chunked
+        k = max(1, int(total_pages * float(budget)))
+        try:
+            picked = quest_score_local_chunked(
+                quest_query, kmin, kmax, k=k,
+                num_kv_heads=H_kv,
+                exclude_pages=already_fetched)
+        except Exception as e:
+            logger.warning(
+                "[icms_quest_per_head] scorer failed at layer %d: %s",
+                next_layer_idx, e)
+            return
+        if not picked:
+            return
+
+        # 4. Fetch the per-head union of selected pages into the main
+        # KV sink. Reply offsets feed _pending_scores so the apply path
+        # is unchanged from the BF2 Score path.
+        try:
+            with self._rpc_lock:  # X1 (race-audit): serialize tx_/rx_
+                union_reply = self._client.fetch_union_per_head(
+                    request_id=icms_rid, chain=chain, layer=next_layer_idx,
+                    sink=self._sink_pool.sink, page_ids=picked,
+                    reuse_through_layer=next_layer_idx)
+        except IcmsError as e:
+            logger.warning(
+                "[icms_quest_per_head] FetchUnionPerHead failed at "
+                "layer %d (rid=%s, k=%d): %r",
+                next_layer_idx, rid[:8], len(picked), e)
+            return
+
+        # 5. Hand off to the existing apply path. Synthesize a
+        # ScoreReply-shaped object with picked + sink_offsets so
+        # wait_for_layer / _apply_fetch_impl don't need to special-case
+        # per-head replies. Scores are recomputed from the same kernel
+        # (max-over-heads of `score[pid, h]`) so perf-sweep histograms
+        # don't see degenerate all-zero distributions in per-head mode.
+        from vllm.distributed.kv_transfer.kv_connector.v1.quest_local_scorer \
+            import quest_score_pages_max
+        try:
+            score_map = quest_score_pages_max(
+                quest_query, kmin, kmax, picked, num_kv_heads=H_kv)
+        except Exception as e:
+            logger.warning(
+                "[icms_quest_per_head] score-map compute failed at "
+                "layer %d: %s; defaulting to zeros.", next_layer_idx, e)
+            score_map = {pid: 0.0 for pid in picked}
+        from icms_client.protocol import ScoreReply
+        synth = ScoreReply(
+            request_id=icms_rid,
+            status=0,
+            trie_walk_ns=0,
+            summary_read_ns=int(sum_reply.summary_read_ns),
+            score_ns=int((time.perf_counter() - t0) * 1e9),
+            sink_write_ns=int(union_reply.sink_write_ns),
+            cache_hit=bool(sum_reply.cache_hit),
+            concurrent_requests=int(union_reply.concurrent_requests),
+            server_ingest_to_ready_ns=int(
+                union_reply.server_ingest_to_ready_ns),
+            effective_supply_bps=int(union_reply.effective_supply_bps),
+            page_ids=list(picked),
+            scores=[score_map.get(pid, 0.0) for pid in picked],
+            sink_offsets=list(union_reply.sink_offsets),
+        )
+        attn_layer_name = f"model.layers.{next_layer_idx}.self_attn.attn"
+        with self._score_lock:
+            self._pending_scores.setdefault(attn_layer_name, {})[rid] = (
+                synth, req_idx)
+
+        rs.fetched_pages.setdefault(next_layer_idx, set()).update(picked)
+        wall_us = (time.perf_counter() - t0) * 1e6
+        self.stats.record_score(wall_us, bool(picked), picked, next_layer_idx)
+        logger.debug(
+            "[icms_quest_per_head] layer=%d total_pages=%d k=%d new=%d "
             "fetched_so_far=%d wall_us=%.1f",
             next_layer_idx, total_pages, k, len(picked),
             len(rs.fetched_pages.get(next_layer_idx, set())), wall_us)
@@ -4681,8 +5320,16 @@ class _Worker:
         kv = self._gpu_kv_caches.get(layer_name)
         if kv is None or kv.ndim != 5:
             return None
-        main_key = kv[0]
-        main_value = kv[1]
+        # See extract_and_record for layout discussion (gemma-3 / TRITON_ATTN
+        # uses [num_blocks, 2, ...] vs standard [2, num_blocks, ...]).
+        if kv.shape[0] == 2:
+            main_key = kv[0]
+            main_value = kv[1]
+        elif kv.shape[1] == 2:
+            main_key = kv[:, 0]
+            main_value = kv[:, 1]
+        else:
+            return None
 
         am = self._attn_metadata.get(layer_name) if isinstance(self._attn_metadata, dict) else None
         if am is None or not hasattr(am, "block_table"):
@@ -4819,6 +5466,43 @@ class _Worker:
                                 logger.warning("diag-tp-apply-fast failed: %s", _e)
                         k_pages = k_pages[:, :, start:start + nkv_local, :].contiguous()
                         v_pages = v_pages[:, :, start:start + nkv_local, :].contiguous()
+                    # ICMS_DIAG_KV_DIFF=1: compare prefix-cache KV vs the
+                    # ICMS-fetched KV at the SAME phys_block before
+                    # index_copy_ overwrites. If hashes differ, ICMS-stored
+                    # KV diverges from what vLLM prefilled — explains the
+                    # b=1.0 < b=0.50 inversion (full overwrite at b=1.0
+                    # corrupts more pages than top-K overwrite at b=0.50).
+                    if (os.environ.get("ICMS_DIAG_KV_DIFF") == "1"
+                            and phys_blocks_dev.numel() > 0):
+                        try:
+                            import hashlib as _h_kvd
+                            _kvd_layer = self._extract_layer_idx(layer_name)
+                            if _kvd_layer in (0, 6, 12, 18, 24, 30, 36, 42):
+                                _phys0 = int(phys_blocks_dev[0].item())
+                                _pre_k = main_key[_phys0].cpu().numpy().tobytes()
+                                _new_k = k_pages[0].cpu().numpy().tobytes()
+                                _pre_v = main_value[_phys0].cpu().numpy().tobytes()
+                                _new_v = v_pages[0].cpu().numpy().tobytes()
+                                _pre_kh = _h_kvd.sha1(_pre_k).hexdigest()[:16]
+                                _new_kh = _h_kvd.sha1(_new_k).hexdigest()[:16]
+                                _pre_vh = _h_kvd.sha1(_pre_v).hexdigest()[:16]
+                                _new_vh = _h_kvd.sha1(_new_v).hexdigest()[:16]
+                                _diff_k = _pre_kh != _new_kh
+                                _diff_v = _pre_vh != _new_vh
+                                # First-bytes hex sample to see content
+                                _pre_k_head = _pre_k[:16].hex()
+                                _new_k_head = _new_k[:16].hex()
+                                logger.info(
+                                    "[diag-kv-diff] rid=%s layer=%d phys=%d "
+                                    "k_pre=%s k_new=%s diff_k=%s "
+                                    "v_pre=%s v_new=%s diff_v=%s "
+                                    "k_pre_head=%s k_new_head=%s",
+                                    rid[:8], _kvd_layer, _phys0,
+                                    _pre_kh, _new_kh, _diff_k,
+                                    _pre_vh, _new_vh, _diff_v,
+                                    _pre_k_head, _new_k_head)
+                        except Exception as _e_kvd:
+                            logger.warning("diag-kv-diff failed: %s", _e_kvd)
                     main_key.index_copy_(0, phys_blocks_dev, k_pages)
                     main_value.index_copy_(0, phys_blocks_dev, v_pages)
 
@@ -5380,6 +6064,43 @@ class _Worker:
                     k_pages = k_pages[:, :, start:start + nkv_local, :].contiguous()
                     v_pages = v_pages[:, :, start:start + nkv_local, :].contiguous()
 
+                # ICMS_DIAG_KV_DIFF=1: see same diag in fast path.
+                # Mirror — slow path is the canonical path for first-
+                # apply-of-request and many bench configs. Logs pre/
+                # post hashes + first-bytes hex sample to detect ICMS-
+                # stored vs prefix-cached KV divergence.
+                if (os.environ.get("ICMS_DIAG_KV_DIFF") == "1"
+                        and phys_blocks_dev.numel() > 0):
+                    try:
+                        import hashlib as _h_kvd
+                        _kvd_layer = self._extract_layer_idx(layer_name)
+                        if _kvd_layer in (0, 6, 12, 18, 24, 30, 36, 42):
+                            _phys0 = int(phys_blocks_dev[0].item())
+                            # bf16 → uint8 view → numpy (numpy has no
+                            # bf16 dtype). Hashes are byte-identical.
+                            _pre_k = main_key[_phys0].view(torch.uint8).cpu().numpy().tobytes()
+                            _new_k = k_pages[0].view(torch.uint8).cpu().numpy().tobytes()
+                            _pre_v = main_value[_phys0].view(torch.uint8).cpu().numpy().tobytes()
+                            _new_v = v_pages[0].view(torch.uint8).cpu().numpy().tobytes()
+                            _pre_kh = _h_kvd.sha1(_pre_k).hexdigest()[:16]
+                            _new_kh = _h_kvd.sha1(_new_k).hexdigest()[:16]
+                            _pre_vh = _h_kvd.sha1(_pre_v).hexdigest()[:16]
+                            _new_vh = _h_kvd.sha1(_new_v).hexdigest()[:16]
+                            _diff_k = _pre_kh != _new_kh
+                            _diff_v = _pre_vh != _new_vh
+                            _pre_k_head = _pre_k[:16].hex()
+                            _new_k_head = _new_k[:16].hex()
+                            logger.info(
+                                "[diag-kv-diff] path=slow rid=%s layer=%d "
+                                "phys=%d k_pre=%s k_new=%s diff_k=%s "
+                                "v_pre=%s v_new=%s diff_v=%s "
+                                "k_pre_head=%s k_new_head=%s",
+                                rid[:8], _kvd_layer, _phys0,
+                                _pre_kh, _new_kh, _diff_k,
+                                _pre_vh, _new_vh, _diff_v,
+                                _pre_k_head, _new_k_head)
+                    except Exception as _e_kvd:
+                        logger.warning("diag-kv-diff slow failed: %s", _e_kvd)
                 # Scatter: two kernels total for this layer.
                 main_key.index_copy_(0, phys_blocks_dev, k_pages)
                 main_value.index_copy_(0, phys_blocks_dev, v_pages)
@@ -5789,7 +6510,22 @@ class _Worker:
         # concurrently and deadlock at TP=2 (worker stuck in
         # extract_and_record's .cpu(), engine core's shm_broadcast times
         # out at 60s). Set ICMS_BLOCK_WRITES=0 to override.
-        _block_default = "1" if self._tp_size > 1 else "0"
+        # 2026-05-08 race-audit follow-up (Step 1 of "C"): batched mode
+        # at TP=1 (max_num_seqs > 1, ICMS_ALLOW_BATCH=1) hits the same
+        # write/read ordering race as TP>1 — iter N's write_pipeline can
+        # lag iter N+1's main-thread Score, and the connector's retry-
+        # on-ENOENT silently falls through to dense (no flush_local
+        # progress means Score reads from a chain prefix the server
+        # hasn't seen yet). Empirical evidence: llama3 vt 32K batched
+        # b=0.05 with BLOCK_WRITES=0 → 0.260 acc; BLOCK_WRITES=1 → 0.600.
+        # Extend the default-on gate to batched mode regardless of TP
+        # so paper accuracy runs are correct out of the box. The
+        # ICMS_BLOCK_WRITES env knob still overrides if the user wants
+        # raw async perf at the known correctness cost.
+        _batched = (_allow_batch()
+                    or self._max_num_seqs is not None
+                    and int(self._max_num_seqs) > 1)
+        _block_default = "1" if (self._tp_size > 1 or _batched) else "0"
         if os.environ.get("ICMS_BLOCK_WRITES", _block_default) == "1":
             # Drain timeout configurable (2026-05-01). Default raised from
             # 60s → 180s: Llama-3.1-8B (32 layers × 8 KV heads × 128k ctx)
@@ -6093,16 +6829,37 @@ class _Worker:
                             self._tp_rank, layer_name)
             return
 
-        # kv_layer: [2, num_blocks, block_size, num_kv_heads, head_dim]
-        if kv_layer.ndim != 5 or kv_layer.shape[0] != 2:
+        # KV cache layout: standard FA backend uses
+        #   [2 (K+V), num_blocks, block_size, num_kv_heads, head_dim]
+        # but TRITON_ATTN backend (used for gemma-3 sliding-window-attention
+        # models) uses
+        #   [num_blocks, 2 (K+V), block_size, num_kv_heads, head_dim]
+        # — the K/V dimension is on axis 1, not axis 0. Detect both. The
+        # K/V slice in either layout is [num_blocks, block_size,
+        # num_kv_heads, head_dim] which is what the rest of this routine
+        # expects.
+        if kv_layer.ndim != 5:
             if _diag_n13 and layer_idx == 0:
                 logger.info("[diag-extract] rank=%d layer=%s SKIP=bad_kv_shape "
-                            "ndim=%d shape0=%d", self._tp_rank, layer_name,
-                            kv_layer.ndim,
-                            kv_layer.shape[0] if kv_layer.ndim > 0 else -1)
+                            "ndim=%d", self._tp_rank, layer_name, kv_layer.ndim)
             return
-        k_cache = kv_layer[0]  # [num_blocks, block_size, num_kv_heads, head_dim]
-        v_cache = kv_layer[1]
+        if kv_layer.shape[0] == 2:
+            # Standard FA layout.
+            k_cache = kv_layer[0]
+            v_cache = kv_layer[1]
+        elif kv_layer.shape[1] == 2:
+            # TRITON_ATTN layout (gemma-3, etc.). kv_layer[:, 0] selects K
+            # across all blocks; result has the same downstream shape as
+            # the standard layout.
+            k_cache = kv_layer[:, 0]
+            v_cache = kv_layer[:, 1]
+        else:
+            if _diag_n13 and layer_idx == 0:
+                logger.info(
+                    "[diag-extract] rank=%d layer=%s SKIP=unknown_kv_layout "
+                    "shape=%s", self._tp_rank, layer_name,
+                    tuple(kv_layer.shape))
+            return
 
         # block_table: [num_reqs, max_num_blocks_per_req] — per-request block IDs
         block_table = getattr(attn_metadata, "block_table", None)
@@ -6260,7 +7017,14 @@ class _Worker:
                 import torch.distributed as dist  # noqa: E402
                 from vllm.distributed.parallel_state import get_tp_group
                 tp_group = get_tp_group()
-                dev_group = tp_group.device_group
+                # T2 fix (race-audit, 2026-05-08): route through the
+                # ICMS sep-NCCL group when ICMS_USE_SEPARATE_NCCL_GROUP=1
+                # so the pipeline thread doesn't share the comm with
+                # vLLM's main-thread per-layer all_reduce. Pre-fix this
+                # site hardcoded tp_group.device_group, defeating the
+                # sep-NCCL knob for the K/V AllGather and explaining
+                # llama3 TP=2 hangs even with sep-NCCL on.
+                dev_group = _get_icms_nccl_group() or tp_group.device_group
                 gk = [torch.empty_like(k_batch_gpu)
                       for _ in range(self._tp_size)]
                 gv = [torch.empty_like(v_batch_gpu)
@@ -6582,6 +7346,16 @@ class _Worker:
                              "k_sha=%s head32=%s",
                              request_id, group_idx, probe_pid, off,
                              k_sha, head32)
+        # Design B (2026-05-08): track local RPC success in a flag,
+        # broadcast OUTSIDE the try, then gate ledger bumps on the
+        # broadcasted (cross-rank-symmetric) value. Replaces the prior
+        # in-try bumps that were skipped on rank-0 when write_group
+        # raised, while rank>0's no-op SKIP path took the bumps —
+        # producing divergent flushed_local / num_groups_written and
+        # the TP=2 multi-rid `sample_tokens` hang. See
+        # project_tp2_writegroup_asymmetry_2026-05-07 + Design B in
+        # docs/icms_open_bugs_audit_2026-05-08.md.
+        ok_local = True
         try:
             # Option W: only rank 0 sends to the server. All ranks still
             # update local bookkeeping (_record_stored_groups etc.) below.
@@ -6625,12 +7399,35 @@ class _Worker:
                         len(parent_chain), len(new_tail_groups),
                         pages, len(buf.summary_blob),
                         len(buf.kv_blob), partial)
-                self._client.write_group(
-                    parent_chain, new_tail_groups,
-                    bytes(buf.summary_blob), bytes(buf.kv_blob),
-                    pages_in_group=pages,
-                )
-            self.stats.record_flush((time.perf_counter() - t0) * 1e6)
+                with self._rpc_lock:  # X1 (race-audit): serialize tx_/rx_
+                    self._client.write_group(
+                        parent_chain, new_tail_groups,
+                        bytes(buf.summary_blob), bytes(buf.kv_blob),
+                        pages_in_group=pages,
+                    )
+        except Exception as e:
+            ok_local = False
+            logger.warning("WriteGroup failed for req=%s group=%d: %s",
+                           request_id, group_idx, e)
+
+        # Always record flush latency — this is observation, not a
+        # bookkeeping bump, so it should fire whether or not the RPC
+        # succeeded so timing histograms stay representative.
+        self.stats.record_flush((time.perf_counter() - t0) * 1e6)
+
+        # OUTSIDE try: every rank broadcasts rank-0's success bit so the
+        # ledger bumps below stay symmetric. TP=1 short-circuits to
+        # ok_local. On rank>0, ok_local is True (no-op SKIP), but only
+        # rank-0's value is authoritative — _tp_broadcast_bool ignores
+        # non-rank-0 inputs.
+        ok = _tp_broadcast_bool(
+            ok_local, self._tp_rank, self._tp_size)
+
+        if ok:
+            # Pre-Design-B, `total_groups_written` incremented on every
+            # rank>0 path (since the SKIP fall-through always reached
+            # this counter even when rank-0 had failed). Now symmetric:
+            # only counts true write successes, mirroring the bumps below.
             self.stats.total_groups_written += 1
             if group_idx >= rs.num_groups_written:
                 rs.num_groups_written = group_idx + 1
@@ -6655,10 +7452,6 @@ class _Worker:
             # to the same prefix must NOT see those 5 pages as a full group.
             if group_idx >= rs.flushed_local and not partial:
                 rs.flushed_local = group_idx + 1
-        except Exception as e:
-            self.stats.record_flush((time.perf_counter() - t0) * 1e6)
-            logger.warning("WriteGroup failed for req=%s group=%d: %s",
-                           request_id, group_idx, e)
 
     # ─── request lifecycle ───────────────────────────────────────────────
 
@@ -6804,12 +7597,27 @@ class _Worker:
                 self._tp_size <= 1 or self._tp_rank == 0):
             try:
                 icms_rid = self._icms_request_id(request_id, 0)
-                self._client.request_finished(icms_rid)
+                with self._rpc_lock:  # X1 (race-audit): serialize tx_/rx_
+                    self._client.request_finished(icms_rid)
             except Exception as e:
                 logger.debug(
                     "request_finished RPC failed for rid=%s: %s "
                     "(harmless; on_closed will GC the entry)",
                     request_id, e)
+            # ICMS_QUEST_MODE=per_kv_head uses a separate registry on
+            # the server side. Best-effort cleanup; the call is silent
+            # (no reply) and a no-op on transports without per-head
+            # support.
+            if (os.environ.get("ICMS_QUEST_MODE", "") == "per_kv_head"
+                    and hasattr(self._client, "request_finished_per_head")):
+                try:
+                    icms_rid = self._icms_request_id(request_id, 0)
+                    with self._rpc_lock:  # X1 (race-audit): serialize tx_/rx_
+                        self._client.request_finished_per_head(icms_rid)
+                except Exception as e:
+                    logger.debug(
+                        "request_finished_per_head failed for rid=%s: %s",
+                        request_id, e)
 
         # No per-rid Evict here.
         #
@@ -6852,10 +7660,11 @@ class _Worker:
         # (parent=[], tail=full chain). Used by smoke tests that put
         # a complete chain in one shot.
         rank_chain = self._rank_chain(chain)
-        return self._client.write_group(
-            [], list(rank_chain),
-            summary_blob, kv_blob,
-            pages_in_group=_GROUP_BLOCKS)
+        with self._rpc_lock:  # X1 (race-audit): serialize tx_/rx_
+            return self._client.write_group(
+                [], list(rank_chain),
+                summary_blob, kv_blob,
+                pages_in_group=_GROUP_BLOCKS)
 
     def direct_score(self, request_id: str, chain: list[int],
                       layer: int, query: torch.Tensor, k: int):
@@ -6868,10 +7677,11 @@ class _Worker:
         # Use 0 as num_computed_tokens so all layers of the same direct
         # call sequence share a single icms request_id (cross-layer reuse).
         icms_rid = self._icms_request_id(request_id, 0)
-        return self._client.score(
-            request_id=icms_rid, chain=self._rank_chain(chain), layer=layer,
-            query=q_np, k=k, sink=self._sink_pool.sink,
-        )
+        with self._rpc_lock:  # X1 (race-audit): serialize tx_/rx_
+            return self._client.score(
+                request_id=icms_rid, chain=self._rank_chain(chain), layer=layer,
+                query=q_np, k=k, sink=self._sink_pool.sink,
+            )
 
     # ─── helpers ─────────────────────────────────────────────────────────
 

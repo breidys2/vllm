@@ -320,9 +320,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # the FetchAll fast path.
             quest_budget = float(extra.get("quest_budget", 0.2))
 
-            num_layers = (
-                self.vllm_config.model_config.hf_config.num_hidden_layers
-            )
+            # Multimodal configs (Mistral3ForConditionalGeneration,
+            # Gemma3ForConditionalGeneration, ...) expose the text-tower
+            # attributes under `hf_config.text_config`. Fall back to the
+            # nested config when the top-level lookup is missing.
+            _hf = self.vllm_config.model_config.hf_config
+            if hasattr(_hf, "num_hidden_layers"):
+                num_layers = _hf.num_hidden_layers
+            elif hasattr(_hf, "text_config") and hasattr(
+                    _hf.text_config, "num_hidden_layers"):
+                num_layers = _hf.text_config.num_hidden_layers
+            else:
+                raise AttributeError(
+                    "hf_config has no num_hidden_layers (and no "
+                    "text_config.num_hidden_layers fallback) — model "
+                    f"{self.vllm_config.model_config.model_id!r} unsupported "
+                    "by Quest hooks")
 
             # Get a reference to the underlying KV connector for the hook
             # to call save_kv_layer.
@@ -388,9 +401,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Disable the shortcut so adaptive always hits the stride-gated
             # Score path. Static ConstantBudget keeps the shortcut so
             # budget=1.0 still routes through the kFetchAll fast path.
-            hook_manager.allow_all_pages_shortcut = not extra.get(
-                "adaptive_bandwidth", False
+            # 2026-05-08: also disable for non-RDMA transports — only
+            # RdmaIcmsClient implements fetch_all. Pre-fix, the unix-
+            # socket / shmem clients raised AttributeError silently
+            # caught at debug-level → empty _pending_scores → corrupted
+            # KV (qwen3 niah_multikey_2 b=1.0 = 0.067). See connector's
+            # _supports_fetch_all flag.
+            _adaptive = extra.get("adaptive_bandwidth", False)
+            _has_fetch_all = bool(extra.get("icms_rdma", False))
+            hook_manager.allow_all_pages_shortcut = (
+                (not _adaptive) and _has_fetch_all
             )
+            if not _has_fetch_all:
+                logger.info(
+                    "[icms] disabled allow_all_pages_shortcut: client "
+                    "transport (non-RDMA) does not implement fetch_all; "
+                    "b>=1.0 will route through Score(k=total_pages)")
             # Stride gating — mirror the connector's icms_score_stride so
             # the hook skips Q compute on non-stride layers.
             hook_manager.score_stride = max(

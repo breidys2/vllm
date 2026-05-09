@@ -203,3 +203,54 @@ def quest_score_local_chunked(
     return sorted(set(int(p.item())
                       for p, v in zip(sel_pids.flatten(), valid.flatten())
                       if bool(v)))
+
+
+def quest_score_pages_max(
+    q: torch.Tensor,
+    kmin: torch.Tensor,
+    kmax: torch.Tensor,
+    pids: list[int],
+    *,
+    num_kv_heads: int | None = None,
+) -> dict[int, float]:
+    """Compute ``max_h score[pid, h]`` for each pid in ``pids``,
+    using the same Quest scoring formula as ``quest_score_local`` but
+    restricted to a precomputed pick list. Returns ``{pid: score}``.
+
+    Used by the per-KV-head Quest connector path to attach real
+    score values to a synthesized ``ScoreReply`` (instead of the
+    degenerate all-zero placeholder). Picks themselves are NOT
+    re-derived — this function does NOT change selection semantics.
+    Cost: O(|pids| × H_kv × D), small relative to the upstream
+    full-page scoring kernel (which already touches O(P × H_kv × D)).
+    """
+    if not pids or kmin.shape[0] == 0:
+        return {}
+    if num_kv_heads is None:
+        num_kv_heads = kmin.shape[1]
+
+    # Normalize q (mirrors quest_score_local).
+    if q.ndim == 3:
+        q2 = q.mean(dim=0)
+    elif q.ndim == 2:
+        q2 = q
+    else:
+        raise ValueError(
+            f"q must be 2D [H_q,D] or 3D [T,H_q,D]; got {q.shape}")
+    h_q, head_dim = q2.shape
+    if h_q != num_kv_heads:
+        if h_q < num_kv_heads or h_q % num_kv_heads != 0:
+            raise ValueError(
+                f"q has {h_q} heads, not divisible by num_kv_heads={num_kv_heads}")
+        group = h_q // num_kv_heads
+        q2 = q2.reshape(num_kv_heads, group, head_dim).mean(dim=1)
+    q2 = q2.to(device=kmin.device, dtype=torch.float32).unsqueeze(0)
+
+    pick_idx = torch.as_tensor(pids, dtype=torch.long, device=kmin.device)
+    kmin_pick = kmin.index_select(0, pick_idx).to(dtype=torch.float32)
+    kmax_pick = kmax.index_select(0, pick_idx).to(dtype=torch.float32)
+    # [|pids|, H_kv, D] → sum_d max(q*kmin, q*kmax) → [|pids|, H_kv]
+    scores = torch.maximum(q2 * kmin_pick, q2 * kmax_pick).sum(dim=-1)
+    per_pid_max, _ = scores.max(dim=-1)  # [|pids|]
+    return {int(p): float(s.item())
+            for p, s in zip(pids, per_pid_max.flatten())}
