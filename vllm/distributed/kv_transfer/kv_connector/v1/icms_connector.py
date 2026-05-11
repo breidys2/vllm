@@ -479,6 +479,43 @@ def _tp_allreduce_max_int(value: int, tp_size: int) -> int:
         return int(value)
 
 
+def _tp_allreduce_min_int(value: int, tp_size: int) -> int:
+    """All-reduce-MIN of an int64 across TP ranks.
+
+    Audit #20 fix (2026-05-11): symmetrize per-rank shape-derived
+    bounds before they gate per-rank filtering. Canonical use:
+    `bt_row_max = int(bt.shape[1])` in the apply slow-path — if
+    vLLM ever allocates differently sized block-table rows per rank
+    for the same rid, post-filter `valid_pids` diverges across ranks
+    and the scatter is asymmetric. MIN-reducing the bound ensures
+    every rank drops the same pids.
+
+    TP=1 → return value unchanged. TP>1 → tiny i64 all-reduce on the
+    ICMS TP group. Cost: ~few μs; called once per apply slow-path.
+
+    Failure mode: on collective failure, return the local value (best
+    effort — apply proceeds with the local bound, which may be
+    asymmetric across ranks but is no worse than pre-fix behavior).
+    """
+    if tp_size <= 1:
+        return int(value)
+    import torch.distributed as dist  # noqa: E402
+    from vllm.distributed.parallel_state import get_tp_group
+    try:
+        tp_group = get_tp_group()
+        dev_group = _get_icms_nccl_group() or tp_group.device_group
+        dev = torch.device(f"cuda:{torch.cuda.current_device()}")
+        t = torch.tensor([int(value)], dtype=torch.int64, device=dev)
+        dist.all_reduce(t, op=dist.ReduceOp.MIN, group=dev_group)
+        return int(t.item())
+    except Exception as e:
+        logger.warning(
+            "[icms-tp] _tp_allreduce_min_int failed: %r — "
+            "falling back to local value (post-filter pids may be "
+            "asymmetric across ranks)", e)
+        return int(value)
+
+
 def _tp_broadcast_bool(value: bool, tp_rank: int, tp_size: int) -> bool:
     """Broadcast rank-0's bool to every rank. Used by `_flush_group` to
     propagate WriteGroup success/failure so all ranks bump
@@ -858,6 +895,16 @@ class _RequestState:
     _apply_cached_new_sl: object = None
     _apply_cached_max_seq_len: int = 0
     _apply_cached_filled_count: int = 0
+    # 2026-05-11 audit fix #21: cumulative-set size at the moment
+    # `_apply_cached_new_bt` was baked. The fast path checks this
+    # against `len(rs.fetched_pages[stride_root])` at entry; if the
+    # cumulative set grew between the slow path's bake and the fast
+    # path's reuse (decode/cross-iter async fetch-all adding pages
+    # mid-stride), the cached `new_bt` is stale and the fast path
+    # would attend to wrong / missing pages → silent KV gap
+    # (anomaly C signature on mistral-small h128k niah_single).
+    # -1 sentinel = "never cached" → fast path treats as invalid.
+    _apply_cached_cumulative_count: int = -1
     # Per-request cached `cont_idx` device tensor for the trimmed
     # block-table tail. cont_idx depends on (context_pages, cont_end)
     # which are per-request constants during prefill — cache once at the
@@ -915,6 +962,18 @@ class _RequestState:
     flush_cond: threading.Condition = field(
         default_factory=threading.Condition)
     flush_seq: int = 0
+    # FAPS audit Finding 4 fix (2026-05-11): track the number of
+    # server-side-committed groups (`flushed_local + stored_groups`)
+    # AT the moment FAPS' first FetchAll RPC completed. Used by
+    # `_fetch_all_one_request`'s top-of-function check to detect
+    # chain growth between chunks of a chunked prefill (e.g.,
+    # mistral-small >16K with default `max_num_batched_tokens=16384`).
+    # When new groups commit AFTER FAPS dispatched, the cached
+    # `_pending_reuse` offsets only cover the chunk-0 page set →
+    # subsequent chunks' apply paths see under-coverage → silent KV
+    # mismatch. Invalidating `_fetch_all_complete` on growth forces a
+    # fresh FAPS dispatch covering the new chain.
+    _fetch_all_committed_at_dispatch: int = 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1183,12 +1242,19 @@ class IcmsConnector(KVConnectorBase_V1):
 
         # RDMA transport (replaces Unix socket + POSIX shmem).
         self._use_rdma: bool = bool(extra.get("icms_rdma", False))
-        # FetchAll RPC is only implemented in RdmaIcmsClient (the
-        # unix-socket IcmsClient and ShmemIcmsClient inherit a stub
-        # that raises NotImplementedError). Used by the b>=1.0
-        # ceiling-snap redirect + quest_hooks's allow_all_pages_shortcut
-        # to know when to fall back to Score(k=total_pages) instead.
-        self._supports_fetch_all: bool = self._use_rdma
+        # FetchAll RPC support flag. Wired across all three client types
+        # as of 2026-05-11:
+        #   - RdmaIcmsClient.fetch_all (rdma_client.py:311) — RDMA path
+        #   - IcmsClient.fetch_all (client.py) — unix-socket path
+        #   - ShmemIcmsClient inherits IcmsClient.fetch_all
+        # The C++ server's handle_fetch_all (handlers.cc:2306) is
+        # sink-agnostic — it dispatches to a worker that handles local
+        # shmem, CUDA-IPC, and RDMA sinks at job time. So
+        # `_supports_fetch_all` is now True for every transport the
+        # connector can be configured with. Kept as a named flag (vs.
+        # inlined `True`) so future transports added without fetch_all
+        # support can opt out via a one-line change.
+        self._supports_fetch_all: bool = True
         self._rdma_server_host: str = extra.get("icms_server_host", "sprc01")
         self._rdma_port: int = int(extra.get("icms_rdma_port", 18515))
         self._rdma_ib_dev: str = extra.get("icms_ib_dev", "mlx5_0")
@@ -2133,6 +2199,30 @@ class _Worker:
         #              chain_prefix, _GroupBuffer-not-needed)
         self._pending_flush_q: "list[tuple]" = []
         self._pending_flush_lock: threading.Lock = threading.Lock()
+
+        # 2026-05-11 Option-1 (batched WriteGroup): when
+        # `ICMS_WRITE_BATCH_N=N>1`, the connector buffers up to N
+        # consecutive full-group flushes per rid and sends them as a
+        # SINGLE WriteGroup RPC carrying K=N tail groups. The server's
+        # protocol already supports K>1 (handlers.cc handle_write_group
+        # reads num_tail + K×(summary+kv) blobs; client.py:418-420
+        # documents the K>1 path). Pre-fix: each haystack group was a
+        # separate RPC; at gemma-3 h32k that meant ~3875 RPCs and ~100 s
+        # Phase 1 wall time. Post-fix at N=32 a typical Phase 1 sends
+        # ~120 RPCs — server work + small per-RPC overhead amortizes.
+        # Default N=1 preserves the pre-fix per-group RPC behavior so
+        # in-flight cells aren't affected. Per-rid buffer keyed by rid;
+        # entries are dicts holding all state needed to reconstruct the
+        # post-RPC bookkeeping in `_record_flush_outcome`.
+        self._write_batch_buf: "dict[str, list[dict]]" = {}
+        # 2026-05-11 write-batching-audit Finding 2: guards
+        # `_write_batch_buf` from concurrent mutation. Pipeline thread
+        # appends via `_flush_group` (`setdefault(...).append(...)` +
+        # `len(buf) >= batch_n` check) while forward thread drains via
+        # `_flush_write_batch_now` (`pop(rid, [])`) — without the lock
+        # at ICMS_WRITE_BATCH_N>1 we get torn dict/list state. Acquire
+        # is short (no I/O / no RPC under the lock).
+        self._write_batch_buf_lock = threading.Lock()
 
         # Memoized "all active rs are in dense_mode" — checked O(1) by the
         # per-layer hooks (wait_for_layer, Quest hook's
@@ -3190,6 +3280,50 @@ class _Worker:
         num_layers = self._geom.num_layers if self._geom else 48
         attn_layer_name = f"model.layers.{next_layer_idx}.self_attn.attn"
 
+        # FAPS audit Finding 4 fix (2026-05-11): chunked-prefill
+        # invalidation. When prefill is chunked (e.g., mistral-small
+        # with default `max_num_batched_tokens=16384` at ctx > 16K),
+        # FAPS' FetchAll fires at chunk-0's layer-0 forward and the
+        # reply only covers the groups COMMITTED to the server by
+        # then. Later chunks commit more groups (via `_flush_group`
+        # → `write_group` RPC → `_drain_pending_flush_queue` bumps
+        # `rs.flushed_local`). The cached `_pending_reuse` offsets
+        # from chunk-0 do NOT cover those new pages → next chunk's
+        # `on_layer_reuse` returns the chunk-0-sized page set →
+        # vLLM's attention under-covers the chain → silent KV
+        # mismatch labelled as FAPS-success.
+        #
+        # Detect via the server-side-committed count
+        # (`flushed_local + stored_groups`) vs the count stamped at
+        # last successful FAPS dispatch. If it grew, invalidate
+        # `_fetch_all_complete` and clear the rid's cached
+        # `_pending_reuse` / `_pending_scores` entries so the slow
+        # path re-fires below covering the new chain. Note: we set
+        # the stamp at the BOTTOM of the function under the
+        # cross-rank consensus branch from Finding 1, so the
+        # invalidation is rank-symmetric (every rank sees the same
+        # `flushed_local`/`stored_groups` post the on_step_start
+        # allreduce-MAX, so the comparison is rank-deterministic
+        # → no asymmetric NCCL collective shape).
+        _committed_now = (int(getattr(rs, "flushed_local", 0))
+                           + int(getattr(rs, "stored_groups", 0)))
+        _committed_at_dispatch = int(getattr(
+            rs, "_fetch_all_committed_at_dispatch", 0))
+        if (getattr(rs, "_fetch_all_complete", False)
+                and _committed_now > _committed_at_dispatch):
+            rs._fetch_all_complete = False
+            with self._score_lock:
+                for _inner in self._pending_reuse.values():
+                    _inner.pop(rid, None)
+                for _inner in self._pending_scores.values():
+                    _inner.pop(rid, None)
+            if os.environ.get("ICMS_DIAG_FAPS") == "1":
+                logger.info(
+                    "[diag-faps] chain grew rid=%s committed %d→%d — "
+                    "invalidating cached reuse for re-FetchAll "
+                    "(chunked-prefill audit Finding 4)",
+                    rid[:8], _committed_at_dispatch, _committed_now)
+
         # Fast path: earlier scoring boundary already issued the single
         # full-request FetchAll. Just promote pre-populated reuse entry
         # into pending_scores for this layer.
@@ -3417,6 +3551,16 @@ class _Worker:
                 (t_end - t_start) * 1e6, False, [], next_layer_idx,
             )
             return
+        # Audit Finding 1 fix (2026-05-11): track whether THIS rank's
+        # post-broadcast bookkeeping completed without raising. We
+        # synchronize across ranks AFTER the try/except so all ranks
+        # agree on the resulting `_fetch_all_complete` state. Pre-fix,
+        # an exception on one rank between the broadcast (above) and
+        # the `_fetch_all_complete=True` write could leave ranks in
+        # asymmetric states: the success rank would fast-path next
+        # stride (no broadcast) while the failure rank would re-enter
+        # the slow path (calling broadcast) → deadlock.
+        _fa_local_ok = False
         try:
             rs._last_storage_concurrent = getattr(
                 reply, 'concurrent_requests', 0)
@@ -3491,7 +3635,11 @@ class _Worker:
                     # (multi-rid stride-reuse fix, 2026-05-05).
                     self._pending_reuse.setdefault(reuse_attn, {})[rid] = (
                         reply, reuse_offsets, req_idx)
-            rs._fetch_all_complete = True
+            # Audit Finding 1 fix: defer the `_fetch_all_complete=True`
+            # write until after cross-rank consensus below. Setting it
+            # here (inside the try) was the pre-fix bug — if a peer
+            # rank's try raises after this point, ranks diverge.
+            _fa_local_ok = True
             if os.environ.get("ICMS_DIAG_FAPS") == "1":
                 logger.info(
                     "[diag-faps] slow-path DONE rid=%s layer=%d k=%d "
@@ -3568,6 +3716,50 @@ class _Worker:
                 for _inner in self._pending_scores.values():
                     _inner.pop(rid, None)
             logger.debug("fetch_all failed layer %d: %s", next_layer_idx, e)
+
+        # Audit Finding 1 fix (2026-05-11): cross-rank consensus on
+        # whether THIS stride's fetch_all bookkeeping succeeded
+        # everywhere. MIN-reduce so any rank's failure flips the
+        # consensus to False; only flip `_fetch_all_complete=True`
+        # when EVERY rank succeeded. If we locally succeeded but a
+        # peer failed, roll back our pending_* writes so next
+        # stride all ranks re-enter the slow path symmetrically.
+        if self._tp_size > 1:
+            try:
+                _fa_consensus = bool(
+                    _tp_allreduce_min_int(int(_fa_local_ok), self._tp_size))
+            except Exception as _bcast_e:
+                logger.warning(
+                    "_fetch_all_one_request: consensus broadcast failed "
+                    "(%s) — falling back to local value; cross-rank "
+                    "state may diverge", _bcast_e)
+                _fa_consensus = _fa_local_ok
+        else:
+            _fa_consensus = _fa_local_ok
+        if _fa_consensus:
+            rs._fetch_all_complete = True
+            # FAPS audit Finding 4 fix (2026-05-11): stamp the
+            # server-side-committed group count AT this successful
+            # FAPS dispatch. The top-of-function chain-grew check
+            # compares the current count against this stamp; if it
+            # grew, the cached reuse offsets from THIS dispatch don't
+            # cover the new groups → invalidate + re-fire. See
+            # `_fetch_all_committed_at_dispatch` docstring on
+            # `_RequestState` for the chunked-prefill rationale.
+            rs._fetch_all_committed_at_dispatch = (
+                int(getattr(rs, "flushed_local", 0))
+                + int(getattr(rs, "stored_groups", 0)))
+        elif _fa_local_ok:
+            # Local success but a peer failed — roll back so next
+            # stride re-enters slow path on every rank symmetrically.
+            with self._score_lock:
+                for _inner in self._pending_reuse.values():
+                    _inner.pop(rid, None)
+                for _inner in self._pending_scores.values():
+                    _inner.pop(rid, None)
+            logger.debug(
+                "fetch_all: rolled back rid=%s layer=%d due to peer "
+                "rank failure (consensus=False)", rid, next_layer_idx)
 
     def on_layer_reuse(self, next_layer_idx, budget, stats):
         """Reuse layer: KV already in sink from the stride group's Score call.
@@ -3737,11 +3929,32 @@ class _Worker:
                 if rs is not None and rs.chain:
                     requests_to_score.append((req_idx, rid, rs))
 
-        # Fallback: use _requests dict order (batch=1 case).
+        # Fallback: when connector_meta.requests is empty (rare; e.g.,
+        # transient scheduler-output edge during connector startup or
+        # an exception path that bypasses build_connector_meta).
+        # Audit Finding 16 fix (2026-05-11): mirror the audit-#19
+        # fix at `extract_and_record` — prefer `_last_step_requests`
+        # (broadcast scheduler metadata, identical order across ranks)
+        # over `self._requests.items()` (Python dict insertion order,
+        # which can drift if a retry path on one rank inserts an extra
+        # rs that the other rank doesn't have). At TP>1, dict-iter
+        # divergence would cause different ranks to build different
+        # `requests_to_score` lists → asymmetric Score-RPC count →
+        # NCCL collective shape mismatch → hang. Falls back to the
+        # legacy dict-iter only when `_last_step_requests` is also
+        # empty (the genuinely-empty-step case).
         if not requests_to_score:
-            for req_idx, (rid, rs) in enumerate(self._requests.items()):
-                if rs.chain:
-                    requests_to_score.append((req_idx, rid, rs))
+            _last_step = getattr(self, "_last_step_requests", None)
+            if _last_step:
+                for req_idx, step_req in enumerate(_last_step):
+                    rid = step_req.request_id
+                    rs = self._requests.get(rid)
+                    if rs is not None and rs.chain:
+                        requests_to_score.append((req_idx, rid, rs))
+            else:
+                for req_idx, (rid, rs) in enumerate(self._requests.items()):
+                    if rs.chain:
+                        requests_to_score.append((req_idx, rid, rs))
 
         _diag_se_n = getattr(self, "_diag_score_entry_count", 0)
         if (os.environ.get("ICMS_DIAG_SCORE_ENTRY", "0") == "1"
@@ -3904,9 +4117,36 @@ class _Worker:
                             per_request_q[step_req.request_id] = (
                                 quest_query[offset:offset + n_tokens])
                         offset += n_tokens
-                # else: no slicing strategy fits; leave per_request_q
-                # empty so .get(rid, quest_query) returns full Q for
-                # every rid (matches the legacy single-rid path).
+                # else: no slicing strategy fits. Audit #24 fix
+                # (2026-05-11): rather than silently leaving
+                # per_request_q empty (so `.get(rid, quest_query)`
+                # falls back to full multi-rid Q for every rid —
+                # the bug class that caused the 2026-05-07 batched
+                # scoring collapse before the qsl path landed),
+                # raise loudly. This is the BATCHED branch
+                # (len(requests_to_score) > 1); the single-rid
+                # path doesn't enter this block. Set
+                # ICMS_ALLOW_QSLICE_FALLBACK=1 to opt back into
+                # the legacy silent fallback if a future batched
+                # workload trips this and you want to ship-it-and-
+                # investigate-later (the diag-log warning above
+                # still fires).
+            if (not per_request_q
+                    and quest_query is not None
+                    and len(requests_to_score) > 1
+                    and os.environ.get(
+                        "ICMS_ALLOW_QSLICE_FALLBACK", "0") != "1"):
+                raise RuntimeError(
+                    f"[icms-qslice] no Q-slicing strategy fit in "
+                    f"batched mode: _q_n={_q_n} _meta_n_reqs={_meta_n_reqs}"
+                    f" _meta_total_tokens={_meta_total_tokens} "
+                    f"requests_to_score={len(requests_to_score)} "
+                    f"layer={next_layer_idx}. Silent fallback to "
+                    f"full multi-rid Q would mis-score every rid "
+                    f"(audit #24). Set "
+                    f"ICMS_ALLOW_QSLICE_FALLBACK=1 to permit the "
+                    f"legacy silent fallback."
+                )
             # ICMS_DIAG_QSLICE=1: probe agent suspect #1 — per-rid Q
             # slicing silently falls back to full-batch Q if the slice
             # is dropped, causing rid X to score against ALL rids'
@@ -4384,7 +4624,29 @@ class _Worker:
             # tensor (~2 KB), so the H2D vanishes.
             q = quest_query.detach()
             if q.ndim == 3:
-                q = q.squeeze(0) if q.shape[0] == 1 else q.mean(dim=0)
+                # 2026-05-11 audit P1 (initial hypothesis) + REVISION:
+                # the original P1 fix assumed `quest_query` contained
+                # haystack + question tokens, with q.mean diluting the
+                # question's discriminative signal. Code-trace revision
+                # showed otherwise for models with prefix_caching=True
+                # (qwen3, mistral-small sparse path): Phase-1 prefills
+                # the haystack, Phase-2 hits prefix cache on haystack
+                # tokens so the scored-layer Quest hook fires only on
+                # the QUESTION's new tokens. q.shape[0] = question
+                # length (~50 tokens), not full prompt. So q.mean is
+                # already the question-only mean.
+                # For gemma-3 (prefix_caching=False due to multimodal
+                # arch), q.shape[0] = full prompt. Question slicing OR
+                # enabling prefix caching would be the right fix there.
+                # Default 'mean' restored. `ICMS_Q_AGG=last` available
+                # as a knob for diagnostic A/B testing on gemma-3.
+                _q_agg = os.environ.get("ICMS_Q_AGG", "mean").lower()
+                if q.shape[0] == 1:
+                    q = q.squeeze(0)
+                elif _q_agg == "last":
+                    q = q[-1]
+                else:  # default 'mean'
+                    q = q.mean(dim=0)
             # q is now [num_heads, head_dim]. Mean-pool for GQA against the
             # rank-local KV-head count: at TP=1 that's geom.num_kv_heads;
             # at TP>1 each rank holds only num_kv_heads/tp_size kv-heads
@@ -4779,8 +5041,30 @@ class _Worker:
         # set, which means we hit the outer except (real exception, not
         # ENOENT-soft-fail). Catches missing methods, broadcast bugs,
         # silent transport failures.
+        #
+        # 2026-05-11 audit #23: broadcast the soft-fail flag so every
+        # rank reaches the same decision. Pre-fix: `_last_err` was
+        # only assigned inside the rank-0 RPC branch (line ~4591 else),
+        # so non-rank-0 ranks always saw `_soft_failed=False`. Under
+        # `ICMS_STRICT_ASSERTIONS=1` with a soft-fail ENOENT on rank-0,
+        # rank-0 would swallow (soft_failed=True) but rank-1 would
+        # raise (soft_failed=False) → asymmetric crash → engine hang.
+        # Post-fix: rank-0's soft-fail bit is broadcast over the same
+        # NCCL group as the reply, every rank takes the same branch.
         _strict = os.environ.get("ICMS_STRICT_ASSERTIONS", "0") == "1"
-        _soft_failed = (locals().get("_last_err") is not None)
+        _soft_failed_local = (locals().get("_last_err") is not None)
+        if self._tp_size > 1:
+            try:
+                _soft_failed = _tp_broadcast_bool(
+                    _soft_failed_local, self._tp_rank, self._tp_size)
+            except Exception as _bcast_e:
+                logger.warning(
+                    "Score: soft-fail broadcast failed (%s) — falling back "
+                    "to local value; strict-mode may raise asymmetrically",
+                    _bcast_e)
+                _soft_failed = _soft_failed_local
+        else:
+            _soft_failed = _soft_failed_local
         if (_strict and total_pages > 0 and reply is None
                 and not _soft_failed):
             raise RuntimeError(
@@ -5934,8 +6218,16 @@ class _Worker:
             if trim_row.dim() == 2:
                 trim_row = trim_row[0]
             k_plus_c = int(trim_row.shape[0])
-            if (req_idx < combined_bt.shape[0]
-                    and k_plus_c <= combined_bt.shape[1]):
+            # Audit #7 fix (2026-05-11): the seq_lens write must move
+            # together with the block_table write. Pre-fix, a skipped bt
+            # row still got `combined_sl[req_idx] = trim_sl_val` →
+            # FA's tile scheduler read up to the (smaller) trim_sl_val
+            # against the (untrimmed) natural block_table for that row.
+            # Latent at paper config (_use_batch_path is False at
+            # max_num_seqs=1); kept correct for batched / TP>1 callers.
+            _bt_in_range = (req_idx < combined_bt.shape[0]
+                            and k_plus_c <= combined_bt.shape[1])
+            if _bt_in_range:
                 combined_bt[req_idx, :k_plus_c] = trim_row
             else:
                 skipped.append((req_idx, k_plus_c))
@@ -5944,7 +6236,7 @@ class _Worker:
                 trim_sl_val = trim_sl[0]
             else:
                 trim_sl_val = trim_sl
-            if req_idx < combined_sl.shape[0]:
+            if _bt_in_range and req_idx < combined_sl.shape[0]:
                 combined_sl[req_idx] = trim_sl_val
         # 2026-05-07: tried `int(combined_sl.max().item())` here based on
         # an audit hypothesis that natural max_seq_len caused FA to
@@ -6162,7 +6454,20 @@ class _Worker:
                 and rs._apply_cached_phys_blocks_dev is not None
                 and rs._apply_cached_new_bt is not None):
             delta = layer_idx_for_cache - cached_start
-            if 0 < delta < self._score_stride:
+            # 2026-05-11 audit fix #21: invalidate the cached new_bt
+            # if the cumulative-page set grew between the slow path's
+            # bake (at the stride-root layer) and now. Without this,
+            # cross-iter async FetchAll replies adding pages mid-stride
+            # leave the cached block_table missing pages that ARE in
+            # main_key → attention reads silent KV gap → garbled
+            # tokens (anomaly C signature: mistral-small h128k
+            # niah_single_{1,2,3} fails identically across budgets).
+            _stride_root_chk = (
+                (cached_start // self._score_stride) * self._score_stride)
+            _live_cum = len(rs.fetched_pages.get(_stride_root_chk, set()))
+            _cached_cum = rs._apply_cached_cumulative_count
+            _fast_path_valid = (_live_cum == _cached_cum)
+            if 0 < delta < self._score_stride and _fast_path_valid:
                 cached_k_pages = rs._apply_cached_actual_k
                 page_idx_dev = (rs._apply_cached_page_idx_dev
                                 + (delta * cached_k_pages))
@@ -6482,6 +6787,16 @@ class _Worker:
         valid_pids: list[int] = []
         valid_sink_offs: list[int] = []
         bt_row_max = int(bt.shape[1])
+        # Audit #20 fix (2026-05-11): MIN-reduce bt_row_max across TP
+        # ranks so every rank uses the same bound when filtering pids.
+        # If vLLM ever allocates differently sized bt rows per rank for
+        # the same rid, post-filter valid_pids would otherwise diverge
+        # → asymmetric scatter / NCCL shape mismatch downstream. At
+        # paper config (max_num_seqs=1, single rid) shapes are
+        # symmetric in practice so this is a no-op; the call enforces
+        # the contract explicitly for TP>1 future-proofing.
+        # TP=1 → identity (helper short-circuits at tp_size<=1).
+        bt_row_max = _tp_allreduce_min_int(bt_row_max, self._tp_size)
         for pid in selected:
             off = pid_to_sink_off.get(pid)
             if off is None or pid >= bt_row_max:
@@ -7262,26 +7577,36 @@ class _Worker:
             # subsequent layers within the stride. Stays current-only.
             rs._apply_cached_phys_blocks_dev = phys_blocks_dev
             rs._apply_cached_page_idx_dev = page_idx_dev
-            rs._apply_cached_actual_k = len(reply.page_ids)
-            # ICMS_DIAG_KSCALE=1: probe for Agent suspect #2 — fast-path
-            # reuse layers stride sink reads by `delta * cached_actual_k`,
-            # but cached_actual_k is set from RAW reply.page_ids count
-            # (line above). If the raw count differs from the post-filter
-            # valid_pids count (e.g. some pids were truncated above
-            # context_pages, or the reply exceeded self._k), the sink
-            # stride diverges from server's pack stride → reuse layers
-            # read wrong sink offsets.
-            if os.environ.get("ICMS_DIAG_KSCALE") == "1":
-                _raw = len(reply.page_ids)
-                _filt = len(valid_pids)
-                if _raw != _filt:
-                    logger.warning(
-                        "[diag-kscale-stride] rid=%s layer=%d "
-                        "raw_reply_n=%d valid_pids_n=%d delta=%d — "
-                        "fast-path reuse layers will use raw count for "
-                        "sink stride → mismatch with server pack stride",
-                        rid, layer_idx_for_cache, _raw, _filt,
-                        _raw - _filt)
+            # Audit fix #9 (2026-05-11): cache the FILTERED count
+            # (post-`valid_pids` filter), not the raw reply count. The
+            # slow path at L0 scattered into sink at the filtered stride
+            # (valid_pids drops dup + OOB pids). The fast path on
+            # L1..L5 of the stride reads from sink at offset
+            # `delta * cached_actual_k * kv_page_bytes`. If we cached
+            # the RAW count here, the fast-path stride disagreed with
+            # the slow-path stride whenever any pid was filtered out
+            # → reuse layers read garbage KV bytes from the wrong sink
+            # slot. Symptom: model fabricates plausible-format outputs
+            # (e.g., 7-digit numbers for NIAH-multikey) at higher
+            # budgets where filtering is more likely. See audit doc
+            # detailed entry #9 + the diagnostic
+            # `[diag-kscale-stride]` warning below.
+            rs._apply_cached_actual_k = len(valid_pids)
+            # Diagnostic only (was the audit-#9 probe): log when the
+            # raw vs filtered count diverges so we can confirm any
+            # future regression that re-introduces the mismatch.
+            # Always logs (no env gate) since the situation is rare
+            # but worth a one-line warning if it ever fires.
+            _raw_n = len(reply.page_ids)
+            if _raw_n != len(valid_pids):
+                logger.warning(
+                    "[icms-cache-actualk] rid=%s layer=%d filtered "
+                    "raw=%d → valid=%d (diff=%d). Fast-path stride "
+                    "now uses filtered count (audit #9 fix). If you "
+                    "see this firing every Score, investigate why "
+                    "the server is returning duplicates / OOB pids.",
+                    rid, layer_idx_for_cache, _raw_n, len(valid_pids),
+                    _raw_n - len(valid_pids))
             # Diag-only: cache the valid_pids list so the fast path's
             # multi-layer canary can map probe_pid → canary_idx without
             # rebuilding it. Has no effect on hot path correctness.
@@ -7289,6 +7614,17 @@ class _Worker:
             # new_bt is built from cumulative pids (M3+M4-A) and is
             # reused by the fast path for attention's block_table.
             rs._apply_cached_new_bt = new_bt
+            # 2026-05-11 audit fix #21: pin the cumulative-set size used
+            # to build new_bt so the fast path can detect mid-stride
+            # growth and invalidate. The fast path entry check at
+            # ~line 6165 compares this against the live
+            # `rs.fetched_pages[stride_root]` count; mismatch → fall
+            # through to slow path which rebuilds new_bt.
+            _stride_root_cache = (
+                (layer_idx_for_cache // self._score_stride)
+                * self._score_stride)
+            rs._apply_cached_cumulative_count = len(
+                rs.fetched_pages.get(_stride_root_cache, set()))
             rs._apply_cached_new_sl = new_sl
             rs._apply_cached_max_seq_len = new_seq_len
             rs._apply_cached_filled_count = filled_blocks_count
@@ -8584,6 +8920,197 @@ class _Worker:
         # work don't stall per-layer save_kv_layer calls during the
         # prefill forward pass.
 
+    def _flush_write_batch_now(self, request_id: str):
+        """2026-05-11 Option-1: drain the per-rid write batch buffer
+        with ONE WriteGroup RPC carrying K = len(buffer) tail groups.
+
+        Records the post-RPC outcome for each buffered group with the
+        SAME `ok_local` (server commits the K groups atomically; one
+        RPC error → all K marked failed; one RPC ok → all K marked
+        committed). Forwards into `_pending_flush_q` so the existing
+        `_drain_pending_flush_queue` machinery bumps `flushed_local`
+        and `num_groups_written` once per group, just as it would have
+        for K individual single-group RPCs."""
+        # Defense-in-depth rank gate (2026-05-11): the callers in
+        # `_flush_group` (line ~9077, 9130) and `on_request_finished`
+        # (line ~9301) ALREADY gate on rank-0, so this should never
+        # fire. Kept inline so the `test_tp_rank_gating` AST inspector
+        # can see the gate without traversing the call graph, and to
+        # protect future callers from accidentally bypassing it.
+        if self._tp_size > 1 and self._tp_rank != 0:
+            return
+        # 2026-05-11 write-batching-audit Finding 2: pop under the
+        # batch-buf lock so a concurrent pipeline-thread append doesn't
+        # race the forward-thread drain.
+        with self._write_batch_buf_lock:
+            buf = self._write_batch_buf.pop(request_id, [])
+        if not buf:
+            return
+        buf.sort(key=lambda b: b['group_idx'])
+        # Sanity: every buffered group must have a strictly-consecutive
+        # group_idx (the wire protocol's "extend" semantic appends K
+        # tails under a single parent — gaps would corrupt the chain).
+        # If not consecutive, fall back to N single-group RPCs.
+        first_gidx = buf[0]['group_idx']
+        for i, b in enumerate(buf):
+            if b['group_idx'] != first_gidx + i:
+                logger.warning(
+                    "[icms-batch] non-consecutive group_idxs in batch "
+                    "for rid=%s: %s. Falling back to single-RPC per "
+                    "group.", request_id,
+                    [b2['group_idx'] for b2 in buf])
+                self._fallback_single_rpcs(request_id, buf)
+                return
+        K = len(buf)
+        # 2026-05-11 wire-size guard: the wire frame header is
+        # `<IB` (uint32 length + byte type — protocol.py:63), so a
+        # single RPC's payload must fit in uint32 (< 4 GiB). For
+        # gemma-3-27b at 16 KV heads × 128 head_dim × 62 layers,
+        # one group's KV ≈ 500 MB; K=16 → 8 GB → frame-length
+        # overflow → struct.pack("<I", length) fails with
+        # `'I' format requires 0 <= number <= 4294967295`. If the
+        # accumulated payload would exceed the safe cap, split the
+        # buffer in half and recurse — each half sends its own
+        # WriteGroup RPC. Choice of 3 GiB cap (vs 4 GiB max) leaves
+        # headroom for the chain-hash + header bytes and avoids
+        # bumping right against the limit.
+        _MAX_FRAME_PAYLOAD = int(os.environ.get(
+            "ICMS_WRITE_BATCH_MAX_PAYLOAD_BYTES",
+            str(3 * 1024 * 1024 * 1024)))
+        # Halve K repeatedly until the payload fits in one frame. Each
+        # iteration drops half of the buffer back into the pending
+        # queue (preserving group_idx order) and re-checks the
+        # remaining first chunk. For gemma-3-27b at K=16/8GB, this
+        # converges at K=4 (~2GB). Bounded by log2(K) iterations.
+        while True:
+            _total_payload = sum(
+                len(b['summary_blob']) + len(b['kv_blob']) for b in buf)
+            if K <= 1 or _total_payload <= _MAX_FRAME_PAYLOAD:
+                break
+            mid = K // 2
+            logger.info(
+                "[icms-batch] payload %.2f GiB > cap %.2f GiB for "
+                "rid=%s K=%d first_gidx=%d — splitting (sending "
+                "K=%d first, deferring K=%d)",
+                _total_payload / (1024 ** 3),
+                _MAX_FRAME_PAYLOAD / (1024 ** 3),
+                request_id, K, first_gidx, mid, K - mid)
+            first_half = buf[:mid]
+            second_half = buf[mid:]
+            with self._write_batch_buf_lock:
+                # Prepend second_half so subsequent _flush_group call
+                # ordering is preserved (lower group_idxs at front).
+                # Any new entries appended concurrently for this rid
+                # have higher group_idxs than `second_half`, so
+                # prepending keeps the sorted invariant.
+                existing = self._write_batch_buf.setdefault(
+                    request_id, [])
+                self._write_batch_buf[request_id] = second_half + existing
+            buf = first_half
+            K = len(buf)
+        # Build parent + tail chains from the LAST buffered group's
+        # `chain_prefix` (= rs.chain[:last_gidx+1] at flush time).
+        last_chain_prefix = buf[-1]['chain_prefix']
+        rank_chain = self._rank_chain(last_chain_prefix)
+        if first_gidx == 0:
+            parent_chain: list[int] = []
+            new_tail_groups = list(rank_chain[:K])
+        else:
+            parent_chain = list(rank_chain[:first_gidx])
+            new_tail_groups = list(rank_chain[first_gidx:first_gidx + K])
+        # Concatenated blobs — server handles K-tail layout per
+        # handlers.cc:1099-1115 (summary_blob_base then kv_blob_base
+        # at offsets keyed by K, num_scored, num_layers).
+        summary_blob = b''.join(b['summary_blob'] for b in buf)
+        kv_blob = b''.join(b['kv_blob'] for b in buf)
+        # pages_in_group on the wire applies to the LAST tail per
+        # client.py:418-425 ("earlier tails must be 32-page-full ...
+        # split the bulk write across calls if the LAST tail isn't").
+        # Since we only buffer partial=False, all are 32-page-full —
+        # send the same pages count for last (a no-op equivalence).
+        pages_in_group = buf[-1]['pages']
+        t_send = time.perf_counter()
+        try:
+            with self._rpc_lock:
+                self._client.write_group(
+                    parent_chain, new_tail_groups,
+                    summary_blob, kv_blob,
+                    pages_in_group=pages_in_group,
+                )
+        except Exception as e:
+            logger.warning(
+                "[icms-batch] Batched WriteGroup failed for rid=%s "
+                "K=%d first_gidx=%d: %s — falling through to per-"
+                "group single-RPC retry for accurate per-tail ok_local.",
+                request_id, K, first_gidx, e)
+            # 2026-05-11 write-batching-audit Finding 3: on batched-
+            # RPC failure, retry per-tail via `_fallback_single_rpcs`
+            # so each group gets its own ok_local. Server's WriteGroup
+            # is idempotent on already-committed tails (handlers.cc
+            # ~L1146-1173: `trie::extend → insert(parent+tails)`
+            # fall-through finds existing match and no-ops), so
+            # retries don't double-write KV bytes. Pre-fix, the
+            # whole batch was marked failed → subsequent same-prefix
+            # requests didn't elide ANY of the K groups even if the
+            # server had committed k<K before erroring → latency hit
+            # proportional to the wasted re-prefill.
+            self._fallback_single_rpcs(request_id, buf)
+            return
+        send_elapsed_us = (time.perf_counter() - t_send) * 1e6
+        # Amortize the batched RPC time across the K groups so the
+        # histogram remains comparable to the N=1 baseline.
+        per_group_lat_us = send_elapsed_us / max(1, K)
+        for b in buf:
+            self.stats.record_flush(per_group_lat_us)
+            with self._pending_flush_lock:
+                self._pending_flush_q.append((
+                    request_id, int(b['group_idx']), True,
+                    bool(b['partial']), int(b['pages']),
+                    tuple(b['chain_prefix']),
+                ))
+
+    def _fallback_single_rpcs(self, request_id: str,
+                               buf: "list[dict]"):
+        """Fallback when batch buffer can't be sent atomically
+        (non-consecutive group_idxs). Sends N single-group RPCs and
+        records the same per-group outcome as the pre-batching path.
+        Should be rare — buffer is built by consecutive `_flush_group`
+        calls during haystack prefill so non-consecutive only happens
+        on weird interleaving (which would be a separate bug)."""
+        # Defense-in-depth rank gate (mirrors _flush_write_batch_now).
+        if self._tp_size > 1 and self._tp_rank != 0:
+            return
+        for b in buf:
+            rank_chain = self._rank_chain(b['chain_prefix'])
+            gidx = b['group_idx']
+            if gidx == 0:
+                parent_chain: list[int] = []
+                new_tail_groups = list(rank_chain)
+            else:
+                parent_chain = list(rank_chain[:-1])
+                new_tail_groups = [rank_chain[-1]]
+            ok_local = True
+            try:
+                with self._rpc_lock:
+                    self._client.write_group(
+                        parent_chain, new_tail_groups,
+                        b['summary_blob'], b['kv_blob'],
+                        pages_in_group=b['pages'],
+                    )
+            except Exception as e:
+                ok_local = False
+                logger.warning(
+                    "[icms-batch] fallback WriteGroup failed for "
+                    "rid=%s gidx=%d: %s", request_id, gidx, e)
+            self.stats.record_flush(
+                (time.perf_counter() - b['t0']) * 1e6)
+            with self._pending_flush_lock:
+                self._pending_flush_q.append((
+                    request_id, int(gidx), bool(ok_local),
+                    bool(b['partial']), int(b['pages']),
+                    tuple(b['chain_prefix']),
+                ))
+
     def _flush_group(self, request_id: str, group_idx: int, partial: bool = False):
         """Issue WriteGroup for a completed (or partial) group buffer."""
         # Diag (2026-05-02): ICMS_SKIP_WRITES=1 short-circuits the
@@ -8690,6 +9217,19 @@ class _Worker:
                         len(chain_prefix), partial, pages,
                         len(buf.summary_blob), len(buf.kv_blob))
             else:
+                # 2026-05-11 Option-1: if this is a partial flush AND we
+                # have buffered full groups for this rid, drain them
+                # FIRST so the chain is built parent→tails in order.
+                # The partial group below appends on top of the
+                # committed batched groups.
+                # Finding 2: dict read under `_write_batch_buf_lock`
+                # for snapshot consistency. `_flush_write_batch_now`
+                # itself re-acquires the lock for the pop.
+                with self._write_batch_buf_lock:
+                    _has_buffered = bool(self._write_batch_buf.get(
+                        request_id))
+                if partial and _has_buffered:
+                    self._flush_write_batch_now(request_id)
                 # v6 wire. WG#1 of a rid (group_idx==0) is a fresh
                 # registration: parent=[], tail=full_rank_chain. Server
                 # routes to insert() which handles cross-rid prefix
@@ -8719,6 +9259,47 @@ class _Worker:
                         len(parent_chain), len(new_tail_groups),
                         pages, len(buf.summary_blob),
                         len(buf.kv_blob), partial)
+                # 2026-05-11 Option-1: batched WriteGroup. Buffer full
+                # consecutive groups (partial=False) and send K-at-a-time.
+                # Default N=1 → no batching. N>1 → defer RPC + post-RPC
+                # bookkeeping to `_flush_write_batch_now`, which handles
+                # all N groups atomically (one RPC + one bookkeeping pass
+                # per group). Partial flushes always go through the
+                # single-RPC path; if there's a pending batch when a
+                # partial flush hits, the partial path drains the batch
+                # FIRST (see end of this function).
+                batch_n = int(os.environ.get("ICMS_WRITE_BATCH_N", "1"))
+                if batch_n > 1 and not partial:
+                    # Finding 2: setdefault+append + length-check must
+                    # be ONE atomic critical section, else two threads
+                    # could each observe `len < batch_n` and both
+                    # decide NOT to drain even when their combined
+                    # count crosses the threshold. Compute the
+                    # post-append count under the lock; perform the
+                    # drain decision OUTSIDE the lock so
+                    # `_flush_write_batch_now`'s own lock acquire
+                    # (for the pop) doesn't dead-nest.
+                    with self._write_batch_buf_lock:
+                        self._write_batch_buf.setdefault(
+                            request_id, []).append({
+                            'group_idx': int(group_idx),
+                            'summary_blob': bytes(buf.summary_blob),
+                            'kv_blob': bytes(buf.kv_blob),
+                            'pages': int(pages),
+                            'chain_prefix': list(chain_prefix),
+                            'partial': bool(partial),
+                            't0': float(t0),
+                        })
+                        _post_append_n = len(
+                            self._write_batch_buf[request_id])
+                    if _post_append_n >= batch_n:
+                        # Drain now — sends one batched RPC + records
+                        # outcome for every buffered group.
+                        self._flush_write_batch_now(request_id)
+                    # In either case, the bookkeeping for this group is
+                    # handled by `_flush_write_batch_now` (now or later).
+                    # Skip the per-group post-RPC tail below.
+                    return
                 with self._rpc_lock:  # X1 (race-audit): serialize tx_/rx_
                     self._client.write_group(
                         parent_chain, new_tail_groups,
@@ -8865,9 +9446,32 @@ class _Worker:
         # silently orphaned in the trie's flushed_local tally.
         for gidx in list(rs.active_group_buffers.keys()):
             buf = rs.active_group_buffers[gidx]
-            is_partial = (getattr(buf, "pages_filled", 0)
-                          < _GROUP_BLOCKS)
+            # 2026-05-11 bug-fix-of-the-fix (write-batching audit
+            # Finding 1): the original audit-#12 fix wrote
+            # `getattr(buf, "pages_filled", 0) < _GROUP_BLOCKS`,
+            # but `_GroupBuffer` defines `filled` (a set of
+            # (layer, page) tuples) — NOT `pages_filled`. The
+            # `getattr` default returned 0, so `is_partial` was
+            # always True and the audit-#12 fix silently reverted
+            # to its pre-fix behavior (every buffer flagged partial
+            # → drain skips bump → stored-prefix undercounts).
+            # `buf.is_complete()` is the canonical "all layers ×
+            # all pages filled" check (line 701); negate to get
+            # "this buffer hasn't reached its full target."
+            is_partial = not buf.is_complete()
             self._flush_group(request_id, gidx, partial=is_partial)
+        # 2026-05-11 Option-1: drain any pending batched writes for
+        # this rid BEFORE we read `flushed_local` / pop the rs. The
+        # for-loop above may have buffered full groups (partial=False
+        # cases) that haven't reached the N threshold and would
+        # otherwise be silently dropped on rs cleanup.
+        # Finding 2: snapshot the dict membership under the lock so
+        # the conditional drain doesn't race a concurrent pipeline
+        # append.
+        with self._write_batch_buf_lock:
+            _has_buffered = bool(self._write_batch_buf.get(request_id))
+        if _has_buffered:
+            self._flush_write_batch_now(request_id)
         # 2026-05-10 audit #12: drain the pending flush queue
         # synchronously so the bumps from the partial=False flushes
         # above (full-buffer-via-this-path) reach `rs.flushed_local`

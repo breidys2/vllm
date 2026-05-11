@@ -692,8 +692,20 @@ class FlashAttentionImpl(AttentionImpl):
         # FA reads block_table[req_idx] and stops at seq_lens[req_idx], so
         # both shapes work without backend changes — non-ICMS rids keep
         # their natural rows in the multi-rid combined tensor.
+        # 2026-05-11 SW-layer correctness fix: when ICMS_SW_LAYER_FIX=1,
+        # sliding-window layers SKIP the ICMS override so they attend
+        # over the natural haystack range (via prefix-cache) rather than
+        # Quest's top-k intersection. See triton_attn.py mirror block
+        # for full rationale. Default off; opt-in.
+        import os as _icms_os
+        _sw_fix = _icms_os.environ.get("ICMS_SW_LAYER_FIX") == "1"
         from vllm.v1.attention import icms_fetch_state as _icms_mod
         _icms_state = _icms_mod.get_active()
+        if (_icms_state is not None and _sw_fix
+                and isinstance(self.sliding_window, tuple)
+                and self.sliding_window[0] >= 0):
+            # SW layer + fix-enabled → fall through to natural-bt path.
+            _icms_state = None
         _use_cascade = attn_metadata.use_cascade and _icms_state is None
 
         if not _use_cascade:

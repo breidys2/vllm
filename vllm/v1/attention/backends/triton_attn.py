@@ -495,8 +495,39 @@ class TritonAttentionImpl(AttentionImpl):
         # routes to TRITON_ATTN) silently runs dense — Score+WriteGroup look
         # healthy but attention reads natural full KV. A/B-confirmed
         # 2026-05-09; see docs/gemma3_symptom2_root_cause_2026-05-09.md.
+        #
+        # 2026-05-11 SW-layer correctness fix: when ICMS_SW_LAYER_FIX=1,
+        # sliding-window layers SKIP the ICMS override and use the natural
+        # block_table. Pre-fix: SW layers saw the SAME trimmed block_table
+        # as global layers, so their effective KV was top-k ∩ SW-window
+        # (potentially missing window pages not in Quest's selection,
+        # which is a latent silent correctness bug — accuracy degrades on
+        # tasks that lean on local coherence, but RULER masks it because
+        # RULER is global-attention-dominated). Post-fix: SW layers use
+        # vLLM's natural block_table (full haystack range via
+        # enable_prefix_caching=True), then apply their per-layer
+        # sliding_window mask on top — matching dense behavior.
+        #
+        # Default off (ICMS_SW_LAYER_FIX unset) to preserve pre-fix
+        # behavior for in-flight runs; opt-in via env flag for validation.
+        import os as _icms_os
+        _sw_fix = _icms_os.environ.get("ICMS_SW_LAYER_FIX") == "1"
         from vllm.v1.attention import icms_fetch_state as _icms_mod
         _icms_state = _icms_mod.get_active()
+        if _icms_state is not None and _sw_fix and self.sliding_window is not None:
+            # SW layer + fix-enabled: skip the ICMS override, use natural
+            # block_table. Note `self.sliding_window` here is a tuple
+            # `(left, right)` set by the Attention wrapper when
+            # per_layer_sliding_window > 0; for global layers it's
+            # `(-1, -1)` (no window). Per
+            # forks/vllm/vllm/attention/layer.py the assignment is
+            # `(sliding_window-1, 0)` for SW layers — so the check
+            # `is not None` would always be true. Use the leading element
+            # to distinguish: SW if window[0] >= 0, global if window[0] < 0.
+            _is_sw = (isinstance(self.sliding_window, tuple)
+                       and self.sliding_window[0] >= 0)
+            if _is_sw:
+                _icms_state = None  # fall through to natural-bt path below
         if _icms_state is not None:
             key_cache = _icms_state.key_cache
             value_cache = _icms_state.value_cache

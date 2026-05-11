@@ -402,21 +402,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Score path. Static ConstantBudget keeps the shortcut so
             # budget=1.0 still routes through the kFetchAll fast path.
             # 2026-05-08: also disable for non-RDMA transports — only
-            # RdmaIcmsClient implements fetch_all. Pre-fix, the unix-
-            # socket / shmem clients raised AttributeError silently
-            # caught at debug-level → empty _pending_scores → corrupted
-            # KV (qwen3 niah_multikey_2 b=1.0 = 0.067). See connector's
-            # _supports_fetch_all flag.
+            # All transports (unix-socket, shmem, RDMA) now implement
+            # fetch_all as of 2026-05-11 — the C++ server's handle_
+            # fetch_all is sink-agnostic; the Python unix-socket client
+            # was wired (client.py:fetch_all). So allow_all_pages_shortcut
+            # is gated only on adaptive-bandwidth mode now (where the
+            # b≥1.0 ceiling-snap interacts with the demand registry in
+            # ways that warrant the slow-path).
             _adaptive = extra.get("adaptive_bandwidth", False)
-            _has_fetch_all = bool(extra.get("icms_rdma", False))
-            hook_manager.allow_all_pages_shortcut = (
-                (not _adaptive) and _has_fetch_all
-            )
-            if not _has_fetch_all:
+            hook_manager.allow_all_pages_shortcut = not _adaptive
+            if _adaptive:
                 logger.info(
-                    "[icms] disabled allow_all_pages_shortcut: client "
-                    "transport (non-RDMA) does not implement fetch_all; "
-                    "b>=1.0 will route through Score(k=total_pages)")
+                    "[icms] disabled allow_all_pages_shortcut: "
+                    "adaptive_bandwidth=True conflicts with the "
+                    "b>=1.0 shortcut; b>=1.0 will route through Score")
             # Stride gating — mirror the connector's icms_score_stride so
             # the hook skips Q compute on non-stride layers.
             hook_manager.score_stride = max(
