@@ -487,6 +487,49 @@ class TritonAttentionImpl(AttentionImpl):
         descale_shape = (cu_seqlens_q.shape[0] - 1, key_cache.shape[2])
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
+        # ICMS Path B: check for fetch state override (selective attention).
+        # Mirror of the flash_attn.py:683-715 block. The connector sets
+        # icms_fetch_state before each layer's attention with a trimmed
+        # block_table containing only selected context pages + continuation
+        # blocks. Without this override, gemma-3 (and any other model that
+        # routes to TRITON_ATTN) silently runs dense — Score+WriteGroup look
+        # healthy but attention reads natural full KV. A/B-confirmed
+        # 2026-05-09; see docs/gemma3_symptom2_root_cause_2026-05-09.md.
+        from vllm.v1.attention import icms_fetch_state as _icms_mod
+        _icms_state = _icms_mod.get_active()
+        if _icms_state is not None:
+            key_cache = _icms_state.key_cache
+            value_cache = _icms_state.value_cache
+            block_table = _icms_state.block_table
+            seqused_k = _icms_state.seq_lens
+            max_seqlen_k = _icms_state.max_seq_len
+            # Force the 2D kernel path: the 3D path requires per-segment
+            # softmax buffers pre-allocated by the natural metadata builder
+            # for `num_seqs` sequences. The trimmed ICMS state may have a
+            # different effective num_seqs and the segment buffers wouldn't
+            # match — drop to the 2D kernel which the unified_attention
+            # signature explicitly supports via None defaults
+            # (triton_unified_attention.py:980-988).
+            seq_threshold_3D = None
+            num_par_softmax_segments = None
+            softmax_segm_output = None
+            softmax_segm_max = None
+            softmax_segm_expsum = None
+            # Multimodal-bidirectional prefix ranges are computed against
+            # the natural block_table positions; the trimmed bt has different
+            # positions, so the prefix mask would mis-fire. None disables the
+            # mm_prefix path (PrefixLM); ICMS-rewritten attention is causal
+            # over the trimmed window, which is what Quest's selection model
+            # assumes.
+            mm_prefix_range_tensor = None
+            # Recompute descale_shape against the (now-overridden) key_cache
+            # so the FP8 descale tensors broadcast correctly. ICMS-state's
+            # key_cache is `main_key` from the connector — same per-block
+            # shape as the natural unbind, so descale_shape is unchanged in
+            # practice, but recompute defensively in case ICMS ever changes
+            # the per-block layout for TP shards.
+            descale_shape = (cu_seqlens_q.shape[0] - 1, key_cache.shape[2])
+
         unified_attention(
             q=query[:num_actual_tokens],
             k=key_cache,

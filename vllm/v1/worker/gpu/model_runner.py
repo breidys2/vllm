@@ -458,6 +458,52 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 "Failed to register Quest hooks", exc_info=True
             )
 
+        # 2026-05-09: backend compatibility guardrail.
+        # Only flash_attn.py honors icms_fetch_state.get_active() (the
+        # apply-path block_table override). TRITON_ATTN / FLEX_ATTENTION /
+        # FLASHINFER do NOT read it, so ICMS apply silently no-ops on those
+        # backends — Score+WriteGroup look healthy in logs while attention
+        # runs over the natural full KV. A/B-confirmed 2026-05-09 (gemma-3
+        # uses TRITON_ATTN; arm-A working ICMS and arm-B fully-broken ICMS
+        # produced byte-identical model outputs). Guard at startup so a
+        # future model swap can't silently regress to dense.
+        # Placed OUTSIDE the broad try/except above on purpose: the abort
+        # must propagate, not be swallowed as "Failed to register Quest hooks".
+        # Only enforce when Quest hooks actually registered (else this is a
+        # dense run anyway and the backend doesn't matter).
+        if getattr(self, "_quest_hook_manager", None) is not None:
+            # 2026-05-09: TRITON_ATTN ported to honor icms_fetch_state at
+            # forks/vllm/vllm/v1/attention/backends/triton_attn.py:480-515
+            # (mirror of flash_attn's override block). FLEX_ATTENTION /
+            # FLASHINFER still don't honor it — keep them off the list.
+            _icms_compat_backends = ("FLASH_ATTN", "TRITON_ATTN")
+            _backend_names = sorted({
+                b.get_name() for b in self.attn_backends.values()
+            })
+            _bad = [n for n in _backend_names
+                     if n not in _icms_compat_backends]
+            if _bad:
+                import os as _os  # mirror inner-block import
+                _msg = (
+                    "[icms] attention backend(s) %r do NOT honor "
+                    "icms_fetch_state — ICMS apply will silently no-op "
+                    "and 'sparse' runs will be DENSE + per-budget prompt "
+                    "noise. Only %r is supported today. Set "
+                    "ICMS_ALLOW_INCOMPATIBLE_BACKEND=1 to bypass (the "
+                    "run will produce silently-dense data; do not use "
+                    "for accuracy benches)."
+                    % (_bad, list(_icms_compat_backends))
+                )
+                if _os.environ.get(
+                        "ICMS_ALLOW_INCOMPATIBLE_BACKEND", "0") == "1":
+                    logger.error(_msg)
+                    logger.error(
+                        "[icms] continuing anyway because "
+                        "ICMS_ALLOW_INCOMPATIBLE_BACKEND=1 is set; "
+                        "results are NOT reliable")
+                else:
+                    raise RuntimeError(_msg)
+
     def prepare_dummy_attn_metadata(self, input_batch: InputBatch) -> None:
         block_tables = self.block_tables.get_dummy_block_tables(input_batch.num_reqs)
         slot_mappings = self.block_tables.get_dummy_slot_mappings(
