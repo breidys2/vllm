@@ -67,9 +67,12 @@ class KVConnectorModelRunnerMixin:
     @staticmethod
     def maybe_get_kv_connector_output(
         scheduler_output: "SchedulerOutput",
+        input_batch_req_ids: list[str] | None = None,
     ) -> AbstractContextManager[KVConnectorOutput | None]:
         return (
-            KVConnectorModelRunnerMixin._get_kv_connector_output(scheduler_output)
+            KVConnectorModelRunnerMixin._get_kv_connector_output(
+                scheduler_output,
+                input_batch_req_ids=input_batch_req_ids)
             if has_kv_transfer_group()
             else nullcontext()
         )
@@ -79,7 +82,8 @@ class KVConnectorModelRunnerMixin:
     @staticmethod
     @contextmanager
     def _get_kv_connector_output(
-        scheduler_output: "SchedulerOutput", wait_for_save: bool = True
+        scheduler_output: "SchedulerOutput", wait_for_save: bool = True,
+        input_batch_req_ids: list[str] | None = None,
     ) -> Generator[KVConnectorOutput, None, None]:
         output = KVConnectorOutput()
 
@@ -88,6 +92,23 @@ class KVConnectorModelRunnerMixin:
         assert isinstance(kv_connector, KVConnectorBase)
         assert scheduler_output.kv_connector_metadata is not None
         kv_connector.bind_connector_metadata(scheduler_output.kv_connector_metadata)
+
+        # 2026-05-12 multi-rid Q-slicing / extract row-mapping fix:
+        # `connector_meta.requests` order (= scheduled_new_reqs +
+        # scheduled_cached_reqs) does NOT match `input_batch.req_ids`
+        # order (= the authoritative row order for FA's block_table /
+        # seq_lens / query_start_loc). The ICMS connector previously
+        # derived bt_row_idx and Q-slice boundaries from meta order,
+        # which mis-mapped rids in multi-rid batched mode. Pass the
+        # authoritative ordering to the connector here (no-op for
+        # connectors that don't implement set_input_batch_req_ids).
+        if input_batch_req_ids is not None and hasattr(
+                kv_connector, "set_input_batch_req_ids"):
+            try:
+                kv_connector.set_input_batch_req_ids(input_batch_req_ids)
+            except Exception:
+                # Best-effort; not all connectors implement this hook.
+                pass
 
         # Background KV cache transfers happen here.
         # These transfers are designed to be async and the requests

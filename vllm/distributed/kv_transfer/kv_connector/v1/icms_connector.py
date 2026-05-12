@@ -52,6 +52,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from vllm.distributed.kv_transfer.kv_connector.v1 import icms_provenance
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
@@ -167,6 +168,55 @@ def _icms_trace(op, rid, layer=-1, chain_fp="", pc_before=-1, pc_after=-1,
                 "ICMS_TRACE_FILE", "/tmp/icms_trace_connector.jsonl")
             _ICMS_TRACE_FH = open(_path, "a", buffering=1)
         _ICMS_TRACE_FH.write(line + "\n")
+
+
+# 2026-05-12 multi-rid slot-1 bug-hunt: a comprehensive per-rid per-layer
+# per-event JSONL emitter. Cheap when disabled; gated by a single env to
+# keep grep across slot 0..3 timelines straightforward.
+_ICMS_FULLTRACE_ENABLED = os.environ.get("ICMS_DIAG_FULLTRACE") == "1"
+_ICMS_FULLTRACE_LOCK = threading.Lock()
+_ICMS_FULLTRACE_FH = None
+
+
+def _icms_fulltrace(op, rid="", layer=-1, **extra):
+    """Append a structured JSONL record for ICMS_DIAG_FULLTRACE=1.
+
+    Emits to `${ICMS_DIAG_FULLTRACE_FILE}` (default
+    /tmp/icms_fulltrace.jsonl). One line per call. All `extra` kwargs
+    are JSON-serialized; non-serializable values are stringified.
+    Caller pays only the env-cached bool check on the hot path.
+    """
+    if not _ICMS_FULLTRACE_ENABLED:
+        return
+    global _ICMS_FULLTRACE_FH
+    import json as _json_ft
+    rec = {
+        "ts_ns": time.monotonic_ns(),
+        "op": op,
+        "rid": str(rid),
+        "layer": int(layer) if layer is not None else -1,
+        "tid": threading.get_ident(),
+        "pid": os.getpid(),
+        **extra,
+    }
+    try:
+        line = _json_ft.dumps(rec)
+    except (TypeError, ValueError):
+        safe = {k: (v if isinstance(v, (int, float, str, bool, list, dict,
+                                         type(None))) else str(v))
+                for k, v in rec.items()}
+        try:
+            line = _json_ft.dumps(safe)
+        except Exception:
+            line = _json_ft.dumps({"op": op, "rid": str(rid),
+                                    "layer": int(layer or -1),
+                                    "_serialize_error": True})
+    with _ICMS_FULLTRACE_LOCK:
+        if _ICMS_FULLTRACE_FH is None:
+            _path = os.environ.get(
+                "ICMS_DIAG_FULLTRACE_FILE", "/tmp/icms_fulltrace.jsonl")
+            _ICMS_FULLTRACE_FH = open(_path, "a", buffering=1)
+        _ICMS_FULLTRACE_FH.write(line + "\n")
 
 
 def _icms_chain_fp(chain) -> str:
@@ -657,6 +707,13 @@ class IcmsConnectorMetadata(KVConnectorMetadata):
     new_chains: dict[str, list[int]] = field(default_factory=dict)
     # Per-request in-order CPU block IDs (for block_id → intra_request_idx mapping).
     block_id_maps: dict[str, list[int]] = field(default_factory=dict)
+    # KV-block provenance tracing (ICMS_TRACE_KV_PROVENANCE). Per-rid counts
+    # of ICMS-elided tokens and vLLM-prefix-cached tokens, plus the alloc'd
+    # block_ids list, ferried scheduler→worker so the worker-side tracker
+    # can derive which blocks ICMS is responsible for populating.
+    prov_ext_comp_tokens: dict[str, int] = field(default_factory=dict)
+    prov_local_cached_tokens: dict[str, int] = field(default_factory=dict)
+    prov_block_ids: dict[str, list[int]] = field(default_factory=dict)
     # Worker→scheduler: chains that were stored in ICMS.
     # List of (chain, num_groups) tuples, drained by the scheduler.
     stored_chain_notifications: list[tuple[list[int], int]] = field(default_factory=list)
@@ -1337,6 +1394,18 @@ class IcmsConnector(KVConnectorBase_V1):
         if self._worker is not None:
             self._worker.register_kv_caches(kv_caches)
 
+    def set_input_batch_req_ids(self, req_ids: list[str]) -> None:
+        """Receive the authoritative input_batch.req_ids ordering from vLLM.
+
+        2026-05-12 multi-rid row-mapping fix: this is the source of truth
+        for FA's per-rid bt / seq_lens / query_start_loc row order. The
+        scheduler-side `connector_meta.requests` order (new+cached) does
+        NOT match this when multi-rid batched mode is active. Routed to
+        the worker; the connector facade only delegates.
+        """
+        if self._worker is not None:
+            self._worker.set_input_batch_req_ids(req_ids)
+
     def start_load_kv(self, forward_context: ForwardContext, **kwargs) -> None:
         """Stash attn_metadata from the forward context and drain metadata."""
         if self._worker is None:
@@ -1484,6 +1553,30 @@ class IcmsConnector(KVConnectorBase_V1):
     ) -> None:
         """C1: read Request.block_hashes on first alloc, derive group chain."""
         if self._sched is not None:
+            # KV provenance capture (env-gated; cheap no-op when disabled).
+            # We snapshot per-rid: ext_comp count (the ICMS-elided range),
+            # local_cached count (vLLM prefix-cache range), and the
+            # allocated block_id list. Plumbed into metadata in build_meta
+            # so the worker can derive which blocks ICMS is responsible
+            # for populating.
+            if icms_provenance.is_enabled():
+                try:
+                    _n_ext = int(num_external_tokens)
+                    _n_total = int(getattr(request, "num_computed_tokens", 0))
+                    _n_local = max(0, _n_total - _n_ext)
+                    _bids: list[int] = []
+                    try:
+                        _groups = blocks.get_block_ids(allow_none=True)
+                        if _groups:
+                            _bids = list(_groups[0])
+                    except Exception:
+                        _bids = []
+                    self._sched._prov_alloc[request.request_id] = (
+                        _n_ext, _n_local, _bids)
+                except Exception as _e:
+                    logger.debug(
+                        "icms_provenance capture failed for rid=%s: %s",
+                        request.request_id, _e)
             self._sched.on_alloc(request, blocks)
 
     def build_connector_meta(
@@ -1522,6 +1615,10 @@ class IcmsConnector(KVConnectorBase_V1):
         if self._sched is not None:
             self._sched.on_finished_record_stored(request)
             self._sched.on_finished(request.request_id)
+            # Drop any undelivered prov alloc snapshot.
+            self._sched._prov_alloc.pop(request.request_id, None)
+        # KV-provenance: drop tracker state for this rid (no-op if env off).
+        icms_provenance.tracker().clear_request(request.request_id)
         return False, None
 
     # ══════════════════════════════════════════════════════════════════════
@@ -1601,6 +1698,12 @@ class _Scheduler:
         # Requests whose chains haven't been sent to the worker yet.
         self._pending_chain_sends: set[str] = set()
 
+        # KV-block provenance capture (env-gated). Set by
+        # update_state_after_alloc; drained into IcmsConnectorMetadata
+        # in build_meta. Value: (ext_comp_tokens, local_cached_tokens,
+        # block_ids).
+        self._prov_alloc: dict[str, tuple[int, int, list[int]]] = {}
+
         # ── Global prefix index (Option 1: in-process hash dict) ──
         # Maps chain prefix (as tuple of group hashes) → num_groups stored.
         # Updated via metadata from the worker after WriteGroup completes.
@@ -1663,6 +1766,23 @@ class _Scheduler:
 
         logger.debug("on_alloc: rid=%s tokens=%d groups=%d",
                       rid, len(token_ids or []), len(chain))
+        if _ICMS_FULLTRACE_ENABLED:
+            try:
+                import hashlib as _hl_oa
+                _tok_bytes = repr(tuple(token_ids or [])).encode()
+                _icms_fulltrace(
+                    "on_alloc", rid=rid,
+                    prompt_len=int(len(token_ids or [])),
+                    chain_len=int(len(chain)),
+                    chain_head=[int(x) for x in chain[:4]],
+                    chain_tail=[int(x) for x in chain[-4:]],
+                    chain_fp=_icms_chain_fp(chain),
+                    token_sha=_hl_oa.sha1(_tok_bytes).hexdigest()[:16],
+                    token_first8=list(int(t) for t in (token_ids or [])[:8]),
+                    token_last8=list(int(t) for t in (token_ids or [])[-8:]),
+                )
+            except Exception:
+                pass
         self._chains[rid] = chain
         self._pending_chain_sends.add(rid)
 
@@ -1764,6 +1884,19 @@ class _Scheduler:
                 meta.stored_groups_by_rid[prs.request_id] = stored_groups
             if stored_groups >= complete_groups_after:
                 meta.skip_extract_rids.add(prs.request_id)
+
+        # Drain KV-provenance alloc snapshots into metadata for the
+        # worker. Only emits when the env flag is on; cheap no-op
+        # otherwise. We drain on every build_meta so per-rid records
+        # land on the worker side ASAP after alloc.
+        if icms_provenance.is_enabled() and self._prov_alloc:
+            for rid, (n_ext, n_local, bids) in list(self._prov_alloc.items()):
+                meta.prov_ext_comp_tokens[rid] = n_ext
+                meta.prov_local_cached_tokens[rid] = n_local
+                meta.prov_block_ids[rid] = list(bids)
+                # Pop after delivery — a re-alloc for the same rid
+                # (preemption) will re-stamp.
+                self._prov_alloc.pop(rid, None)
         return meta
 
     # ── Global prefix index operations ──────────────────────────────
@@ -1771,6 +1904,18 @@ class _Scheduler:
     def record_stored_chain(self, chain: list[int], num_groups: int):
         """Called when the worker reports that groups were written to ICMS."""
         key = tuple(chain[:num_groups])
+        if _ICMS_FULLTRACE_ENABLED:
+            try:
+                _icms_fulltrace(
+                    "record_stored_chain", rid="",
+                    n_groups=int(num_groups),
+                    chain_len=int(len(chain)),
+                    chain_fp=_icms_chain_fp(list(chain)),
+                    chain_head=[int(x) for x in chain[:4]],
+                    stored_chains_count_pre=int(len(self._stored_chains)),
+                )
+            except Exception:
+                pass
         # Update existing or append.
         for i, (sc, ng) in enumerate(self._stored_chains):
             if sc == key:
@@ -1801,6 +1946,14 @@ class _Scheduler:
         chain from token IDs and check our in-process prefix index.
         Returns (num_external_tokens, is_async).
         """
+        if _ICMS_FULLTRACE_ENABLED:
+            _icms_fulltrace(
+                "gnnmt_entry", rid=request.request_id,
+                num_computed_tokens=int(num_computed_tokens),
+                force_cold=(os.environ.get("ICMS_FORCE_COLD") == "1"),
+                opt1_env=os.environ.get(
+                    "ICMS_OPTION_1_COLD_FALLBACK", "0"),
+            )
         # ICMS_FORCE_COLD=1: pretend nothing is externally cached. vLLM
         # then takes the cold prefill path even on run 2 (no apply, no
         # FetchAll). Sanity check: if run 2 PASSES with this flag, the
@@ -1808,7 +1961,37 @@ class _Scheduler:
         # contract). If it FAILS, BF2 server state from run 1 is
         # poisoning run 2 (e.g., NVMe namespace pollution).
         if os.environ.get("ICMS_FORCE_COLD") == "1":
+            if _ICMS_FULLTRACE_ENABLED:
+                _icms_fulltrace(
+                    "gnnmt_exit_force_cold", rid=request.request_id,
+                    returned=(0, False))
             return 0, False
+        # 2026-05-12 CROSS-RID BLOCK ALIASING FALLBACK (Option 1, opt-in):
+        # In multi-rid mode, reporting num_external_tokens > 0 causes vLLM's
+        # BlockManager to ALIAS the matched-prefix physical blocks across
+        # all rids sharing the prefix. ICMS apply's scatter to those shared
+        # blocks → cross-rid contamination.
+        # Workaround: return 0 in multi-rid → cold prefill per rid → unique
+        # blocks. Trade-off: Phase 2 re-prefills the haystack per rid.
+        # Opt-in via ICMS_OPTION_1_COLD_FALLBACK=1. The primary fix is
+        # Option 4 (ICMS-owned scratch tensor); see register_kv_caches.
+        if os.environ.get("ICMS_OPTION_1_COLD_FALLBACK", "0") == "1":
+            _scheduler_cfg = getattr(self._vllm_config,
+                                     "scheduler_config", None)
+            _max_num_seqs = int(getattr(_scheduler_cfg,
+                                        "max_num_seqs", 1) or 1)
+            _ab = _allow_batch()
+            if _max_num_seqs > 1 or _ab:
+                logger.info(
+                    "[icms-opt1] FIRED: returning (0, False) for rid=%s "
+                    "(max_num_seqs=%d allow_batch=%s)",
+                    request.request_id, _max_num_seqs, _ab)
+                return 0, False
+            else:
+                logger.info(
+                    "[icms-opt1] env set but gate FALSE: "
+                    "max_num_seqs=%d allow_batch=%s — letting fall through",
+                    _max_num_seqs, _ab)
         # Drain worker → scheduler notifications first.
         # Bug #5 fix (race-audit 2026-05-08): atomic snapshot+clear under
         # `_stored_chain_cond` so a producer append landing during the
@@ -1939,6 +2122,18 @@ class _Scheduler:
             "matched_tokens=%d local=%d ext=%d",
             rid, matched_groups, matched_tokens, num_computed_tokens, ext_tokens,
         )
+        if _ICMS_FULLTRACE_ENABLED:
+            _icms_fulltrace(
+                "get_num_new_matched_tokens", rid=rid,
+                chain_len=int(len(chain)),
+                stored_chains_count=int(len(self._stored_chains)),
+                matched_groups=int(matched_groups),
+                matched_tokens=int(matched_tokens),
+                num_computed_tokens=int(num_computed_tokens),
+                ext_tokens=int(ext_tokens),
+                returned=(int(ext_tokens), False),
+                prompt_len=int(total_prompt),
+            )
         # Synchronous loading (False): the worker fills blocks during
         # the forward pass via wait_for_layer_load.
         return ext_tokens, False
@@ -2310,6 +2505,15 @@ class _Worker:
         # multi-rid extract path can map batch row index → rid without
         # threading an extra arg through extract_and_record.
         self._last_step_requests: list = []
+        # 2026-05-12 multi-rid row-mapping fix: vLLM's input_batch.req_ids
+        # is the authoritative source for FA's per-rid bt/qsl/seq_lens
+        # row order. `_last_step_requests` order (= scheduled_new_reqs +
+        # scheduled_cached_reqs from build_meta) does NOT match it under
+        # multi-rid batched mode. We receive the live ordering via
+        # set_input_batch_req_ids() before each forward and use it for
+        # rid → row lookups. None means single-rid path / pre-fix smoke.
+        self._input_batch_req_ids: list[str] | None = None
+        self._rid_to_bt_row: dict[str, int] = {}
 
 
         # Pending notifications for the scheduler (stored chain info).
@@ -3141,6 +3345,24 @@ class _Worker:
         for rid, bids in meta.block_id_maps.items():
             rs = self._requests.setdefault(rid, _RequestState(request_id=rid))
             rs.block_ids = bids
+
+        # KV-block provenance: record alloc snapshots delivered via
+        # metadata. Only fires when env flag is on (zero cost otherwise).
+        # Records per-rid the ext_comp range so check_bt can verify each
+        # layer's attention bt covers ext_comp blocks only through ICMS
+        # apply scatter, never through unpopulated free-pool blocks.
+        if (icms_provenance.is_enabled()
+                and getattr(meta, "prov_block_ids", None)):
+            for rid, bids in meta.prov_block_ids.items():
+                n_ext = int(meta.prov_ext_comp_tokens.get(rid, 0))
+                n_local = int(meta.prov_local_cached_tokens.get(rid, 0))
+                icms_provenance.tracker().record_alloc(
+                    rid=rid,
+                    block_ids=bids,
+                    num_external_tokens=n_ext,
+                    num_local_cached_tokens=n_local,
+                    page_tokens=PAGE_TOKENS,
+                )
         # Client-side preload DISABLED by default — the server now kicks off
         # the same async preload internally on first Score (see
         # kick_off_summary_preload in handlers.cc), which avoids the
@@ -4074,19 +4296,41 @@ class _Worker:
                         if _am is not None else None)
                 if (_qsl is not None and _qsl.numel() == _meta_n_reqs + 1
                         and int(_qsl[-1].item()) == _q_n):
-                    # qsl is consistent with the connector_meta order
-                    # AND covers exactly quest_query.shape[0] tokens.
-                    # NOTE: this assumes connector_meta.requests order
-                    # matches input_batch / FA's cu_q order. If a
-                    # future vLLM build interleaves new+cached
-                    # differently, this assumption breaks; the assert
-                    # at line ~3063 will fire on the q-length mismatch.
-                    for req_idx, step_req in enumerate(connector_meta.requests):
-                        start = int(_qsl[req_idx].item())
-                        end = int(_qsl[req_idx + 1].item())
-                        if 0 <= start < end <= _q_n:
-                            per_request_q[step_req.request_id] = (
-                                quest_query[start:end])
+                    # qsl is FA's authoritative cu_q boundary tensor;
+                    # its row i corresponds to vLLM's input_batch row i,
+                    # NOT to connector_meta.requests[i]. 2026-05-12 fix:
+                    # use `self._rid_to_bt_row` (populated from
+                    # input_batch.req_ids via set_input_batch_req_ids)
+                    # to map each rid to its FA row. Pre-fix this
+                    # enumerated connector_meta.requests order, which
+                    # is `scheduled_new_reqs + scheduled_cached_reqs`
+                    # append order — not FA's row order. The mismatch
+                    # silently assigned the wrong Q-slice to each rid
+                    # under multi-rid batched mode → wrong K-similarity
+                    # in Score → wrong page selection → slot N fails
+                    # deterministically. See docs/multi_rid_root_cause_2026-05-12.md.
+                    if self._rid_to_bt_row:
+                        for step_req in connector_meta.requests:
+                            rid = step_req.request_id
+                            fa_idx = self._rid_to_bt_row.get(rid)
+                            if fa_idx is None or fa_idx + 1 >= _qsl.numel():
+                                continue
+                            start = int(_qsl[fa_idx].item())
+                            end = int(_qsl[fa_idx + 1].item())
+                            if 0 <= start < end <= _q_n:
+                                per_request_q[rid] = (
+                                    quest_query[start:end])
+                    else:
+                        # Pre-fix fallback: no input_batch ordering
+                        # plumbed through. Use legacy enumerate order
+                        # — known buggy but preserves behavior for
+                        # callers that haven't been migrated yet.
+                        for req_idx, step_req in enumerate(connector_meta.requests):
+                            start = int(_qsl[req_idx].item())
+                            end = int(_qsl[req_idx + 1].item())
+                            if 0 <= start < end <= _q_n:
+                                per_request_q[step_req.request_id] = (
+                                    quest_query[start:end])
                     _qsl_used = True
             except Exception as _qsl_err:
                 logger.warning("[icms] qsl slicing failed: %s; "
@@ -4182,7 +4426,14 @@ class _Worker:
         # _score_one_request body issues NCCL AllGather + broadcast
         # collectives whose ordering must match across ranks — running
         # them concurrently from N threads would risk a deadlock.
-        if (_allow_batch() and self._tp_size == 1
+        # 2026-05-12 ICMS_DISABLE_SCORE_ASYNC=1: force the serial dispatch
+        # path even when conditions for async pool dispatch are met.
+        # Used as a discriminating test for H1 (async-demux race) — if
+        # the smoke passes with this flag set, the bug is in the async
+        # path (race condition or pool-state contamination across rids).
+        _disable_async = os.environ.get("ICMS_DISABLE_SCORE_ASYNC") == "1"
+        if (not _disable_async
+                and _allow_batch() and self._tp_size == 1
                 and len(requests_to_score) >= 2
                 and hasattr(self._client, "score_async")):
             pool = self._score_dispatch_pool
@@ -4199,6 +4450,27 @@ class _Worker:
                         "fell back to full-batch Q (shape=%s) — "
                         "wrong page selection imminent",
                         next_layer_idx, rid, _q_shape)
+                # 2026-05-12: log Q-tensor SHA per rid for slot-1
+                # contamination investigation. Two rids with identical
+                # Q SHA at the same layer == they're scoring against the
+                # same tokens → cross-rid contamination at the score side.
+                if (os.environ.get("ICMS_DIAG_Q_SHA") == "1"
+                        and hasattr(q_for_request, "shape")
+                        and hasattr(q_for_request, "cpu")):
+                    try:
+                        import hashlib as _hl
+                        # bf16 → float32 first; numpy lacks bf16.
+                        _qb = (q_for_request.contiguous().to(
+                            torch.float32).cpu().numpy().tobytes())
+                        _qsha = _hl.sha256(_qb).hexdigest()[:16]
+                        _q0 = float(q_for_request.flatten()[0].item())
+                        logger.info(
+                            "[diag-q-sha] layer=%d rid=%s req_idx=%d "
+                            "q_shape=%s q_first=%.6e q_sha=%s",
+                            next_layer_idx, rid[:8], req_idx,
+                            tuple(q_for_request.shape), _q0, _qsha)
+                    except Exception as _eq:
+                        logger.warning("diag-q-sha failed: %s", _eq)
                 futs.append(pool.submit(
                     self._score_one_request,
                     rid, rs, req_idx, next_layer_idx, q_for_request,
@@ -4221,6 +4493,24 @@ class _Worker:
                         "fell back to full-batch Q (shape=%s) — "
                         "wrong page selection imminent",
                         next_layer_idx, rid, _q_shape)
+                # 2026-05-12: Q-SHA diag (mirror of the async branch above).
+                if (os.environ.get("ICMS_DIAG_Q_SHA") == "1"
+                        and hasattr(q_for_request, "shape")
+                        and hasattr(q_for_request, "cpu")):
+                    try:
+                        import hashlib as _hl
+                        # bf16 → float32 first; numpy lacks bf16.
+                        _qb = (q_for_request.contiguous().to(
+                            torch.float32).cpu().numpy().tobytes())
+                        _qsha = _hl.sha256(_qb).hexdigest()[:16]
+                        _q0 = float(q_for_request.flatten()[0].item())
+                        logger.info(
+                            "[diag-q-sha] layer=%d rid=%s req_idx=%d "
+                            "q_shape=%s q_first=%.6e q_sha=%s",
+                            next_layer_idx, rid[:8], req_idx,
+                            tuple(q_for_request.shape), _q0, _qsha)
+                    except Exception as _eq:
+                        logger.warning("diag-q-sha failed: %s", _eq)
                 self._score_one_request(
                     rid, rs, req_idx, next_layer_idx, q_for_request,
                     budget, stats, connector_meta)
@@ -4274,6 +4564,20 @@ class _Worker:
         # BUG-N7: cached on rs by on_step_start; avoids per-layer rescan.
         stored_groups = rs.stored_groups
         effective_groups = max(rs.num_groups_written, stored_groups)
+        # 2026-05-12 cross-rid slot-1 investigation: log per-(rid, layer)
+        # the score-state inputs that feed total_pages. If rid_5 (slot 1)
+        # shows a smaller effective_groups than rids 4/6/7 in the same
+        # layer, that's the smoking gun for "rid_5's stored_groups
+        # truncated by an asymmetric _stored_chains snapshot".
+        if os.environ.get("ICMS_DIAG_STORED", "0") == "1":
+            logger.info(
+                "[diag-stored] rid=%s layer=%d stored_groups=%d "
+                "num_groups_written=%d effective_groups=%d "
+                "chain_len=%d total_pages_will_be=%d",
+                rid[:10], next_layer_idx,
+                int(stored_groups), int(rs.num_groups_written),
+                int(effective_groups), len(rs.chain) if rs.chain else 0,
+                int(effective_groups * _GROUP_BLOCKS))
         # 2026-05-10 TP>1 stored_groups asymmetry fix:
         # `effective_groups` derives from per-rank state (num_groups_written
         # bumped by per-rank pipeline thread; stored_groups read from
@@ -5217,6 +5521,36 @@ class _Worker:
                         len(_pids), _pids[:8], _pids[-8:], _hash, out_path)
                 except Exception as _e:
                     logger.warning("diag-page-ids failed: %s", _e)
+            # ICMS_DIAG_FULLTRACE: emit per-(rid, layer) score-reply
+            # summary. Includes full sorted page_ids list (capped to
+            # 512 entries — at h=32k b=0.20 the top-K is ~400 pages,
+            # so this captures the full set) so we can diff slot-1's
+            # selection against slot-0/2/3.
+            if _ICMS_FULLTRACE_ENABLED:
+                try:
+                    _pids_ft = [int(p) for p in reply.page_ids]
+                    _scores_ft = [float(s) for s in reply.scores]
+                    _icms_fulltrace(
+                        "score", rid=rid, layer=int(next_layer_idx),
+                        k_requested=int(k),
+                        total_pages=int(total_pages),
+                        n_pids=len(_pids_ft),
+                        page_ids_unsorted=_pids_ft[:512],
+                        page_ids_sorted_head=sorted(_pids_ft)[:8],
+                        page_ids_sorted_tail=sorted(_pids_ft)[-8:],
+                        scores_head=_scores_ft[:8],
+                        scores_tail=_scores_ft[-8:],
+                        chain_len=int(len(rs.chain) if rs.chain else 0),
+                        stored_groups=int(getattr(rs, "stored_groups", -1)),
+                        num_groups_written=int(getattr(
+                            rs, "num_groups_written", -1)),
+                        flushed_local=int(getattr(rs, "flushed_local", -1)),
+                        cache_hit=int(getattr(reply, "cache_hit", 0)),
+                        reply_chain_groups=int(getattr(
+                            reply, "matched_chain_groups", -1)),
+                    )
+                except Exception:
+                    pass
             # Stash storage-side concurrent request count for adaptive budget.
             rs._last_storage_concurrent = getattr(
                 reply, 'concurrent_requests', 0)
@@ -5830,9 +6164,130 @@ class _Worker:
         logger.info("Path B: registered %d KV cache layers (reordered block table mode)",
                      len(kv_caches))
 
+        # 2026-05-12 OPTION 4 — ICMS-OWNED SCRATCH TENSOR:
+        # Cross-rid block aliasing bug (project_multi_rid_slot1_residual_gap_2026-05-12.md):
+        # in multi-rid mode, vLLM aliases prefix-cached physical blocks
+        # across rids; ICMS scatter into bt[req_idx][valid_pids] (where
+        # valid_pids fall in the matched-prefix range) lands on SHARED
+        # blocks → cross-rid contamination. Workaround: allocate an
+        # ICMS-owned scratch tensor (separate from main_key), redirect
+        # the scatter there, and tell FA to read from the scratch via
+        # IcmsFetchState.key_cache / .value_cache override
+        # (forks/vllm/vllm/v1/attention/backends/flash_attn.py:719+).
+        #
+        # Sizing: one slot per (rid, selected_or_cont_block). The slot
+        # count per rid is icms_k (selected pages cap) + MAX_CONT (8 is
+        # enough for question + early decode). Allocated per layer to
+        # match the layer's KV cache shape.
+        #
+        # Gated by ICMS_OPTION_4_SCRATCH=1 (default OFF for safety while
+        # under test). When OFF, behavior is unchanged from current main
+        # code path.
+        self._icms_scratch_k: dict[str, torch.Tensor] = {}
+        self._icms_scratch_v: dict[str, torch.Tensor] = {}
+        if os.environ.get("ICMS_OPTION_4_SCRATCH", "0") == "1":
+            max_n_seqs = max(1, int(getattr(self, "_max_num_seqs", 1) or 1))
+            k_cap = int(getattr(self, "_k", 2000) or 2000)
+            MAX_CONT = 16  # safe upper bound for question + early decode
+            slots_per_rid = k_cap + MAX_CONT
+            total_slots = max_n_seqs * slots_per_rid
+            mem_total = 0
+            for layer_name, kv in kv_caches.items():
+                # kv shape: typically [num_blocks, 2, page_size, num_kv_heads, head_dim]
+                # OR [2, num_blocks, ...] depending on backend. We need
+                # a scratch with the SAME trailing dims and dtype.
+                if kv.ndim != 5:
+                    logger.warning(
+                        "[icms-scratch] layer=%s unexpected kv.ndim=%d; "
+                        "scratch not allocated. Multi-rid fix unavailable "
+                        "for this layer.", layer_name, kv.ndim)
+                    continue
+                if kv.shape[0] == 2:
+                    # Layout [2, num_blocks, page_size, num_kv_heads, head_dim]
+                    _per_layer_shape = kv.shape[1:]  # drop the leading "2"
+                elif kv.shape[1] == 2:
+                    # Layout [num_blocks, 2, page_size, num_kv_heads, head_dim]
+                    _per_layer_shape = (kv.shape[0],) + kv.shape[2:]
+                else:
+                    logger.warning(
+                        "[icms-scratch] layer=%s kv.shape=%s — neither dim "
+                        "is 2. Scratch not allocated for this layer.",
+                        layer_name, tuple(kv.shape))
+                    continue
+                # _per_layer_shape is now [num_blocks, page_size, num_kv_heads, head_dim]
+                # Replace num_blocks with total_slots for scratch.
+                scratch_shape = (total_slots,) + tuple(_per_layer_shape[1:])
+                k_scratch = torch.zeros(
+                    *scratch_shape, dtype=kv.dtype, device=kv.device)
+                v_scratch = torch.zeros(
+                    *scratch_shape, dtype=kv.dtype, device=kv.device)
+                self._icms_scratch_k[layer_name] = k_scratch
+                self._icms_scratch_v[layer_name] = v_scratch
+                mem_total += k_scratch.numel() * k_scratch.element_size() * 2
+            self._icms_scratch_slots_per_rid = slots_per_rid
+            logger.info(
+                "[icms-scratch] Option-4 enabled: per-layer scratch allocated "
+                "for %d layers, max_num_seqs=%d, slots_per_rid=%d, "
+                "total scratch mem=%.1f MiB",
+                len(self._icms_scratch_k), max_n_seqs,
+                slots_per_rid, mem_total / (1024 * 1024))
+        else:
+            self._icms_scratch_slots_per_rid = 0
+
     def set_attn_metadata(self, attn_metadata):
         """Stash per-step attn_metadata dict from ForwardContext."""
         self._attn_metadata = attn_metadata
+
+    def set_input_batch_req_ids(self, req_ids: list[str]) -> None:
+        """Capture vLLM's authoritative input_batch.req_ids ordering.
+
+        2026-05-12 multi-rid row-mapping fix: every connector site that
+        derived a batch row index from `enumerate(self._last_step_requests)`
+        was using the wrong order (meta.requests = new+cached append
+        order, not vLLM input_batch order). With this hook the connector
+        knows the live order and can map rid → FA bt row correctly.
+        """
+        self._input_batch_req_ids = list(req_ids)
+        self._rid_to_bt_row = {rid: i for i, rid in enumerate(req_ids)}
+
+    def _provenance_check_natural_bt(
+        self, layer_name: str, abs_layer: int, path: str = "?",
+    ) -> None:
+        """Check natural attn_metadata.block_table against ICMS-populated
+        block_ids for each active rid. Flags ext_comp blocks in the
+        layer's bt that ICMS did not populate (i.e., attention will
+        read uninitialized / stale free-pool KV).
+
+        Called from wait_for_layer's non-scored short-circuit. Gated on
+        ICMS_TRACE_KV_PROVENANCE; safe no-op otherwise.
+        """
+        try:
+            am = (self._attn_metadata.get(layer_name)
+                  if isinstance(self._attn_metadata, dict) else None)
+            if am is None or not hasattr(am, "block_table"):
+                return
+            bt = am.block_table
+            if bt is None:
+                return
+            # bt: [num_reqs, max_blocks_per_req] tensor (GPU). Move to
+            # CPU once for indexing — only fires when env flag is on.
+            if hasattr(bt, "cpu"):
+                bt_cpu = bt.cpu()
+            else:
+                bt_cpu = bt
+            tracker = icms_provenance.tracker()
+            for req_idx, (rid, rs) in enumerate(self._requests.items()):
+                if req_idx >= bt_cpu.shape[0]:
+                    break
+                # Cap to seq_lens to ignore padding tail.
+                _row = bt_cpu[req_idx].tolist()
+                tracker.check_bt(
+                    rid=rid, layer_idx=abs_layer,
+                    bt_block_ids=_row, path=path,
+                )
+        except Exception as _e:
+            # Tracing must never crash the forward path. Log + swallow.
+            logger.debug("provenance check failed: %s", _e)
 
     def wait_for_layer(self, layer_name: str):
         """Path B: fetch selected KV from icms → GPU + modify block table rows.
@@ -5875,6 +6330,14 @@ class _Worker:
                 and not self._geom.is_scored(_abs_layer_for_mask)):
             from vllm.v1.attention import icms_fetch_state
             icms_fetch_state.clear()
+            # KV-provenance: this is the non-scored short-circuit path.
+            # Attention will read the NATURAL bt from attn_metadata,
+            # which includes ext_comp blocks that ICMS may not have
+            # populated for this layer. Check per active rid and log
+            # any unpopulated ext_comp blocks in their bt row.
+            if icms_provenance.is_enabled():
+                self._provenance_check_natural_bt(
+                    layer_name, _abs_layer_for_mask, path="nonscored")
             return
         with self._score_lock:
             per_request = self._pending_scores.pop(layer_name, None)
@@ -6084,10 +6547,71 @@ class _Worker:
         _use_batch_path = self._is_multi_rid_mode() and len(per_request) >= 1
         _captures: list | None = [] if _use_batch_path else None
 
+        # 2026-05-12 FIX (cross-rid contamination): req_idx cached in
+        # _pending_scores at Score-fire time can be STALE by the time
+        # _apply_selective_attention runs. Under chunked prefill with
+        # max_num_seqs>1, the same rid can occupy different batch
+        # positions in successive forward passes (e.g., rid=4 at
+        # req_idx=0 in chunk N, req_idx=3 in chunk N+1). If Apply uses
+        # the stale value, `combined_bt[req_idx, :k+c] = trim_row` at
+        # line ~6351 writes to the WRONG row → that row's owner reads
+        # rid_A's selected KV pages → cross-rid contamination (rid_B
+        # generates rid_A's needle). Discovered in the qwen3 batched
+        # smoke: 4 examples score 0.75; 8 examples score 0.25; single-rid
+        # baseline scores 1.00 for the same inputs.
+        #
+        # Fix: build a live rid → req_idx map from `_last_step_requests`
+        # (set at the start of every forward step from meta.requests)
+        # and use that instead of the cached value. If a rid in
+        # per_request is no longer in the current batch (e.g., it
+        # finished), skip its apply — applying it would target some
+        # other rid's row.
+        _live_rid_to_req_idx: dict[str, int] = {}
+        if self._is_multi_rid_mode():
+            # 2026-05-12 multi-rid row-mapping fix: prefer the
+            # authoritative `self._rid_to_bt_row` populated from vLLM's
+            # `input_batch.req_ids`. Pre-fix this rebuild used the SAME
+            # `_last_step_requests` enumeration as the buggy source, so
+            # it didn't actually fix the cross-rid contamination it was
+            # written to fix.
+            if self._rid_to_bt_row:
+                _live_rid_to_req_idx = dict(self._rid_to_bt_row)
+            elif self._last_step_requests:
+                for _live_idx, _prs in enumerate(self._last_step_requests):
+                    _live_rid_to_req_idx[_prs.request_id] = _live_idx
+
         total_k_pages = 0
-        for rid, (reply, req_idx) in per_request.items():
+        for rid, (reply, _cached_req_idx) in per_request.items():
             if reply is None or not reply.page_ids:
                 continue
+            # Re-derive the live req_idx for this rid. If the rid is no
+            # longer in the current step's batch, skip apply (the cached
+            # req_idx would point into another rid's row).
+            if self._is_multi_rid_mode():
+                if rid not in _live_rid_to_req_idx:
+                    if os.environ.get(
+                            "ICMS_DIAG_REQIDX_DRIFT", "1") != "0":
+                        logger.warning(
+                            "[reqidx-drift] layer=%s rid=%s NOT in current "
+                            "batch (cached_req_idx=%d, current batch n=%d) "
+                            "— SKIPPING apply to avoid writing to another "
+                            "rid's block_table row",
+                            layer_name, rid[:8], _cached_req_idx,
+                            len(_live_rid_to_req_idx))
+                    continue
+                req_idx = _live_rid_to_req_idx[rid]
+                if (req_idx != _cached_req_idx
+                        and os.environ.get(
+                            "ICMS_DIAG_REQIDX_DRIFT", "1") != "0"):
+                    logger.warning(
+                        "[reqidx-drift] layer=%s rid=%s cached_req_idx=%d "
+                        "live_req_idx=%d — applying at live (cached would "
+                        "have caused cross-rid contamination)",
+                        layer_name, rid[:8], _cached_req_idx, req_idx)
+            else:
+                # Single-rid path: cached value is fine (only 1 rid
+                # per forward pass).
+                req_idx = _cached_req_idx
             try:
                 t_apply_start = time.perf_counter()
                 self._apply_selective_attention(
@@ -6577,6 +7101,18 @@ class _Worker:
                             logger.warning("diag-kv-diff failed: %s", _e_kvd)
                     main_key.index_copy_(0, phys_blocks_dev, k_pages)
                     main_value.index_copy_(0, phys_blocks_dev, v_pages)
+                    # KV provenance: record blocks ICMS just populated for
+                    # this layer. Cheap no-op when env flag is off.
+                    if icms_provenance.is_enabled():
+                        try:
+                            _pb_list = phys_blocks_dev.tolist()
+                            icms_provenance.tracker().record_icms_populated(
+                                rid=rid,
+                                layer_idx=layer_idx_for_cache,
+                                block_ids=_pb_list,
+                            )
+                        except Exception:
+                            pass
 
                 # Multi-layer canary read in fast path (2026-04-30):
                 # detect mis-pack of layers 1..47 in the FAPS sink. Slow
@@ -7219,35 +7755,131 @@ class _Worker:
                         import hashlib as _h_kvd
                         _kvd_layer = self._extract_layer_idx(layer_name)
                         if _kvd_layer in (0, 6, 12, 18, 24, 30, 36, 42):
-                            _phys0 = int(phys_blocks_dev[0].item())
-                            # bf16 → uint8 view → numpy (numpy has no
-                            # bf16 dtype). Hashes are byte-identical.
-                            _pre_k = main_key[_phys0].view(torch.uint8).cpu().numpy().tobytes()
-                            _new_k = k_pages[0].view(torch.uint8).cpu().numpy().tobytes()
-                            _pre_v = main_value[_phys0].view(torch.uint8).cpu().numpy().tobytes()
-                            _new_v = v_pages[0].view(torch.uint8).cpu().numpy().tobytes()
-                            _pre_kh = _h_kvd.sha1(_pre_k).hexdigest()[:16]
-                            _new_kh = _h_kvd.sha1(_new_k).hexdigest()[:16]
-                            _pre_vh = _h_kvd.sha1(_pre_v).hexdigest()[:16]
-                            _new_vh = _h_kvd.sha1(_new_v).hexdigest()[:16]
-                            _diff_k = _pre_kh != _new_kh
-                            _diff_v = _pre_vh != _new_vh
-                            _pre_k_head = _pre_k[:16].hex()
-                            _new_k_head = _new_k[:16].hex()
-                            logger.info(
-                                "[diag-kv-diff] path=slow rid=%s layer=%d "
-                                "phys=%d k_pre=%s k_new=%s diff_k=%s "
-                                "v_pre=%s v_new=%s diff_v=%s "
-                                "k_pre_head=%s k_new_head=%s",
-                                rid[:8], _kvd_layer, _phys0,
-                                _pre_kh, _new_kh, _diff_k,
-                                _pre_vh, _new_vh, _diff_v,
-                                _pre_k_head, _new_k_head)
+                            # 2026-05-12 extension: also log the LAST
+                            # phys_block_dev (the descending-range block
+                            # for shorter-chain rids like rid_5 in the
+                            # multi-rid contamination investigation).
+                            # phys_blocks_dev[0] = first selected page's
+                            # block; phys_blocks_dev[-1] = last selected
+                            # page's block (e.g., block 659 for rid_5
+                            # at valid_pid=1976 in batched mode).
+                            _n_phys = int(phys_blocks_dev.numel())
+                            _probe_idxs = [0]
+                            if _n_phys > 1:
+                                _probe_idxs.append(_n_phys - 1)
+                            for _pidx in _probe_idxs:
+                                _phys = int(phys_blocks_dev[_pidx].item())
+                                # bf16 → uint8 view → numpy.
+                                _pre_k = main_key[_phys].view(torch.uint8).cpu().numpy().tobytes()
+                                _new_k = k_pages[_pidx].view(torch.uint8).cpu().numpy().tobytes()
+                                _pre_v = main_value[_phys].view(torch.uint8).cpu().numpy().tobytes()
+                                _new_v = v_pages[_pidx].view(torch.uint8).cpu().numpy().tobytes()
+                                _pre_kh = _h_kvd.sha1(_pre_k).hexdigest()[:16]
+                                _new_kh = _h_kvd.sha1(_new_k).hexdigest()[:16]
+                                _pre_vh = _h_kvd.sha1(_pre_v).hexdigest()[:16]
+                                _new_vh = _h_kvd.sha1(_new_v).hexdigest()[:16]
+                                _diff_k = _pre_kh != _new_kh
+                                _diff_v = _pre_vh != _new_vh
+                                _pre_k_head = _pre_k[:16].hex()
+                                _new_k_head = _new_k[:16].hex()
+                                _zero_pre_k = (_pre_k == b'\x00' * len(_pre_k))
+                                logger.info(
+                                    "[diag-kv-diff] path=slow rid=%s layer=%d "
+                                    "probe=%s/%d phys=%d k_pre=%s k_new=%s "
+                                    "diff_k=%s v_pre=%s v_new=%s diff_v=%s "
+                                    "pre_zero=%s k_pre_head=%s k_new_head=%s",
+                                    rid[:8], _kvd_layer,
+                                    "first" if _pidx == 0 else "last",
+                                    _n_phys, _phys,
+                                    _pre_kh, _new_kh, _diff_k,
+                                    _pre_vh, _new_vh, _diff_v,
+                                    _zero_pre_k,
+                                    _pre_k_head, _new_k_head)
                     except Exception as _e_kvd:
                         logger.warning("diag-kv-diff slow failed: %s", _e_kvd)
                 # Scatter: two kernels total for this layer.
                 main_key.index_copy_(0, phys_blocks_dev, k_pages)
                 main_value.index_copy_(0, phys_blocks_dev, v_pages)
+                # ICMS_DIAG_FULLTRACE: per-rid per-layer apply summary
+                # AFTER scatter. Logs the full list of dst phys_blocks
+                # so cross-rid contamination can be detected by simple
+                # set-intersection across rids' logs. For layer 0 we
+                # additionally read back the K bytes at every dst phys
+                # block and SHA them so we can verify the scatter
+                # actually landed correctly (catches an overwrite by a
+                # concurrent scatter from another rid).
+                if _ICMS_FULLTRACE_ENABLED:
+                    try:
+                        import hashlib as _hl_ftap
+                        _layer_idx_ftap = self._extract_layer_idx(layer_name)
+                        _vp_list = list(valid_pids)
+                        _pb_list = phys_blocks_dev.tolist()
+                        _extra_ftap: dict = {
+                            "req_idx": int(req_idx),
+                            "n_valid_pids": int(len(_vp_list)),
+                            "valid_pids_head": _vp_list[:16],
+                            "valid_pids_tail": _vp_list[-16:],
+                            "phys_blocks_head": [int(x) for x in _pb_list[:16]],
+                            "phys_blocks_tail": [int(x) for x in _pb_list[-16:]],
+                            "phys_blocks_full": [int(x) for x in _pb_list[:512]],
+                            "phys_blocks_uniq": int(len(set(int(x) for x in _pb_list))),
+                            "context_pages": int(context_pages),
+                            "effective_groups": int(effective_groups),
+                            "stored_groups": int(getattr(rs, "stored_groups", -1)),
+                            "num_groups_written": int(getattr(
+                                rs, "num_groups_written", -1)),
+                            "seq_len": int(seq_len),
+                            "bt_row_max": int(bt_row_max),
+                            "tp_rank": int(self._tp_rank),
+                        }
+                        if (_layer_idx_ftap == 0
+                                and phys_blocks_dev.numel() > 0):
+                            # Sample first/mid/last dst phys blocks and SHA
+                            # the post-scatter K + V bytes at each.
+                            n_pb = int(phys_blocks_dev.numel())
+                            _idxs = [0]
+                            if n_pb > 1:
+                                _idxs.append(n_pb // 2)
+                            if n_pb > 2:
+                                _idxs.append(n_pb - 1)
+                            samples_ftap: list = []
+                            for _i in _idxs:
+                                _pb = int(phys_blocks_dev[_i].item())
+                                _kfull = main_key[_pb].contiguous().view(
+                                    torch.uint8).cpu().numpy().tobytes()
+                                _vfull = main_value[_pb].contiguous().view(
+                                    torch.uint8).cpu().numpy().tobytes()
+                                samples_ftap.append({
+                                    "scatter_idx": int(_i),
+                                    "src_pid": int(_vp_list[_i])
+                                        if _i < len(_vp_list) else -1,
+                                    "dst_phys_block": _pb,
+                                    "post_scatter_k_sha":
+                                        _hl_ftap.sha1(_kfull).hexdigest()[:16],
+                                    "post_scatter_v_sha":
+                                        _hl_ftap.sha1(_vfull).hexdigest()[:16],
+                                    "post_scatter_k_head8":
+                                        _kfull[:8].hex(),
+                                })
+                            _extra_ftap["post_scatter_samples"] = samples_ftap
+                        _icms_fulltrace(
+                            "apply", rid=rid,
+                            layer=int(_layer_idx_ftap or -1),
+                            **_extra_ftap)
+                    except Exception:
+                        pass
+                # KV provenance: record blocks ICMS just populated.
+                if icms_provenance.is_enabled():
+                    try:
+                        _layer_idx_prov = self._extract_layer_idx(layer_name)
+                        _pb_list = phys_blocks_dev.tolist()
+                        icms_provenance.tracker().record_icms_populated(
+                            rid=rid,
+                            layer_idx=_layer_idx_prov,
+                            block_ids=_pb_list,
+                        )
+                    except Exception:
+                        pass
                 _t4 = _t()
             _lt("after_scatter")
 
@@ -8404,14 +9036,29 @@ class _Worker:
         # the second rid's KV — every rid past the first contributed
         # garbage downstream Score/apply with zeroed sink bytes.
         if self._is_multi_rid_mode() and self._last_step_requests:
-            for batch_idx, prs in enumerate(self._last_step_requests):
+            # 2026-05-12 multi-rid row-mapping fix: prefer the
+            # authoritative `self._rid_to_bt_row` populated from vLLM's
+            # `input_batch.req_ids` (the row order FA actually uses for
+            # bt / seq_lens / qsl). The legacy `enumerate(_last_step_requests)`
+            # order matches meta.requests (new+cached append) which does
+            # NOT match FA when input_batch reorders — pre-fix this read
+            # the wrong rid's K/V at extract for every rid in the batch
+            # whose position differed. See docs/multi_rid_root_cause_2026-05-12.md.
+            for prs in self._last_step_requests:
                 rid_i = prs.request_id
                 if rid_i in self._skip_extract_rids:
                     continue
                 rs_i = self._requests.get(rid_i)
                 if rs_i is None or not rs_i.chain:
                     continue
-                plan.append((rid_i, rs_i, batch_idx))
+                bt_row_idx = self._rid_to_bt_row.get(rid_i)
+                if bt_row_idx is None:
+                    # Pre-fix path: no input_batch ordering plumbed
+                    # through. Fall back to legacy enumerate order.
+                    bt_row_idx = next(
+                        (i for i, p in enumerate(self._last_step_requests)
+                         if p.request_id == rid_i), 0)
+                plan.append((rid_i, rs_i, bt_row_idx))
         else:
             # Legacy single-rid path: first active request, row 0.
             # 2026-05-10 audit fix #19: pick from `_last_step_requests`
@@ -8442,6 +9089,77 @@ class _Worker:
                     break
         if not plan:
             return
+
+        # ICMS_DIAG_FULLTRACE: cross-rid block-table snapshot at L=0.
+        # Dumps every active rid's bt row + seq_len so set-intersection
+        # across rid timelines reveals physical-block aliasing.
+        if _ICMS_FULLTRACE_ENABLED and layer_idx == 0:
+            try:
+                per_rid_rows: list = []
+                for _rid, _rs, _bt_idx in plan:
+                    if hasattr(sl_cpu, '__len__') and len(sl_cpu) > _bt_idx:
+                        _sl = int(sl_cpu[_bt_idx]) if isinstance(
+                            sl_cpu[_bt_idx],
+                            (int, float, torch.Tensor)) else 0
+                    else:
+                        _sl = 0
+                    _nb = (_sl + block_size - 1) // block_size
+                    if bt_cpu.ndim >= 2:
+                        _bts = int(bt_cpu.shape[1])
+                        _nb = min(_nb, _bts)
+                        _bt_row_full = bt_cpu[_bt_idx, :_nb].tolist()
+                    elif bt_cpu.ndim == 1:
+                        _bts = int(bt_cpu.shape[0])
+                        _nb = min(_nb, _bts)
+                        _bt_row_full = bt_cpu[:_nb].tolist()
+                    else:
+                        _bt_row_full = []
+                    per_rid_rows.append({
+                        "rid": str(_rid),
+                        "bt_row_idx": int(_bt_idx),
+                        "seq_len": int(_sl),
+                        "num_blocks": int(_nb),
+                        "chain_len": int(
+                            len(_rs.chain) if _rs.chain else 0),
+                        "stored_groups": int(getattr(
+                            _rs, "stored_groups", -1)),
+                        "num_groups_written": int(getattr(
+                            _rs, "num_groups_written", -1)),
+                        "bt_row_first16": [int(x)
+                                             for x in _bt_row_full[:16]],
+                        "bt_row_last4": [int(x)
+                                           for x in _bt_row_full[-4:]],
+                        "bt_row_full": [int(x) for x in _bt_row_full[:2048]],
+                    })
+                # Cross-rid intersection counts: for each pair (i, j),
+                # count how many phys blocks they share.
+                _bts_per_rid = [set(int(x) for x in r["bt_row_full"])
+                                 for r in per_rid_rows]
+                _bts_per_rid_full = []
+                for r in per_rid_rows:
+                    _bts_per_rid_full.append(set(int(x) for x in
+                                                  r["bt_row_full"]))
+                pair_intersections: list = []
+                for i in range(len(per_rid_rows)):
+                    for j in range(i + 1, len(per_rid_rows)):
+                        _inter = _bts_per_rid_full[i] & _bts_per_rid_full[j]
+                        pair_intersections.append({
+                            "i_rid": per_rid_rows[i]["rid"],
+                            "j_rid": per_rid_rows[j]["rid"],
+                            "intersection_count": int(len(_inter)),
+                            "intersection_head": sorted(list(_inter))[:8],
+                        })
+                _icms_fulltrace(
+                    "iter_bt_snapshot", rid="", layer=int(layer_idx),
+                    n_rids=len(per_rid_rows),
+                    per_rid=per_rid_rows,
+                    pair_intersections=pair_intersections,
+                    bt_shape=list(bt_cpu.shape) if hasattr(bt_cpu, 'shape')
+                        else [],
+                    skip_extract_rids=sorted(list(self._skip_extract_rids)),
+                )
+            except Exception:
+                pass
 
         # Process each rid's new blocks. At TP>1, AllGather fires once
         # per rid (per layer); both ranks iterate plan in identical
@@ -8751,6 +9469,57 @@ class _Worker:
         rs._recorded_blocks[recorded_key] = len(req_block_ids)
         self.stats.record_extract(
             (time.perf_counter() - t0) * 1e6, len(valid_ids))
+        # ICMS_DIAG_FULLTRACE: per-rid per-layer extract summary. Layer 0
+        # also emits first/last/sample K+V SHAs over the extracted batch
+        # so we can cross-reference Phase 1 against what comes back at
+        # apply time.
+        if _ICMS_FULLTRACE_ENABLED:
+            try:
+                import hashlib as _hl_ft
+                extra: dict = {
+                    "bt_row_idx": int(bt_row_idx),
+                    "seq_len": int(seq_len),
+                    "num_blocks": int(num_blocks),
+                    "effective_start": int(effective_start),
+                    "stored_blocks": int(stored_blocks),
+                    "n_valid": int(len(valid_ids)),
+                    "valid_ids_head": [int(x) for x in valid_ids[:8]],
+                    "valid_ids_tail": [int(x) for x in valid_ids[-8:]],
+                    "req_block_ids_head": [int(x)
+                                             for x in req_block_ids[:8]],
+                    "req_block_ids_tail": [int(x)
+                                             for x in req_block_ids[-8:]],
+                    "num_groups_written": int(rs.num_groups_written),
+                    "stored_groups": int(rs.stored_groups),
+                    "chain_len": int(len(rs.chain) if rs.chain else 0),
+                }
+                if layer_idx == 0 and len(valid_ids) > 0:
+                    samples: list = []
+                    _idxs = [0]
+                    if len(valid_ids) > 1:
+                        _idxs.append(len(valid_ids) // 2)
+                    if len(valid_ids) > 2:
+                        _idxs.append(len(valid_ids) - 1)
+                    for _i in _idxs:
+                        _kbi = k_batch[_i].contiguous().view(
+                            torch.uint8).numpy().tobytes()
+                        _vbi = v_batch[_i].contiguous().view(
+                            torch.uint8).numpy().tobytes()
+                        samples.append({
+                            "intra_idx": int(effective_start + _i),
+                            "phys_block": int(req_block_ids[
+                                effective_start + _i])
+                                if effective_start + _i < len(
+                                    req_block_ids) else -1,
+                            "k_sha": _hl_ft.sha1(_kbi).hexdigest()[:16],
+                            "v_sha": _hl_ft.sha1(_vbi).hexdigest()[:16],
+                            "k_head8": _kbi[:8].hex(),
+                        })
+                    extra["samples"] = samples
+                _icms_fulltrace("extract", rid=rid, layer=int(layer_idx),
+                                **extra)
+            except Exception:
+                pass
 
     @staticmethod
     def _parse_layer_idx(layer_name: str) -> int | None:
@@ -9332,6 +10101,26 @@ class _Worker:
         # bookkeeping bump, so it should fire whether or not the RPC
         # succeeded so timing histograms stay representative.
         self.stats.record_flush((time.perf_counter() - t0) * 1e6)
+        # ICMS_DIAG_FULLTRACE: emit per-flush summary so we can see exactly
+        # which (rid, group_idx) made it to the server (locally) before
+        # the deferred TP broadcast.
+        if _ICMS_FULLTRACE_ENABLED:
+            try:
+                _icms_fulltrace(
+                    "flush_group", rid=request_id,
+                    group_idx=int(group_idx),
+                    ok_local=bool(ok_local),
+                    partial=bool(partial),
+                    pages=int(pages),
+                    chain_prefix_len=int(len(chain_prefix)),
+                    chain_prefix_head=[int(x) for x in chain_prefix[:4]],
+                    chain_prefix_tail=[int(x) for x in chain_prefix[-4:]],
+                    chain_fp=_icms_chain_fp(list(chain_prefix)),
+                    num_groups_written_pre=int(rs.num_groups_written),
+                    flushed_local_pre=int(getattr(rs, "flushed_local", -1)),
+                )
+            except Exception:
+                pass
 
         # 2026-05-09 N2 deferral: instead of running `_tp_broadcast_bool`
         # inline (which is a NCCL op on the TP comm and races iter N+1's

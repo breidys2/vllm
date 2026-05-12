@@ -3587,7 +3587,10 @@ class GPUModelRunner(
                 skip_compiled=has_encoder_input,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
-            self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
+            self.maybe_get_kv_connector_output(
+                scheduler_output,
+                input_batch_req_ids=list(self.input_batch.req_ids),
+            ) as kv_connector_output,
         ):
             model_output = self._model_forward(
                 input_ids=input_ids,
