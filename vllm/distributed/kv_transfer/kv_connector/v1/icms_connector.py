@@ -985,6 +985,21 @@ class _RequestState:
     # untouched) when ICMS_ORIGINAL_QUEST is unset — no impact on the
     # default path. See quest_local_scorer.py.
     quest_gpu_summaries: dict = field(default_factory=dict)
+    # ICMS_DIAG_SCORE_DUMP only: per-(scored layer) Q tensor snapshot,
+    # captured inside _score_one_request and used by on_request_finished
+    # to write a complete (q + kmin/kmax + picked_page_ids) bundle for
+    # offline alt-scoring analysis. The per-layer .pt file written at
+    # Score time has q + picked but no kmin/kmax (extract_and_record
+    # hasn't run yet); the per-rid summaries .pt has kmin/kmax but no q
+    # — so we stash q here at Score time and join on rid in the
+    # summaries dump. Empty when ICMS_DIAG_SCORE_DUMP is unset.
+    last_q_by_layer: dict = field(default_factory=dict)
+    # ICMS_DIAG_SCORE_DUMP only: per-(scored layer) Score reply snapshot
+    # — what page IDs Score returned and what scores it gave them.
+    # Stashed alongside last_q_by_layer so the per-rid summaries dump
+    # bundles {q, kmin, kmax, picked, server_scores} per layer.
+    last_picked_by_layer: dict = field(default_factory=dict)
+    last_scores_by_layer: dict = field(default_factory=dict)
     # M4: once a decode-mode Score reply yields 0 net-new pages for any
     # stride group, the bitmap is effectively saturated — flip the
     # request into dense mode and skip all further Score RPCs / Quest
@@ -1266,6 +1281,12 @@ class IcmsConnector(KVConnectorBase_V1):
         # checked as a fallback for shell-based benches.
         self._fetch_all_post_score: bool = bool(
             extra.get("fetch_all_post_score", False))
+        # Sparse-prefill + dense-decode: Score's K-page picks ARE applied
+        # during prefill (unlike FAPS, which discards them), then a single
+        # FetchAll fires at the prefill→decode transition so decode attends
+        # over all N pages. Mutually exclusive with fetch_all_post_score.
+        self._sparse_prefill_dense_decode: bool = bool(
+            extra.get("sparse_prefill_dense_decode", False))
         # B1 (2026-05-05): sink-size multiplier for concurrent in-flight
         # Score / FetchAll RPCs. Today the server allocates sink offsets
         # internally, so the connector's only job is to register a sink
@@ -1372,6 +1393,8 @@ class IcmsConnector(KVConnectorBase_V1):
                 gpu_direct=self._gpu_direct,
                 gpu_device=self._gpu_device,
                 fetch_all_post_score=self._fetch_all_post_score,
+                sparse_prefill_dense_decode=
+                    self._sparse_prefill_dense_decode,
                 shmem_name=self._shmem_name,
                 sink_slots=self._sink_slots,
                 local_gpu_direct=self._local_gpu_direct,
@@ -2228,6 +2251,7 @@ class _Worker:
                  gpu_direct: bool = False,
                  gpu_device: str = "cuda:0",
                  fetch_all_post_score: bool = False,
+                 sparse_prefill_dense_decode: bool = False,
                  shmem_name: str = "",
                  sink_slots: int = 1,
                  local_gpu_direct: bool = False):
@@ -2261,11 +2285,27 @@ class _Worker:
         self._fetch_all_post_score: bool = (
             bool(fetch_all_post_score)
             or os.environ.get("ICMS_FETCH_ALL_POST_SCORE") == "1")
+        # Sparse-prefill + dense-decode variant. Unlike FAPS, Score's
+        # K-page picks ARE applied during prefill; FetchAll fires once
+        # at the prefill→decode transition so decode goes dense.
+        # Mutually exclusive with fetch_all_post_score above.
+        self._sparse_prefill_dense_decode: bool = (
+            bool(sparse_prefill_dense_decode)
+            or os.environ.get("ICMS_SPARSE_PREFILL_DENSE_DECODE") == "1")
+        if (self._fetch_all_post_score
+                and self._sparse_prefill_dense_decode):
+            raise ValueError(
+                "fetch_all_post_score and sparse_prefill_dense_decode "
+                "are mutually exclusive; pass at most one.")
         logger.info(
             "[icms-init] _Worker init: fetch_all_post_score=%s "
-            "(extra_config=%s, env=%r)",
-            self._fetch_all_post_score, fetch_all_post_score,
-            os.environ.get("ICMS_FETCH_ALL_POST_SCORE"))
+            "sparse_prefill_dense_decode=%s "
+            "(extra_config=%s/%s, env=%r/%r)",
+            self._fetch_all_post_score,
+            self._sparse_prefill_dense_decode,
+            fetch_all_post_score, sparse_prefill_dense_decode,
+            os.environ.get("ICMS_FETCH_ALL_POST_SCORE"),
+            os.environ.get("ICMS_SPARSE_PREFILL_DENSE_DECODE"))
         # Bug 11 family verification (2026-04-30): bf16 byte round-trip
         # self-test. record_page writes raw bytes via view(uint8); apply
         # reads back via view(model_dtype). If pytorch's reinterpret
@@ -4309,10 +4349,12 @@ class _Worker:
                     # under multi-rid batched mode → wrong K-similarity
                     # in Score → wrong page selection → slot N fails
                     # deterministically. See docs/multi_rid_root_cause_2026-05-12.md.
-                    if self._rid_to_bt_row:
+                    _rid_to_bt_row_qsl = (
+                        getattr(self, "_rid_to_bt_row", None) or {})
+                    if _rid_to_bt_row_qsl:
                         for step_req in connector_meta.requests:
                             rid = step_req.request_id
-                            fa_idx = self._rid_to_bt_row.get(rid)
+                            fa_idx = _rid_to_bt_row_qsl.get(rid)
                             if fa_idx is None or fa_idx + 1 >= _qsl.numel():
                                 continue
                             start = int(_qsl[fa_idx].item())
@@ -4529,6 +4571,7 @@ class _Worker:
         #
         # Cost: one extra RPC per scoring boundary at layer 0 only —
         # subsequent boundaries early-return on rs._fetch_all_complete.
+        #
         if self._fetch_all_post_score:
             if os.environ.get("ICMS_DIAG_FAPS") == "1":
                 logger.info(
@@ -5587,6 +5630,108 @@ class _Worker:
                 next_layer_idx,
                 scores=list(reply.scores),
             )
+            # ICMS_DIAG_SCORE_DUMP=<dir>: dump Q + per-page kmin/kmax
+            # summaries + server-picked page IDs + per-page scores so the
+            # user can replay alternate scoring algorithms offline without
+            # re-running the bench. Runs in the regular sparse path (not
+            # ICMS_ORIGINAL_QUEST); summaries come from record_page which
+            # now also populates them under this flag (see ~line 9794).
+            # Per-process file cap via ICMS_DIAG_SCORE_DUMP_LIMIT (default
+            # 256) so a multi-task/multi-budget run can't fill disk.
+            # Rank-gated to tp_rank==0 since per-rank KV-head slicing
+            # makes cross-rank summaries hard to reconstruct offline.
+            _dump_dir = os.environ.get("ICMS_DIAG_SCORE_DUMP", "")
+            if _dump_dir and int(self._tp_rank) == 0:
+                # Always stash q for this (rid, layer) so the per-rid
+                # summaries dump (in on_request_finished) can join q
+                # with the kmin/kmax that record_page populates AFTER
+                # the forward pass completes. Independent of the
+                # per-layer file write below — even when that's
+                # skipped (cap hit, exception, etc.), the q stash
+                # still gives us complete data via the summaries dump.
+                # This is the 2026-05-14 fix for the "rid=1 had layer
+                # dumps but other rids didn't" data-collection bug.
+                if isinstance(quest_query, torch.Tensor):
+                    try:
+                        rs.last_q_by_layer[int(next_layer_idx)] = (
+                            quest_query.detach().cpu())
+                    except Exception as _e_qstash:
+                        logger.warning(
+                            "[icms_diag_score_dump] q-stash failed "
+                            "layer=%d rid=%s: %s",
+                            next_layer_idx, rid, _e_qstash)
+                # Also stash Score reply contents per layer — picked
+                # page IDs and the server's score for each, so the
+                # per-rid summaries dump has complete data even when
+                # the per-layer .pt write fails for some rids.
+                try:
+                    rs.last_picked_by_layer[int(next_layer_idx)] = [
+                        int(p) for p in reply.page_ids]
+                    rs.last_scores_by_layer[int(next_layer_idx)] = (
+                        [float(s) for s in reply.scores]
+                        if reply.scores is not None else [])
+                except Exception as _e_picked:
+                    logger.warning(
+                        "[icms_diag_score_dump] picked-stash failed "
+                        "layer=%d rid=%s: %s",
+                        next_layer_idx, rid, _e_picked)
+                try:
+                    _limit = int(os.environ.get(
+                        "ICMS_DIAG_SCORE_DUMP_LIMIT", "256"))
+                except ValueError:
+                    _limit = 256
+                _n_dumped = getattr(self, "_diag_score_dump_n", 0)
+                if _n_dumped < _limit:
+                    try:
+                        import os as _os
+                        _os.makedirs(_dump_dir, exist_ok=True)
+                        _per_layer = rs.quest_gpu_summaries.get(
+                            next_layer_idx)
+                        if _per_layer:
+                            _items = sorted(_per_layer, key=lambda t: t[0])
+                            _items = _items[:total_pages]
+                            _kmin = torch.stack(
+                                [m for _, m, _ in _items], dim=0)
+                            _kmax = torch.stack(
+                                [m for _, _, m in _items], dim=0)
+                            _abs_pids = [int(p) for p, _, _ in _items]
+                        else:
+                            _kmin = None
+                            _kmax = None
+                            _abs_pids = []
+                        _safe_rid = str(rid).replace("/", "_")
+                        _path = _os.path.join(
+                            _dump_dir,
+                            f"{_safe_rid}_layer{next_layer_idx:02d}.pt")
+                        _payload = {
+                            "rid": str(rid),
+                            "layer": int(next_layer_idx),
+                            "q": (quest_query.detach().cpu()
+                                  if isinstance(quest_query, torch.Tensor)
+                                  else None),
+                            "kmin": (_kmin.detach().cpu()
+                                     if _kmin is not None else None),
+                            "kmax": (_kmax.detach().cpu()
+                                     if _kmax is not None else None),
+                            "summary_abs_pids": _abs_pids,
+                            "total_pages": int(total_pages),
+                            "k": int(k),
+                            "budget": float(effective_budget),
+                            "picked_page_ids": [int(p) for p in
+                                                reply.page_ids],
+                            "server_scores": [float(s) for s in
+                                              reply.scores]
+                                if reply.scores is not None else [],
+                            "tp_rank": int(self._tp_rank),
+                            "tp_size": int(self._tp_size),
+                        }
+                        torch.save(_payload, _path)
+                        self._diag_score_dump_n = _n_dumped + 1
+                    except Exception as _e:
+                        logger.warning(
+                            "[icms_diag_score_dump] save failed at "
+                            "layer %d rid=%s: %s",
+                            next_layer_idx, rid, _e)
             # M2: prime the decode-mode fetched-pages set for this
             # stride group. After prefill completes this dict will hold
             # exactly the pages on host (per scored layer); M3 reads it
@@ -5886,6 +6031,33 @@ class _Worker:
             picked = []
         wall_us = (time.perf_counter() - t0) * 1e6
 
+        # ICMS_DIAG_SCORE_DUMP=<dir>: dump Q + per-page min/max summaries
+        # + picked page IDs per (rid, scored layer) so the user can replay
+        # different scoring algorithms offline without re-running the bench.
+        _dump_dir = os.environ.get("ICMS_DIAG_SCORE_DUMP", "")
+        if _dump_dir:
+            try:
+                import os as _os
+                _os.makedirs(_dump_dir, exist_ok=True)
+                _safe_rid = str(rid).replace("/", "_")
+                _path = _os.path.join(
+                    _dump_dir, f"{_safe_rid}_layer{next_layer_idx:02d}.pt")
+                torch.save({
+                    "rid": str(rid),
+                    "layer": int(next_layer_idx),
+                    "q": quest_query.detach().cpu(),
+                    "kmin": kmin.detach().cpu(),
+                    "kmax": kmax.detach().cpu(),
+                    "total_pages": int(total_pages),
+                    "k": int(k),
+                    "budget": float(budget),
+                    "picked": list(picked),
+                    "already_fetched": list(already_fetched) if already_fetched else [],
+                }, _path)
+            except Exception as _e:
+                logger.warning("[icms_diag_score_dump] save failed at "
+                               "layer %d rid=%s: %s", next_layer_idx, rid, _e)
+
         rs.fetched_pages.setdefault(next_layer_idx, set()).update(picked)
         # Match the existing Score-stats shape so downstream tooling
         # doesn't have to special-case the Quest path.
@@ -5905,23 +6077,71 @@ class _Worker:
         sink or None if the underlying client doesn't have a working
         register_sink() (RDMA / shmem clients differ — for those the
         per-head pipeline is not supported in v1).
+
+        2026-05-14 sink-id-collision fix: when the main sink is CUDA-IPC
+        (``self._local_gpu_direct``), the shmem ``register_sink`` would
+        return sink_id=1, which COLLIDES with the CUDA-IPC main sink's
+        own sink_id=1 — the two server-side registries have INDEPENDENT
+        ``next_id_`` counters (sink_registry.h:77 and
+        cuda_ipc_sink_registry.h:124, both start at 1). The server's
+        sink lookup chain (handlers_per_head.cc:593-616) tries the
+        shmem registry FIRST, so ``fetch_union_per_head(sink_id=1)``
+        resolves to the SHMEM SUMMARY sink (small) instead of the
+        intended CUDA-IPC main sink (large) — ENOMEM at any union
+        whose KV bytes exceed the summary sink's capacity, AND silent
+        data corruption when the write fits (pages land in summary
+        shmem, but apply path reads from the CUDA-IPC GPU sink).
+
+        Fix: when ``_local_gpu_direct`` is True, register the summary
+        sink as a CUDA-IPC sink too. Both sinks then live in the
+        ``cuda_ipc_sinks_`` registry with sequential IDs (1 and 2),
+        and the shmem registry stays empty — server lookup falls
+        through to the cuda_ipc_sinks_ registry cleanly.
         """
         if self._client is None or self._geom is None or total_pages <= 0:
             return None
-        needed = int(total_pages) * int(self._geom.summary_page_bytes)
+        # Worst-case sizing: the same sink_id may be presented to
+        # FetchUnionPerHead if any sink-id-routing ambiguity persists,
+        # AND a future server change could conceivably reuse the
+        # summaries sink for a union dump. Size for max(summaries
+        # bytes, worst-case union bytes) so the assertion at
+        # handlers_per_head.cc:735 cannot fire on either RPC.
+        #
+        # Summaries:  total_pages * summary_page_bytes
+        # Worst-case union (single layer): total_pages * kv_page_bytes
+        #   (the union is bounded by total_pages — even if per-head
+        #   top-k overlaps zero, the union can't exceed the chain).
+        summary_needed = int(total_pages) * int(
+            self._geom.summary_page_bytes)
+        union_worst   = int(total_pages) * int(self._geom.kv_page_bytes)
+        needed = max(summary_needed, union_worst)
         existing = getattr(self, "_per_head_summary_sink", None)
         capacity = getattr(self, "_per_head_summary_sink_capacity", 0)
         if existing is not None and capacity >= needed:
             return existing
+        new_size = max(needed * 2, 64 * 1024)
+        use_cuda_ipc = bool(getattr(self, "_local_gpu_direct", False))
         try:
-            new_size = max(needed * 2, 64 * 1024)
             with self._rpc_lock:  # X1 (race-audit): serialize tx_/rx_
-                new_sink = self._client.register_sink(new_size)
+                if use_cuda_ipc:
+                    # Pin to the same GPU as the main CUDA-IPC sink so the
+                    # server's per-thread CUDA context binding stays
+                    # consistent across summary and union RPCs.
+                    gpu_dev = self._gpu_device
+                    if self._tp_size > 1:
+                        try:
+                            gpu_dev = f"cuda:{int(torch.cuda.current_device())}"
+                        except Exception:
+                            gpu_dev = f"cuda:{self._tp_rank}"
+                    new_sink = self._client.register_cuda_ipc_sink(
+                        new_size, gpu_dev)
+                else:
+                    new_sink = self._client.register_sink(new_size)
         except Exception as e:
             logger.warning(
                 "[icms_quest_per_head] could not allocate summaries "
-                "sink (size=%d, total_pages=%d): %r",
-                needed, total_pages, e)
+                "sink (size=%d, total_pages=%d, cuda_ipc=%s): %r",
+                needed, total_pages, use_cuda_ipc, e)
             return None
         if existing is not None:
             try:
@@ -5932,6 +6152,12 @@ class _Worker:
                 pass
         self._per_head_summary_sink = new_sink
         self._per_head_summary_sink_capacity = new_size
+        logger.info(
+            "[icms_quest_per_head] (re)allocated summary sink: "
+            "size=%d bytes (summary_needed=%d, union_worst=%d, "
+            "total_pages=%d) cuda_ipc=%s",
+            new_size, summary_needed, union_worst, total_pages,
+            use_cuda_ipc)
         return new_sink
 
     def _quest_per_kv_head_score_one_layer(self, rid, rs, req_idx,
@@ -6045,33 +6271,65 @@ class _Worker:
         # sum_reply.sink_offsets[0]. One bulk slice instead of P
         # per-page memcpys — the loop was the dominant Python cost
         # at long context (P × spb bytes; ~64 MB/layer at qwen3 128K).
-        view = sum_sink.view()
         slot_base = int(sum_reply.sink_offsets[0])
         total_bytes = P * spb
-        # Defensive: confirm contiguity. If a future server-side layout
-        # change ever breaks the dense [slot_base, slot_base+P*spb)
-        # invariant, fall back to per-page rather than silently
-        # scrambling KV. The compare loop is O(P) ints — noise vs the
-        # avoided memcpy.
-        if all(int(sum_reply.sink_offsets[i]) == slot_base + i * spb
-                for i in range(P)):
-            host_bytes = bytes(view[slot_base:slot_base + total_bytes])
-        else:
-            logger.warning(
-                "[icms_quest_per_head] sink_offsets are non-contiguous "
-                "(server-side layout change?); falling back to per-page "
-                "memcpy.")
-            host_buf = bytearray(total_bytes)
-            for i, off in enumerate(sum_reply.sink_offsets):
-                host_buf[i * spb:(i + 1) * spb] = bytes(view[off:off + spb])
-            host_bytes = bytes(host_buf)
-        # `host_bytes` is immutable so torch.frombuffer can wrap it
-        # without copying; .to(device) is the single H2D copy.
-        flat_cpu = torch.frombuffer(host_bytes, dtype=torch.float16,
-                                      count=P * 2 * H_kv * D).reshape(
-            P, 2, H_kv, D)
+        contiguous = all(
+            int(sum_reply.sink_offsets[i]) == slot_base + i * spb
+            for i in range(P))
         device = quest_query.device if quest_query.is_cuda else "cuda"
-        flat_gpu = flat_cpu.to(device=device, non_blocking=True)
+        # 2026-05-14 sink-id-collision fix: when sum_sink is a CUDA-IPC
+        # sink (the `_local_gpu_direct` path), the bytes are already on
+        # the GPU — slice directly instead of D2H→host_bytes→H2D.
+        if getattr(sum_sink, "is_gpu_direct", False):
+            gpu_tensor = getattr(sum_sink, "gpu_tensor", None)
+            if gpu_tensor is None:
+                logger.warning(
+                    "[icms_quest_per_head] GPU-IPC summary sink missing "
+                    "gpu_tensor; aborting layer %d", next_layer_idx)
+                return
+            if contiguous:
+                flat_u8 = gpu_tensor[
+                    slot_base:slot_base + total_bytes]
+            else:
+                logger.warning(
+                    "[icms_quest_per_head] sink_offsets are non-contiguous "
+                    "(server-side layout change?); falling back to per-page "
+                    "D2D memcpy.")
+                flat_u8 = torch.empty(total_bytes, dtype=torch.uint8,
+                                      device=gpu_tensor.device)
+                for i, off in enumerate(sum_reply.sink_offsets):
+                    flat_u8[i * spb:(i + 1) * spb] = \
+                        gpu_tensor[off:off + spb]
+            # uint8 → fp16 view (zero-copy reinterpret) → reshape.
+            flat_gpu = flat_u8.view(torch.float16).reshape(
+                P, 2, H_kv, D)
+            # Ensure on the query's device (typically same as gpu_tensor's).
+            if flat_gpu.device != torch.device(device):
+                flat_gpu = flat_gpu.to(device=device, non_blocking=True)
+        else:
+            view = sum_sink.view()
+            # Defensive: confirm contiguity. If a future server-side layout
+            # change ever breaks the dense [slot_base, slot_base+P*spb)
+            # invariant, fall back to per-page rather than silently
+            # scrambling KV. The compare loop is O(P) ints — noise vs the
+            # avoided memcpy.
+            if contiguous:
+                host_bytes = bytes(view[slot_base:slot_base + total_bytes])
+            else:
+                logger.warning(
+                    "[icms_quest_per_head] sink_offsets are non-contiguous "
+                    "(server-side layout change?); falling back to per-page "
+                    "memcpy.")
+                host_buf = bytearray(total_bytes)
+                for i, off in enumerate(sum_reply.sink_offsets):
+                    host_buf[i * spb:(i + 1) * spb] = bytes(view[off:off + spb])
+                host_bytes = bytes(host_buf)
+            # `host_bytes` is immutable so torch.frombuffer can wrap it
+            # without copying; .to(device) is the single H2D copy.
+            flat_cpu = torch.frombuffer(host_bytes, dtype=torch.float16,
+                                          count=P * 2 * H_kv * D).reshape(
+                P, 2, H_kv, D)
+            flat_gpu = flat_cpu.to(device=device, non_blocking=True)
         kmin = flat_gpu[:, 0, :, :].contiguous()
         kmax = flat_gpu[:, 1, :, :].contiguous()
 
@@ -6573,9 +6831,10 @@ class _Worker:
             # `input_batch.req_ids`. Pre-fix this rebuild used the SAME
             # `_last_step_requests` enumeration as the buggy source, so
             # it didn't actually fix the cross-rid contamination it was
-            # written to fix.
-            if self._rid_to_bt_row:
-                _live_rid_to_req_idx = dict(self._rid_to_bt_row)
+            # written to fix. `getattr` keeps access safe for mocks.
+            _rid_to_bt_row_safe = getattr(self, "_rid_to_bt_row", None) or {}
+            if _rid_to_bt_row_safe:
+                _live_rid_to_req_idx = dict(_rid_to_bt_row_safe)
             elif self._last_step_requests:
                 for _live_idx, _prs in enumerate(self._last_step_requests):
                     _live_rid_to_req_idx[_prs.request_id] = _live_idx
@@ -8504,6 +8763,7 @@ class _Worker:
             # Nothing to extract — still flip the prefill_done flag.
             if not self._prefill_done:
                 self._reset_apply_caches_for_prefill_done()
+                self._spdd_fire_one_shot_fetch_all()
                 self._prefill_done = True
                 logger.info("Prefill done. Switching to dense decode.")
             return
@@ -8658,6 +8918,7 @@ class _Worker:
 
         if not self._prefill_done:
             self._reset_apply_caches_for_prefill_done()
+            self._spdd_fire_one_shot_fetch_all()
             self._prefill_done = True
             logger.info("Prefill done. Switching to dense decode.")
 
@@ -8753,6 +9014,89 @@ class _Worker:
                     sm_first, sm_last, msk_local, nat_local)
         except Exception as _e:
             logger.warning("[diag-postflip] snapshot failed: %r", _e)
+
+    def _spdd_fire_one_shot_fetch_all(self):
+        """Sparse-prefill + dense-decode (SPDD): at the prefill→decode
+        boundary, fire ONE FetchAll per active rid covering all 48
+        layers. The reply populates `_pending_scores[layer 0]` and
+        `_pending_reuse[layer 1..47]` with full N-page entries (same
+        wire-shape and apply path as the existing per-scoring-boundary
+        FAPS). Decode iter 1's wait_for_layer at L=0 then consumes the
+        Score entry and the FAPS reuse machinery propagates per-layer
+        for L=1..47, so all 48 layers' main_key gets uniformly
+        sink-routed bytes scattered across all N positions. Decode
+        attends over uniform bytes — no source mixing.
+        Subsequent scoring boundaries in decode iter 1 hit the natural
+        dense_mode flip at _score_one_request L4733-4748 (FAPS-saturated
+        rs.fetched_pages → flip threshold met → return early), so Quest
+        hook short-circuits in decode iter 2+ and decode runs purely
+        natural-bt thereafter.
+        No-op when the SPDD flag is unset, so non-SPDD paths
+        (sparse Quest, real FAPS, dense baseline) are byte-identical."""
+        if not self._sparse_prefill_dense_decode:
+            return
+        if not self._requests:
+            return
+        # Build (req_idx, rid, rs) using `_last_step_requests` order
+        # (= scheduler-meta batch order, set at on_step_start L3305).
+        # This matches vLLM's authoritative batch-slot index so req_idx
+        # aligns with _rid_to_bt_row[rid] in apply. At max_num_seqs=1
+        # both orderings collapse to req_idx=0; multi-rid SPDD needs
+        # the meta-driven order to avoid wrong-bt-row apply (silent KV
+        # corruption). Per the 2026-05-14 parallel-agent audit.
+        # Falls back to enumerate(_requests) when _last_step_requests
+        # is empty (rare; e.g., transient state during connector startup).
+        _last_step = getattr(self, "_last_step_requests", None)
+        requests_to_fetch = []
+        if _last_step:
+            for req_idx, step_req in enumerate(_last_step):
+                rid = step_req.request_id
+                rs = self._requests.get(rid)
+                if rs is not None and rs.chain:
+                    requests_to_fetch.append((req_idx, rid, rs))
+        if not requests_to_fetch:
+            for req_idx, (rid, rs) in enumerate(self._requests.items()):
+                if rs.chain:
+                    requests_to_fetch.append((req_idx, rid, rs))
+        if not requests_to_fetch:
+            return
+        # 2026-05-14 v4 SPDD: fire FAPS at next_layer_idx=0 so the reply
+        # populates _pending_scores[0] + _pending_reuse[1..47] and apply
+        # runs at EVERY layer in decode iter 1 — uniform sink bytes
+        # everywhere (the same coverage shape as real FAPS produces by
+        # firing per-scoring-boundary during prefill).
+        #
+        # Sink-sizing requirement: the connector sizes the sink as
+        # `_k * num_layers * page_bytes`. FAPS at L=0 with reuse_through
+        # =num_layers-1 needs `total_pages * num_layers * page_bytes`
+        # of sink space. If `total_pages > _k`, the server returns
+        # ENOSPC ("Score failed status=4294967268"). Empirical: h32k
+        # haystacks can produce total_pages up to ~2200 (max_context
+        # 35K / 16-page-size). Bump --icms-k accordingly in the SPDD
+        # launcher (rule of thumb: --icms-k >= max_context_tokens / 16
+        # × 1.05). This also benefits the sparse Quest path's k-pages
+        # cap (no harm; just oversizes the sink buffer).
+        first_layer = 0
+        for req_idx, rid, rs in requests_to_fetch:
+            try:
+                self._fetch_all_one_request(
+                    rid=rid, rs=rs, req_idx=req_idx,
+                    next_layer_idx=first_layer,
+                    budget=1.0,
+                    stats=self.stats)
+                logger.info(
+                    "[icms] sparse_prefill_dense_decode: one-shot "
+                    "FetchAll fired rid=%s layer=%d at prefill→decode "
+                    "boundary", rid, first_layer)
+            except Exception:
+                logger.exception(
+                    "sparse_prefill_dense_decode: one-shot FetchAll "
+                    "failed for rid=%s; decode will fall back to "
+                    "vLLM's natural K/V (which is correct under SPDD "
+                    "since prefill already populated native K/V via "
+                    "reshape_and_cache, but loses the sink-byte "
+                    "uniformity invariant — accuracy may degrade).",
+                    rid)
 
     def _reset_apply_caches_for_prefill_done(self):
         """Bug 11 (2026-04-29) audit fix #1: invalidate per-rs apply
@@ -9044,6 +9388,9 @@ class _Worker:
             # NOT match FA when input_batch reorders — pre-fix this read
             # the wrong rid's K/V at extract for every rid in the batch
             # whose position differed. See docs/multi_rid_root_cause_2026-05-12.md.
+            # `getattr` keeps the access safe for callers (tests, mocks)
+            # that don't initialize the attribute.
+            _rid_to_bt_row = getattr(self, "_rid_to_bt_row", None) or {}
             for prs in self._last_step_requests:
                 rid_i = prs.request_id
                 if rid_i in self._skip_extract_rids:
@@ -9051,7 +9398,7 @@ class _Worker:
                 rs_i = self._requests.get(rid_i)
                 if rs_i is None or not rs_i.chain:
                     continue
-                bt_row_idx = self._rid_to_bt_row.get(rid_i)
+                bt_row_idx = _rid_to_bt_row.get(rid_i)
                 if bt_row_idx is None:
                     # Pre-fix path: no input_batch ordering plumbed
                     # through. Fall back to legacy enumerate order.
@@ -9667,12 +10014,14 @@ class _Worker:
             s_off = rank * geom.summary_group_bytes + page_in_group * spb
             buf.summary_blob[s_off:s_off + len(summary_bytes)] = summary_bytes
 
-        # ICMS_ORIGINAL_QUEST: also retain GPU-side per-(KV-head) summaries
-        # for *every* layer (not just scored ones), shape [num_kv_heads,
-        # head_dim] fp16, indexed by absolute page id. Used by the local
-        # Quest scorer in lieu of the BF2-side summary store. Gated by env
-        # so the default path is byte-identical when unset.
-        if os.environ.get("ICMS_ORIGINAL_QUEST", "0") == "1":
+        # Retain GPU-side per-(KV-head) summaries (shape [num_kv_heads,
+        # head_dim] fp16, indexed by absolute page id) when EITHER:
+        #   ICMS_ORIGINAL_QUEST=1   — local Quest scorer path
+        #   ICMS_DIAG_SCORE_DUMP=<> — regular sparse path dump for offline
+        #                            scoring-algo analysis (added 2026-05-14)
+        # Default path is byte-identical when both envs are unset.
+        if (os.environ.get("ICMS_ORIGINAL_QUEST", "0") == "1"
+                or os.environ.get("ICMS_DIAG_SCORE_DUMP", "")):
             keys_gpu = key_block.detach()
             if keys_gpu.ndim == 3:
                 # [block_size, num_kv_heads, head_dim] → reduce over tokens
@@ -10324,6 +10673,71 @@ class _Worker:
             with _rs.flush_cond:
                 _rs.flush_seq += 1
                 _rs.flush_cond.notify_all()
+        # ICMS_DIAG_SCORE_DUMP: save per-(rid) summary snapshot for
+        # offline replay of alternate scoring algorithms. Pairs with the
+        # per-(rid, layer) Q+picked_pages dumps written during Score
+        # (~line 5592). quest_gpu_summaries is populated by record_page
+        # under the same env gate (~line 9864). Score fires mid-forward-
+        # pass before extract_and_record (end-of-pass) populates summaries
+        # for the current chunk, so the per-Score `kmin/kmax` fields can
+        # be empty even when this final snapshot has full data. Offline
+        # consumer reads BOTH files and cross-references by (rid, layer).
+        _dump_dir = os.environ.get("ICMS_DIAG_SCORE_DUMP", "")
+        # 2026-05-14 fix: ALSO dump when last_q_by_layer is non-empty
+        # (Score fired even if extract_and_record didn't populate
+        # quest_gpu_summaries — happens for "generate" rids that hit
+        # prefix-cache and don't write fresh KV). Without this, mk2's
+        # 5 generate rids dumped no q at all because the cache hit
+        # zeroed quest_gpu_summaries.
+        if (_dump_dir and int(self._tp_rank) == 0
+                and (rs.quest_gpu_summaries
+                     or rs.last_q_by_layer)):
+            try:
+                import os as _os
+                _os.makedirs(_dump_dir, exist_ok=True)
+                _safe_rid = str(request_id).replace("/", "_")
+                _path = _os.path.join(
+                    _dump_dir, f"{_safe_rid}_summaries.pt")
+                _by_layer = {}
+                for _lyr, _entries in rs.quest_gpu_summaries.items():
+                    _items = sorted(_entries, key=lambda t: t[0])
+                    _by_layer[int(_lyr)] = {
+                        "abs_pids": [int(p) for p, _, _ in _items],
+                        "kmin": torch.stack(
+                            [m for _, m, _ in _items], dim=0).cpu(),
+                        "kmax": torch.stack(
+                            [m for _, _, m in _items], dim=0).cpu(),
+                    }
+                # 2026-05-14: include the per-(scored-layer) Q tensor
+                # snapshot stashed by _score_one_request, plus the
+                # picked_page_ids that Score returned at that layer. This
+                # is what previously only lived in the per-(rid,layer).pt
+                # files — and those only got written for the first rid
+                # because the per-layer write path had silent failures
+                # for subsequent rids. Embedding everything in the
+                # per-rid summaries dump makes the data complete for
+                # every rid in one place.
+                _q_by_layer = {
+                    int(L): t for L, t in
+                    getattr(rs, "last_q_by_layer", {}).items()}
+                _picked_by_layer = dict(
+                    getattr(rs, "last_picked_by_layer", {}))
+                _scores_by_layer = dict(
+                    getattr(rs, "last_scores_by_layer", {}))
+                torch.save({
+                    "rid": str(request_id),
+                    "summaries": _by_layer,
+                    "q_by_layer": _q_by_layer,
+                    "picked_by_layer": _picked_by_layer,
+                    "scores_by_layer": _scores_by_layer,
+                    "tp_rank": int(self._tp_rank),
+                    "tp_size": int(self._tp_size),
+                }, _path)
+            except Exception as _e:
+                logger.warning(
+                    "[icms_diag_score_dump] summaries save failed "
+                    "for rid=%s: %s", request_id, _e)
+
         # Now pop the request state and reset prefill_done.
         self._requests.pop(request_id, None)
         self._prefill_done = False
