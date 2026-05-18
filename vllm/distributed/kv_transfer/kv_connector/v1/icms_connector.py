@@ -1453,6 +1453,23 @@ class IcmsConnector(KVConnectorBase_V1):
         """
         if self._worker is None:
             return
+        # 2026-05-16 diag (gated): log each unique layer_name vLLM passes
+        # once. Used to confirm whether the connector's hardcoded
+        # `model.layers.N.self_attn.attn` write-key matches the actual
+        # read-key (e.g. for Mistral3ForConditionalGeneration the LM is
+        # wrapped at prefix `language_model`, so reads may arrive as
+        # `language_model.model.layers.N.self_attn.attn` and the
+        # _pending_scores.pop in wait_for_layer would silently miss).
+        if os.environ.get("ICMS_DIAG_LAYERNAME") == "1":
+            seen = getattr(self, "_diag_layername_seen", None)
+            if seen is None:
+                seen = set()
+                self._diag_layername_seen = seen
+            if layer_name not in seen:
+                seen.add(layer_name)
+                logger.warning(
+                    "[diag-layername] wait_for_layer_load layer_name=%r",
+                    layer_name)
         self._worker.wait_for_layer(layer_name)
 
     def is_dense_for_active_request(self) -> bool:
@@ -3208,7 +3225,171 @@ class _Worker:
             f_post[L] = None; f_pre[L] = None; f_call[L] = None
         self._slack_t_step = None
 
-    # ─── metadata drain (C1) ─────────────────────────────────────────────
+    # ─── runtime invariant flags ────────────────────────────────────────
+
+    def _assert_pending_scores_no_clobber(self, layer_key, rid, source: str):
+        """Runtime invariant flag (2026-05-15): every write to
+        `_pending_scores[layer][rid]` MUST happen against an empty
+        slot. Today the connector uses `.setdefault(...)[rid] = ...`
+        at 5+ call sites, which silently CLOBBERS any pre-existing
+        entry → stale (reply, req_idx) discarded, the new one wins,
+        the apply path may consume the wrong req_idx.
+
+        Call this BEFORE the `[rid] = ...` assignment at each site:
+            self._assert_pending_scores_no_clobber(
+                layer_key, rid, source="score-reply-landing")
+            self._pending_scores.setdefault(layer_key, {})[rid] = (...)
+
+        Default: log WARNING. Strict (`ICMS_PENDING_CLOBBER_FLAG=strict`):
+        raise RuntimeError. The strict mode is useful in CI for
+        catching design-level violations early; default-warn keeps
+        production paths flowing even if a transient race happens.
+        """
+        layer_dict = self._pending_scores.get(layer_key)
+        if layer_dict is None or rid not in layer_dict:
+            return  # clean slot, nothing to flag
+        msg = (
+            f"[icms-invariant] _pending_scores clobber at "
+            f"layer={layer_key} rid={rid} (source={source}). A prior "
+            f"(reply, req_idx) is being overwritten — if the new "
+            f"req_idx differs from the existing one, apply will use "
+            f"the new value AND the prior reply's KV bytes are "
+            f"discarded. Audit S-1 (2026-05-15).")
+        if os.environ.get(
+                "ICMS_PENDING_CLOBBER_FLAG", "warn") == "strict":
+            raise RuntimeError(msg)
+        logger.warning("%s", msg)
+
+    def _check_faps_reply_coverage(self, rid, rs, reply,
+                                    *, source: str):
+        """Runtime invariant flag (2026-05-15): a FAPS reply MUST
+        cover essentially the full chain. The expected page count is
+        `len(rs.chain) * GROUP_PAGES`; allow 10% under (last group
+        may be partial in practice). Below threshold = silent
+        byte-source mismatch class (the SPDD v3 failure mode
+        generalized to non-SPDD FAPS callers).
+
+        The SPDD helper already does this check inline. This is
+        the same check, exposed as a method so non-SPDD FAPS
+        callers (`_fetch_all_one_request`, per-scoring-boundary
+        FAPS, etc.) can adopt the same flag with one line:
+            self._check_faps_reply_coverage(rid, rs, reply,
+                                             source="layer-FAPS")
+
+        Returns True if reply is "full enough", False if partial.
+        Logs WARNING by default; raises under
+        `ICMS_FAPS_PARTIAL_REPLY_FLAG=strict`.
+        """
+        page_ids = getattr(reply, "page_ids", None)
+        if page_ids is None:
+            return True   # nothing to check; caller decides
+        chain = getattr(rs, "chain", None) or []
+        expected = len(chain) * GROUP_PAGES
+        if expected <= 0:
+            return True   # empty chain; no expectation
+        threshold = int(expected * 0.90)
+        actual = len(page_ids)
+        if actual >= threshold:
+            return True
+        msg = (
+            f"[icms-invariant] FAPS partial reply for rid={rid} "
+            f"(source={source}): {actual} pages received vs "
+            f"{expected} expected (chain_len={len(chain)} × "
+            f"GROUP_PAGES={GROUP_PAGES}, threshold=90%). Downstream "
+            f"apply will scatter sink-routed bytes at the received "
+            f"page IDs only; other positions retain whatever was "
+            f"there → byte-source mismatch on uncovered positions.")
+        if os.environ.get(
+                "ICMS_FAPS_PARTIAL_REPLY_FLAG", "warn") == "strict":
+            raise RuntimeError(msg)
+        logger.warning("%s", msg)
+        return False
+
+    def _check_prefill_rid_order_stable(self, new_requests):
+        """Runtime invariant flag (2026-05-15): during chunked prefill,
+        vLLM's request ordering in `connector_meta.requests` MUST be
+        stable across chunks of the same prefill — if a rid that
+        appeared at position N in step K appears at position N' in
+        step K+1 (while still in prefill), the apply path's `req_idx`
+        will index into the wrong bt-row → silent KV corruption.
+
+        This is the 2026-05-12 multi-rid slot-1 bug class. The fix
+        landed (plumb `input_batch.req_ids` through), but no runtime
+        CHECK existed that the scheduler ordering is actually stable.
+        This is that check.
+
+        Default behavior: log WARNING and continue (the
+        `_rid_to_bt_row` plumbing handles correctness independently).
+        Set ICMS_RID_ORDER_FLAG=strict to RAISE instead — useful in
+        tests and CI to surface drift loudly.
+
+        No-op once `_prefill_done=True` (decode-phase reordering is
+        normal and handled by the apply path's per-step req_idx
+        resolution).
+        """
+        if getattr(self, "_prefill_done", False):
+            return
+        prior = getattr(self, "_last_step_requests", None)
+        if not prior:
+            return
+        prior_pos = {step.request_id: i for i, step in enumerate(prior)}
+        drift = []
+        for new_pos, step in enumerate(new_requests):
+            rid = step.request_id
+            old_pos = prior_pos.get(rid)
+            if old_pos is not None and old_pos != new_pos:
+                drift.append((rid, old_pos, new_pos))
+        if not drift:
+            return
+        msg = (
+            "[icms-invariant] rid-order drift across chunked prefill: "
+            "%d rid(s) moved between consecutive prefill chunks "
+            "(rid, old_pos, new_pos) → %s. This is the 2026-05-12 "
+            "multi-rid slot-1 bug class — apply path's req_idx will "
+            "index into wrong bt-row unless _rid_to_bt_row plumbing "
+            "is intact. If the run is producing correct outputs, the "
+            "plumbing is doing its job; this warning still pins the "
+            "structural hazard for refactor visibility."
+        ) % (len(drift), drift[:5])
+        if os.environ.get("ICMS_RID_ORDER_FLAG", "warn") == "strict":
+            raise RuntimeError(msg)
+        logger.warning("%s", msg)
+
+    def _check_rid_to_bt_row_present(self, active_rids, source: str):
+        """Runtime invariant flag (2026-05-15): every rid we look up via
+        `self._rid_to_bt_row.get(rid)` at apply / extract time MUST have
+        an entry in the dict. A missing entry is the pre-2026-05-12
+        multi-rid bug class — the lookup falls back to enumerate order
+        which is meta.requests (append) ordering, NOT FA's input_batch
+        row ordering. That mismatch silently routed the wrong Q-slice
+        or wrong bt-row to each rid → slot-N deterministic accuracy
+        collapse.
+
+        Default behavior: log WARNING, name the missing rids, and
+        continue (the fallback enumerate path still runs, so the
+        invariant flag is OBSERVABILITY for the structural hazard).
+        Set ICMS_RID_TO_BT_ROW_FLAG=strict to RAISE instead.
+
+        `active_rids` is whatever iterable of rids the caller is about
+        to look up. `source` names the call site for the log message.
+        """
+        missing = [r for r in active_rids
+                   if r not in (self._rid_to_bt_row or {})]
+        if not missing:
+            return
+        msg = (
+            "[icms-invariant] _rid_to_bt_row missing %d rid(s) at "
+            "%s: %s. Pre-2026-05-12 multi-rid slot-N bug class: "
+            "lookup falls back to enumerate(meta.requests) order, "
+            "which does NOT match FA input_batch row order under "
+            "multi-rid batching. If this run is correct, "
+            "set_input_batch_req_ids ran for these rids before the "
+            "lookup; otherwise the lookup is routing the wrong rid."
+        ) % (len(missing), source, missing[:5])
+        if os.environ.get("ICMS_RID_TO_BT_ROW_FLAG",
+                          "warn") == "strict":
+            raise RuntimeError(msg)
+        logger.warning("%s", msg)
 
     def on_step_start(self, meta: IcmsConnectorMetadata):
         """Called from start_load_kv. Drains scheduler metadata into caches."""
@@ -3316,6 +3497,15 @@ class _Worker:
             meta.skip_extract_rids)
         # Multi-rid path uses a per-rid set instead of the global gate.
         self._skip_extract_rids = set(meta.skip_extract_rids)
+        # 2026-05-15 runtime invariant flag: chunked-prefill rid-order
+        # stability. The 2026-05-12 multi-rid slot-1 bug was that vLLM
+        # swapped rid order between chunks of the same prefill; the
+        # connector's apply path consumed `connector_meta.requests`
+        # index as req_idx, so rid_A's apply scattered into rid_B's
+        # bt-row. Fix landed (plumb input_batch.req_ids through), but
+        # there was no runtime CHECK that the scheduler's ordering is
+        # stable. This is that check.
+        self._check_prefill_rid_order_stable(meta.requests)
         # Stash for extract_and_record's batch-order walk.
         self._last_step_requests = list(meta.requests)
         # BUG-N13 Phase 1 diag: per-step skip_extract decision trace.
@@ -3615,6 +3805,8 @@ class _Worker:
             promoted = copy.copy(reply)
             promoted.sink_offsets = reuse_offsets
             with self._score_lock:
+                self._assert_pending_scores_no_clobber(
+                    attn_layer_name, rid, source="faps-fast-path-promote")
                 self._pending_scores.setdefault(attn_layer_name, {})[rid] = (
                     promoted, req_idx)
             if os.environ.get("ICMS_DIAG_FAPS") == "1":
@@ -3878,6 +4070,8 @@ class _Worker:
             sink = self._sink_pool.sink
             _ = sink
             with self._score_lock:
+                self._assert_pending_scores_no_clobber(
+                    attn_layer_name, rid, source="faps-slow-path-landing")
                 self._pending_scores.setdefault(attn_layer_name, {})[rid] = (
                     reply, req_idx)
             # Reply-specific per-layer stride: server packs sink as
@@ -4711,6 +4905,21 @@ class _Worker:
         # this is also per-request. Multi-request decode would need
         # per-rs gating which is future work.
         is_decode = bool(self._prefill_done)
+        # 2026-05-15 SPDD first-principles fix: override budget to 1.0
+        # on the FIRST decode-iter scored layer when sparse-prefill-
+        # dense-decode is enabled. The existing Score path then fires
+        # with k=total_pages, server returns all N pages, fetched_pages
+        # saturates, dense_mode flips — exactly as sparse Quest's
+        # natural saturation iter does. Subsequent scored layers in
+        # this decode iter hit the `is_decode and rs.dense_mode` early-
+        # return below, so the override fires exactly once per rid.
+        # The boundary fetch helper was removed in favor of this
+        # in-control-flow override; sparse Quest's flow handles
+        # everything else identically.
+        if (is_decode
+                and not rs.dense_mode
+                and self._sparse_prefill_dense_decode):
+            budget = 1.0
         # M4: once any prior decode-mode Score returned 0 net-new pages
         # for this rs, the bitmap is saturated — drop into dense decode
         # for the rest of the request and skip every subsequent Score
@@ -5641,6 +5850,9 @@ class _Worker:
             # Rank-gated to tp_rank==0 since per-rank KV-head slicing
             # makes cross-rank summaries hard to reconstruct offline.
             _dump_dir = os.environ.get("ICMS_DIAG_SCORE_DUMP", "")
+            _picked_only_stash = os.environ.get(
+                "ICMS_DIAG_SCORE_DUMP_PICKED_ONLY", "") in (
+                "1", "true", "True")
             if _dump_dir and int(self._tp_rank) == 0:
                 # Always stash q for this (rid, layer) so the per-rid
                 # summaries dump (in on_request_finished) can join q
@@ -5651,10 +5863,20 @@ class _Worker:
                 # still gives us complete data via the summaries dump.
                 # This is the 2026-05-14 fix for the "rid=1 had layer
                 # dumps but other rids didn't" data-collection bug.
+                # PICKED_ONLY=1: stash a 1-byte sentinel instead of the
+                # full Q tensor (~250 MB for 32k tokens × 32 heads ×
+                # 128 dims bf16). The on_request_finished dump still
+                # needs `last_q_by_layer` to be non-empty to fire for
+                # generate rids, but the tensor content is irrelevant
+                # when only membership analysis runs downstream.
                 if isinstance(quest_query, torch.Tensor):
                     try:
-                        rs.last_q_by_layer[int(next_layer_idx)] = (
-                            quest_query.detach().cpu())
+                        if _picked_only_stash:
+                            rs.last_q_by_layer[int(next_layer_idx)] = (
+                                torch.zeros(1, dtype=torch.uint8))
+                        else:
+                            rs.last_q_by_layer[int(next_layer_idx)] = (
+                                quest_query.detach().cpu())
                     except Exception as _e_qstash:
                         logger.warning(
                             "[icms_diag_score_dump] q-stash failed "
@@ -5681,6 +5903,14 @@ class _Worker:
                 except ValueError:
                     _limit = 256
                 _n_dumped = getattr(self, "_diag_score_dump_n", 0)
+                # PICKED_ONLY=1 skips the per-(rid, layer) legacy
+                # files entirely — they're ~75 MB each (kmin/kmax for
+                # the full haystack) and aren't needed for membership
+                # analysis. The per-rid v3 summaries dump (in
+                # on_request_finished) carries picked_by_layer which
+                # is the only thing membership needs.
+                if _picked_only_stash:
+                    _n_dumped = _limit  # short-circuit
                 if _n_dumped < _limit:
                     try:
                         import os as _os
@@ -5921,6 +6151,9 @@ class _Worker:
             # Skip the Score write under FAPS — let FAPS be sole writer.
             if not self._fetch_all_post_score:
                 with self._score_lock:
+                    self._assert_pending_scores_no_clobber(
+                        attn_layer_name, rid,
+                        source="score-reply-landing")
                     self._pending_scores.setdefault(attn_layer_name, {})[rid] = (
                         reply, req_idx)
 
@@ -6401,6 +6634,8 @@ class _Worker:
         )
         attn_layer_name = f"model.layers.{next_layer_idx}.self_attn.attn"
         with self._score_lock:
+            self._assert_pending_scores_no_clobber(
+                attn_layer_name, rid, source="per-kv-head-score-landing")
             self._pending_scores.setdefault(attn_layer_name, {})[rid] = (
                 synth, req_idx)
 
@@ -6597,8 +6832,27 @@ class _Worker:
                 self._provenance_check_natural_bt(
                     layer_name, _abs_layer_for_mask, path="nonscored")
             return
+        # 2026-05-16 fix: every write to `_pending_scores` keys by the
+        # CONSTRUCTED `f"model.layers.{idx}.self_attn.attn"` (5+ call
+        # sites: faps-fast-path-promote ~3793, faps-slow-path-landing
+        # ~4058, score-reply-landing ~6140, per-kv-head ~6622, etc.).
+        # The read here used the RAW vLLM-passed `layer_name`, which
+        # for `Mistral3ForConditionalGeneration` is prefixed with
+        # `language_model.` (the LM is wrapped at that prefix; see
+        # mistral3.py:489 `init_vllm_registered_model(prefix=...)`).
+        # The pop silently missed for every layer → Score replies
+        # accumulated in `_pending_scores` (the source of the per-layer
+        # `_pending_scores clobber` warnings on mistral-small but not
+        # qwen3/gemma-3 which register at the top level) → KV-overlay
+        # apply never ran → attention read uncovered KV → token-loop
+        # gibberish on every sparse mistral-small run (even at b=1.0
+        # where coverage was complete — the smoking gun in
+        # [[mistral-sparse-path-bug-2026-05-15]]).
+        canonical_key = (
+            f"model.layers.{_abs_layer_for_mask}.self_attn.attn"
+            if _abs_layer_for_mask is not None else layer_name)
         with self._score_lock:
-            per_request = self._pending_scores.pop(layer_name, None)
+            per_request = self._pending_scores.pop(canonical_key, None)
 
         if os.environ.get("ICMS_DIAG_FAPS") == "1":
             _abs = self._extract_layer_idx(layer_name)
@@ -6642,6 +6896,46 @@ class _Worker:
                 and self._extract_layer_idx(layer_name) == 0):
             self._diag_full_iter_metadata(
                 layer_name, self._attn_metadata, where="wfl_entry")
+
+        # ICMS_DIAG_SPDD_COMPREHENSIVE=1 (2026-05-15): per-layer wfl-entry
+        # snapshot for SPDD diagnosis. Logs whether a pending reply exists
+        # for each active rid at this layer, dense_mode, _post_dense_iter,
+        # and per_request size. Critical signal: in SPDD-with-FetchAll,
+        # _pending_scores[0] should have a populated reply at decode iter 1
+        # layer 0; without FetchAll, it should be empty (normal Score path
+        # repopulates it later). Diff between the two runs at this hook
+        # exposes layer-by-layer behavior changes.
+        if os.environ.get("ICMS_DIAG_SPDD_COMPREHENSIVE") == "1":
+            try:
+                _abs_l = self._extract_layer_idx(layer_name)
+                _phase = "decode" if self._prefill_done else "prefill"
+                # Snapshot per-rid context. _requests may be empty during
+                # transients; tolerate.
+                _per_req_keys = (list(per_request.keys()) if per_request
+                                  else [])
+                _per_req_n = len(_per_req_keys)
+                _reuse_pres = (layer_name in
+                                getattr(self, "_pending_reuse", {}))
+                _rs_summary = []
+                for _r, _rs in list(self._requests.items()):
+                    _ri = self._rid_to_bt_row.get(_r, -1)
+                    _has_pending = _r in (per_request or {})
+                    _rs_summary.append(
+                        f"{_r[:8]}:ri={_ri}/dense={_rs.dense_mode}/"
+                        f"pdi={_rs._post_dense_iter}/"
+                        f"chain={len(_rs.chain)}/"
+                        f"fetched={getattr(_rs,'fetched_pages',-1)}/"
+                        f"pending={_has_pending}")
+                logger.info(
+                    "[diag-spdd-cs-wfl] phase=%s layer=%s abs=%s "
+                    "per_req_n=%d per_req_keys=%s reuse_present=%s "
+                    "rs_summary=%s",
+                    _phase, layer_name, _abs_l, _per_req_n,
+                    [k[:8] for k in _per_req_keys[:4]],
+                    _reuse_pres, _rs_summary[:4])
+            except Exception as _diag_e:
+                logger.warning(
+                    "[diag-spdd-cs-wfl] log failed: %r", _diag_e)
 
         if not per_request:
             return
@@ -8267,6 +8561,65 @@ class _Worker:
                 return None
             new_bt = new_bt_row.unsqueeze(0)
             _lt("after_bt_build")
+
+            # ICMS_DIAG_SPDD_COMPREHENSIVE=1 (2026-05-15): log every apply's
+            # full routing state — valid_pids → phys_blocks (scatter dest),
+            # bt[req_idx][valid_pids] (what FA WOULD read at those pids),
+            # and new_bt (what FA actually reads after set_active). Paired
+            # SPDD-with vs SPDD-without-FetchAll runs differ exactly in
+            # whether _pending_scores[0]+_pending_reuse[1..47] are populated,
+            # so diffing these lines per-layer reveals what FetchAll changes
+            # in the apply pipeline.
+            if os.environ.get("ICMS_DIAG_SPDD_COMPREHENSIVE") == "1":
+                try:
+                    _is_decode = bool(getattr(rs, "_post_dense_iter", -1) >= 0
+                                       or self._prefill_done)
+                    _layer_idx = layer_idx_for_cache
+                    _vp_n = len(valid_pids)
+                    _pb_cpu = phys_blocks_dev.cpu().tolist()
+                    _vp_head = valid_pids[:8]
+                    _vp_tail = valid_pids[-8:] if _vp_n > 8 else []
+                    _pb_head = _pb_cpu[:8]
+                    _pb_tail = _pb_cpu[-8:] if len(_pb_cpu) > 8 else []
+                    _bt_row_full = bt[req_idx].cpu().tolist()
+                    _bt_at_vp = [_bt_row_full[p] if p < len(_bt_row_full)
+                                  else -1 for p in valid_pids[:8]]
+                    _bt_at_vp_tail = ([_bt_row_full[p] if p < len(_bt_row_full)
+                                        else -1 for p in valid_pids[-8:]]
+                                       if _vp_n > 8 else [])
+                    _new_bt_cpu = new_bt.cpu().tolist()[0]
+                    _new_bt_head = _new_bt_cpu[:8]
+                    _new_bt_tail = (_new_bt_cpu[-8:]
+                                     if len(_new_bt_cpu) > 8 else [])
+                    # Mismatch detector: pb[i] should == bt[req_idx][vp[i]].
+                    _mismatches = []
+                    for _i, _p in enumerate(valid_pids[:16]):
+                        _expect = (_bt_row_full[_p]
+                                    if _p < len(_bt_row_full) else -1)
+                        _actual = (_pb_cpu[_i] if _i < len(_pb_cpu)
+                                    else -1)
+                        if _expect != _actual:
+                            _mismatches.append((_i, _p, _expect, _actual))
+                    logger.info(
+                        "[diag-spdd-cs-apply] layer=%d rid=%s req_idx=%d "
+                        "is_decode=%s dense=%s pdi=%d "
+                        "vp_n=%d pb_n=%d new_bt_n=%d "
+                        "vp_head=%s vp_tail=%s "
+                        "pb_head=%s pb_tail=%s "
+                        "bt_at_vp_head=%s bt_at_vp_tail=%s "
+                        "new_bt_head=%s new_bt_tail=%s "
+                        "routing_mismatches[:8]=%s",
+                        _layer_idx, rid[:8], req_idx, _is_decode,
+                        rs.dense_mode, rs._post_dense_iter,
+                        _vp_n, len(_pb_cpu), len(_new_bt_cpu),
+                        _vp_head, _vp_tail,
+                        _pb_head, _pb_tail,
+                        _bt_at_vp, _bt_at_vp_tail,
+                        _new_bt_head, _new_bt_tail,
+                        _mismatches[:8])
+                except Exception as _diag_e:
+                    logger.warning(
+                        "[diag-spdd-cs-apply] log failed: %r", _diag_e)
         else:
             # Fallback per-page loop for host-sink path. Mirrors the
             # GPU-direct branch's per-rank slicing at lines 2970-2974.
@@ -8763,7 +9116,6 @@ class _Worker:
             # Nothing to extract — still flip the prefill_done flag.
             if not self._prefill_done:
                 self._reset_apply_caches_for_prefill_done()
-                self._spdd_fire_one_shot_fetch_all()
                 self._prefill_done = True
                 logger.info("Prefill done. Switching to dense decode.")
             return
@@ -8918,7 +9270,6 @@ class _Worker:
 
         if not self._prefill_done:
             self._reset_apply_caches_for_prefill_done()
-            self._spdd_fire_one_shot_fetch_all()
             self._prefill_done = True
             logger.info("Prefill done. Switching to dense decode.")
 
@@ -9014,90 +9365,6 @@ class _Worker:
                     sm_first, sm_last, msk_local, nat_local)
         except Exception as _e:
             logger.warning("[diag-postflip] snapshot failed: %r", _e)
-
-    def _spdd_fire_one_shot_fetch_all(self):
-        """Sparse-prefill + dense-decode (SPDD): at the prefill→decode
-        boundary, fire ONE FetchAll per active rid covering all 48
-        layers. The reply populates `_pending_scores[layer 0]` and
-        `_pending_reuse[layer 1..47]` with full N-page entries (same
-        wire-shape and apply path as the existing per-scoring-boundary
-        FAPS). Decode iter 1's wait_for_layer at L=0 then consumes the
-        Score entry and the FAPS reuse machinery propagates per-layer
-        for L=1..47, so all 48 layers' main_key gets uniformly
-        sink-routed bytes scattered across all N positions. Decode
-        attends over uniform bytes — no source mixing.
-        Subsequent scoring boundaries in decode iter 1 hit the natural
-        dense_mode flip at _score_one_request L4733-4748 (FAPS-saturated
-        rs.fetched_pages → flip threshold met → return early), so Quest
-        hook short-circuits in decode iter 2+ and decode runs purely
-        natural-bt thereafter.
-        No-op when the SPDD flag is unset, so non-SPDD paths
-        (sparse Quest, real FAPS, dense baseline) are byte-identical."""
-        if not self._sparse_prefill_dense_decode:
-            return
-        if not self._requests:
-            return
-        # Build (req_idx, rid, rs) using `_last_step_requests` order
-        # (= scheduler-meta batch order, set at on_step_start L3305).
-        # This matches vLLM's authoritative batch-slot index so req_idx
-        # aligns with _rid_to_bt_row[rid] in apply. At max_num_seqs=1
-        # both orderings collapse to req_idx=0; multi-rid SPDD needs
-        # the meta-driven order to avoid wrong-bt-row apply (silent KV
-        # corruption). Per the 2026-05-14 parallel-agent audit.
-        # Falls back to enumerate(_requests) when _last_step_requests
-        # is empty (rare; e.g., transient state during connector startup).
-        _last_step = getattr(self, "_last_step_requests", None)
-        requests_to_fetch = []
-        if _last_step:
-            for req_idx, step_req in enumerate(_last_step):
-                rid = step_req.request_id
-                rs = self._requests.get(rid)
-                if rs is not None and rs.chain:
-                    requests_to_fetch.append((req_idx, rid, rs))
-        if not requests_to_fetch:
-            for req_idx, (rid, rs) in enumerate(self._requests.items()):
-                if rs.chain:
-                    requests_to_fetch.append((req_idx, rid, rs))
-        if not requests_to_fetch:
-            return
-        # 2026-05-14 v4 SPDD: fire FAPS at next_layer_idx=0 so the reply
-        # populates _pending_scores[0] + _pending_reuse[1..47] and apply
-        # runs at EVERY layer in decode iter 1 — uniform sink bytes
-        # everywhere (the same coverage shape as real FAPS produces by
-        # firing per-scoring-boundary during prefill).
-        #
-        # Sink-sizing requirement: the connector sizes the sink as
-        # `_k * num_layers * page_bytes`. FAPS at L=0 with reuse_through
-        # =num_layers-1 needs `total_pages * num_layers * page_bytes`
-        # of sink space. If `total_pages > _k`, the server returns
-        # ENOSPC ("Score failed status=4294967268"). Empirical: h32k
-        # haystacks can produce total_pages up to ~2200 (max_context
-        # 35K / 16-page-size). Bump --icms-k accordingly in the SPDD
-        # launcher (rule of thumb: --icms-k >= max_context_tokens / 16
-        # × 1.05). This also benefits the sparse Quest path's k-pages
-        # cap (no harm; just oversizes the sink buffer).
-        first_layer = 0
-        for req_idx, rid, rs in requests_to_fetch:
-            try:
-                self._fetch_all_one_request(
-                    rid=rid, rs=rs, req_idx=req_idx,
-                    next_layer_idx=first_layer,
-                    budget=1.0,
-                    stats=self.stats)
-                logger.info(
-                    "[icms] sparse_prefill_dense_decode: one-shot "
-                    "FetchAll fired rid=%s layer=%d at prefill→decode "
-                    "boundary", rid, first_layer)
-            except Exception:
-                logger.exception(
-                    "sparse_prefill_dense_decode: one-shot FetchAll "
-                    "failed for rid=%s; decode will fall back to "
-                    "vLLM's natural K/V (which is correct under SPDD "
-                    "since prefill already populated native K/V via "
-                    "reshape_and_cache, but loses the sink-byte "
-                    "uniformity invariant — accuracy may degrade).",
-                    rid)
-
     def _reset_apply_caches_for_prefill_done(self):
         """Bug 11 (2026-04-29) audit fix #1: invalidate per-rs apply
         caches at the prefill→decode transition.
@@ -9391,6 +9658,22 @@ class _Worker:
             # `getattr` keeps the access safe for callers (tests, mocks)
             # that don't initialize the attribute.
             _rid_to_bt_row = getattr(self, "_rid_to_bt_row", None) or {}
+            # 2026-05-15 invariant flag: surface the structural hazard
+            # of falling back to enumerate order. Cheap; runs once per
+            # extract; gated by _is_multi_rid_mode so the single-rid
+            # path doesn't pay the cost.
+            try:
+                _active = [prs.request_id
+                           for prs in self._last_step_requests
+                           if prs.request_id not in self._skip_extract_rids
+                           and self._requests.get(prs.request_id) is not None
+                           and self._requests[prs.request_id].chain]
+                if _active:
+                    self._check_rid_to_bt_row_present(
+                        _active, source="extract.multi_rid")
+            except Exception:
+                # Never let the invariant check itself break extract.
+                pass
             for prs in self._last_step_requests:
                 rid_i = prs.request_id
                 if rid_i in self._skip_extract_rids:
@@ -10683,15 +10966,26 @@ class _Worker:
         # be empty even when this final snapshot has full data. Offline
         # consumer reads BOTH files and cross-references by (rid, layer).
         _dump_dir = os.environ.get("ICMS_DIAG_SCORE_DUMP", "")
+        # 2026-05-15 ICMS_DIAG_SCORE_DUMP_PICKED_ONLY=1: skip cache-rid
+        # dumps entirely (require last_q_by_layer, which only generate
+        # rids have) AND drop the heavy `summaries` kmin/kmax payload
+        # from the saved file. Used when the only downstream analysis
+        # is membership (picked_by_layer is enough). Drops dump-dir
+        # size by ~99% (per-rid file goes from ~195 MB → ~100 KB).
+        # Forward-fill / alt-scoring analyses MUST run without this flag.
+        _picked_only = os.environ.get(
+            "ICMS_DIAG_SCORE_DUMP_PICKED_ONLY", "") in ("1", "true",
+                                                          "True")
         # 2026-05-14 fix: ALSO dump when last_q_by_layer is non-empty
         # (Score fired even if extract_and_record didn't populate
         # quest_gpu_summaries — happens for "generate" rids that hit
         # prefix-cache and don't write fresh KV). Without this, mk2's
         # 5 generate rids dumped no q at all because the cache hit
         # zeroed quest_gpu_summaries.
-        if (_dump_dir and int(self._tp_rank) == 0
-                and (rs.quest_gpu_summaries
-                     or rs.last_q_by_layer)):
+        _dump_eligible = (
+            rs.last_q_by_layer if _picked_only
+            else (rs.quest_gpu_summaries or rs.last_q_by_layer))
+        if _dump_dir and int(self._tp_rank) == 0 and _dump_eligible:
             try:
                 import os as _os
                 _os.makedirs(_dump_dir, exist_ok=True)
@@ -10699,15 +10993,16 @@ class _Worker:
                 _path = _os.path.join(
                     _dump_dir, f"{_safe_rid}_summaries.pt")
                 _by_layer = {}
-                for _lyr, _entries in rs.quest_gpu_summaries.items():
-                    _items = sorted(_entries, key=lambda t: t[0])
-                    _by_layer[int(_lyr)] = {
-                        "abs_pids": [int(p) for p, _, _ in _items],
-                        "kmin": torch.stack(
-                            [m for _, m, _ in _items], dim=0).cpu(),
-                        "kmax": torch.stack(
-                            [m for _, _, m in _items], dim=0).cpu(),
-                    }
+                if not _picked_only:
+                    for _lyr, _entries in rs.quest_gpu_summaries.items():
+                        _items = sorted(_entries, key=lambda t: t[0])
+                        _by_layer[int(_lyr)] = {
+                            "abs_pids": [int(p) for p, _, _ in _items],
+                            "kmin": torch.stack(
+                                [m for _, m, _ in _items], dim=0).cpu(),
+                            "kmax": torch.stack(
+                                [m for _, _, m in _items], dim=0).cpu(),
+                        }
                 # 2026-05-14: include the per-(scored-layer) Q tensor
                 # snapshot stashed by _score_one_request, plus the
                 # picked_page_ids that Score returned at that layer. This
