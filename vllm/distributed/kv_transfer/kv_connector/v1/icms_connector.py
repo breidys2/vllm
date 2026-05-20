@@ -827,13 +827,23 @@ class IcmsTimingStats:
 
     def record_score(self, us: float, cache_hit: bool, page_ids: list[int],
                       layer_idx: int, scores: list[float] | None = None):
+        # total_score_calls must increment on EVERY Score call regardless
+        # of stats level — it's read by the bench's silent-fallback guard
+        # to detect engine death (0 Score calls over a non-trivial cell
+        # → engine is dead, dense-attention rows silently labelled as
+        # ICMS budget). Pre-2026-05-20 fix this was gated on `level >= 1`,
+        # so default runs (level=0) had total_score_calls stuck at 0,
+        # spuriously tripping the guard on short-prompt benchmarks where
+        # Score legitimately ran (MMLU/GSM8K smoke 2026-05-20). The
+        # detailed timing/cache-hit fields below stay gated on level
+        # since they're expensive (per-call lists at level=2).
+        self.total_score_calls += 1
+        if cache_hit:
+            self.total_score_cache_hits += 1
         if self.level == 0 and not self.log_selections:
             return
         if self.level >= 1:
             self.total_score_us += us
-            self.total_score_calls += 1
-            if cache_hit:
-                self.total_score_cache_hits += 1
         if self.level >= 2:
             self.score_roundtrip_us.append(us)
             self.score_cache_hit.append(cache_hit)
@@ -7043,9 +7053,9 @@ class _Worker:
         rs.fetched_pages.setdefault(next_layer_idx, set()).update(picked)
         self.stats.record_score(wall_us, bool(picked), picked,
                                   next_layer_idx)
-        # Force-bump silent-fallback-guard counter even at stats level=0.
-        if self.stats.level == 0:
-            self.stats.total_score_calls += 1
+        # 2026-05-20: removed the level==0 force-bump band-aid here —
+        # record_score now increments total_score_calls unconditionally,
+        # so this would double-count in the subset_max path.
         logger.debug(
             "[icms_subset_max] layer=%d total_pages=%d k=%d "
             "subset=%s n_picked=%d sink_offsets=%d wall_us=%.1f",
