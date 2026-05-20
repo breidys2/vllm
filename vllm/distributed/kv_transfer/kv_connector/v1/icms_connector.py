@@ -2779,6 +2779,30 @@ class _Worker:
                          "(num_layers=%d)",
                          _scored_mask, self._geom.num_scored_layers,
                          self._geom.num_layers)
+        # ICMS_DENSE_LAYERS: subset of scored_layers that fire Score with
+        # budget=1.0 (full-fetch). Activates contiguous-reuse mode: reuse
+        # window walks to the next scored layer instead of stride-1, and
+        # wait_for_layer's non-scored short-circuit falls through when a
+        # reuse entry was promoted. Required for hybrid schedules like
+        # "L0,L1 dense + L2,L8,... Quest @ 0.20" on full-attention models
+        # (qwen3) where every layer must apply the selected page set.
+        _dense_spec = os.environ.get("ICMS_DENSE_LAYERS", "")
+        _dense_mask = parse_scored_layers(_dense_spec)
+        if _dense_mask != 0 and self._geom.num_layers < 64:
+            _dense_mask &= ((1 << self._geom.num_layers) - 1)
+        if _dense_mask != 0:
+            _bad = _dense_mask & ~self._geom.scored_layers_mask
+            if _bad:
+                raise ValueError(
+                    f"ICMS_DENSE_LAYERS bitmask 0x{_dense_mask:x} contains "
+                    f"layers not in ICMS_SCORED_LAYERS (extra bits "
+                    f"0x{_bad:x}). Dense layers must be a subset of scored "
+                    f"layers.")
+            self._geom = _dataclasses.replace(self._geom,
+                                               dense_layers_mask=_dense_mask)
+            logger.info("[icms] dense_layers mask=0x%x popcount=%d "
+                         "(contiguous-reuse enabled)",
+                         _dense_mask, bin(_dense_mask).count("1"))
         # KV on-disk layout from env. Must match server --kv-layout.
         _kv_layout_str = os.environ.get("ICMS_KV_LAYOUT", "layer-major").lower()
         if _kv_layout_str in ("page-major", "page_major", "page"):
@@ -2841,8 +2865,25 @@ class _Worker:
         # Size for the worst case so B doesn't overflow → server's sink-
         # bounds check rejects writes → GPU-direct index_select trips a
         # CUDA OOB assertion.
+        # 2026-05-19: when scored_layers_mask is set (e.g. ICMS_SCORED_LAYERS
+        # for gemma-3 SWA models), the matching server patch makes FetchAll
+        # skip non-scored layers AND lay out sink slots by scored_rank. So
+        # we only need num_scored_layers × per_layer_bytes here instead of
+        # num_layers × per_layer_bytes. For gemma-3-27b that drops sink
+        # from 62 layers to 10, freeing ~22 GiB of GPU memory per worker.
         per_layer_bytes = self._k * self._geom.kv_page_bytes
-        sink_layers = max(self._score_stride, int(self._geom.num_layers))
+        # 2026-05-19: in contiguous-reuse mode (dense_layers_mask != 0),
+        # the server side runs without --scored-layers so it writes K/V
+        # for ALL num_layers slots (not just num_scored_layers). The
+        # client's reuse offset math (off + delta * per_layer_bytes for
+        # non-scored reuse layers) reads from slot abs_layer — so the
+        # sink MUST be sized for num_layers. Sizing for num_scored_layers
+        # would silently truncate reuse reads on layers > scored_rank.
+        _eff_layers = (int(self._geom.num_scored_layers)
+                       if (self._geom.scored_layers_mask != 0
+                           and self._geom.dense_layers_mask == 0)
+                       else int(self._geom.num_layers))
+        sink_layers = max(self._score_stride, _eff_layers)
         # B1: scale the sink to hold `_sink_slots` concurrent dumps.
         # Default _sink_slots=1 preserves legacy behavior; under
         # ICMS_ALLOW_BATCH=1 it defaults to max_num_seqs so the server's
@@ -4080,10 +4121,27 @@ class _Worker:
             # reuse offsets past the server's actual layer-delta stride.
             actual_k = len(reply.page_ids)
             per_layer_bytes = actual_k * self._geom.kv_page_bytes
+            # 2026-05-19: with scored_layers_mask set (e.g. gemma-3 SWA),
+            # the server's FetchAll worker only writes scored layers and
+            # packs them by scored_rank in the sink. Reflect that here:
+            # skip non-scored reuse layers (they short-circuit in
+            # wait_for_layer anyway), and compute the per-layer offset
+            # from scored_rank delta, not the abs_layer delta.
+            _mask_set = self._geom.scored_layers_mask != 0
+            if _mask_set:
+                _base_scored_rank = self._geom.scored_rank(next_layer_idx)
             for delta in range(1, reuse_through - next_layer_idx + 1):
                 reuse_layer = next_layer_idx + delta
+                if _mask_set and not self._geom.is_scored(reuse_layer):
+                    continue
+                if _mask_set:
+                    effective_delta = (
+                        self._geom.scored_rank(reuse_layer)
+                        - _base_scored_rank)
+                else:
+                    effective_delta = delta
                 reuse_attn = f"model.layers.{reuse_layer}.self_attn.attn"
-                reuse_offsets = [off + delta * per_layer_bytes
+                reuse_offsets = [off + effective_delta * per_layer_bytes
                                  for off in reply.sink_offsets]
                 with self._score_lock:
                     # 3-tuple now carries req_idx so on_layer_reuse can
@@ -4302,11 +4360,23 @@ class _Worker:
         # corresponding wait_for_layer call will also short-circuit and clear
         # the active fetch state so attention falls back to natural full-
         # context bt for those layers (e.g. SW layers in gemma-3).
+        #
+        # 2026-05-19: contiguous-reuse mode (dense_layers_mask != 0) instead
+        # routes non-scored layers through on_layer_reuse so they apply the
+        # cached page selection. Required for full-attention models (qwen3)
+        # where the gemma-SWA fallback path corrupts hidden states.
+        _contiguous_reuse = self._geom.dense_layers_mask != 0
         if not self._geom.is_scored(next_layer_idx):
+            if _contiguous_reuse:
+                self.on_layer_reuse(next_layer_idx, budget, stats)
             self._slack_probe_pre_hook(next_layer_idx)
             return
         try:
-            if (next_layer_idx % self._score_stride) != 0:
+            # Stride modular gate: only consulted in legacy mode. With
+            # contiguous-reuse every scored layer fires Score and the next
+            # scored layer in the mask delimits the reuse window.
+            if (not _contiguous_reuse
+                    and (next_layer_idx % self._score_stride) != 0):
                 self.on_layer_reuse(next_layer_idx, budget, stats)
                 if _diag:
                     t_exit = time.perf_counter()
@@ -4319,6 +4389,18 @@ class _Worker:
                     )
                 self._slack_probe_pre_hook(next_layer_idx)
                 return
+            # Per-layer dense budget override: ICMS_DENSE_LAYERS forces
+            # budget=1.0 on the listed layers (still subject to the mask
+            # gate above). Picks all pages → set_active leaves bt at
+            # natural length → effectively dense attention for L0,L1.
+            # Skip the override under ICMS_SCORING_MODE=subset_max: in
+            # that mode dense_layers_mask is used purely to activate
+            # contiguous-reuse (line 4368 gate); the scored layers
+            # themselves must keep their sparse subset_max budget.
+            if (self._geom.is_dense(next_layer_idx)
+                    and os.environ.get("ICMS_SCORING_MODE", "")
+                        != "subset_max"):
+                budget = 1.0
             self._on_layer_score_impl(
                 next_layer_idx, quest_query, budget, stats, connector_meta)
             if _diag:
@@ -4851,12 +4933,16 @@ class _Worker:
         # does — symptom of pending writes still in deferred-write
         # pipeline at long context (mistral-nemo 128K).
         if os.environ.get("ICMS_DIAG_CHAIN") == "1":
+            _flushed_local_v = int(getattr(rs, "flushed_local", -1))
+            _eff_stored_v = int(getattr(rs, "_effective_stored_groups", -1))
             logger.info(
                 "[diag-chain] PRE rid=%s layer=%d chain_len=%d "
                 "stored_groups=%d num_groups_written=%d "
+                "flushed_local=%d _effective_stored_groups=%d "
                 "effective_groups=%d client_total_pages=%d",
                 rid, next_layer_idx, len(rs.chain),
                 stored_groups, rs.num_groups_written,
+                _flushed_local_v, _eff_stored_v,
                 effective_groups, total_pages,
             )
         # 2026-05-08 race-audit follow-up: per-Score chain-state lag
@@ -4973,6 +5059,24 @@ class _Worker:
             os.environ.get("ICMS_DECODE_APPLY", "1") == "0"
             or len(already_fetched) >= total_pages
         )
+        # 2026-05-19 THRESHOLD-FLIP DIAG: report why the threshold flip path
+        # is/isn't firing each Score call. Useful when bitmap should be
+        # saturating but flip never fires.
+        if os.environ.get("ICMS_DIAG_BITMAP_GROWTH", "0") == "1" and is_decode:
+            _cond_decode = is_decode
+            _cond_threshold = len(already_fetched) >= _flip_threshold
+            _cond_safe = _flip_safe
+            _already_flipped = rs.dense_mode
+            logger.info(
+                "[diag-flip-thresh] rid=%s layer=%d "
+                "len_fetched=%d total_pages=%d _flip_threshold=%d _flip_frac=%.3f "
+                "decode=%s thresh_met=%s safe=%s already_flipped=%s "
+                "WILL_FIRE=%s",
+                rid, next_layer_idx,
+                len(already_fetched), total_pages, _flip_threshold, _flip_frac,
+                _cond_decode, _cond_threshold, _cond_safe, _already_flipped,
+                (_cond_decode and _cond_threshold and _cond_safe
+                 and not _already_flipped))
         if is_decode and len(already_fetched) >= _flip_threshold and _flip_safe:
             # Threshold reached (default = full saturation). Once dense_mode
             # flips, the Quest hook short-circuits at quest_hooks.py:458 and
@@ -5009,6 +5113,25 @@ class _Worker:
         if os.environ.get("ICMS_ORIGINAL_QUEST", "0") == "1":
             self._quest_local_score_one_layer(
                 rid, rs, next_layer_idx, quest_query, budget,
+                total_pages, already_fetched)
+            return
+
+        # ICMS_SCORING_MODE=subset_max — per-layer per-Q-head subset_max
+        # scoring (2026-05-19). For each scored layer, score with a small
+        # set of Q heads (e.g. 1-2 per layer, calibrated offline) and
+        # take per-page MAX across the subset, then top-K. Validated
+        # offline on qwen3-30b mk1/mk2/mk3: catches needle in 80-100% of
+        # examples at b=0.20 vs ~50-60% with baseline_sum32, at ~1/4 the
+        # FLOPs. Requires ICMS_SUBSET_HEADS_JSON pointing to a layer→
+        # subset mapping. See scripts/utils/subset_max_scoring.py.
+        if os.environ.get("ICMS_SCORING_MODE", "") == "subset_max":
+            if not getattr(self, "_subset_max_entry_logged", False):
+                logger.info("[icms_subset_max] env detected; entering "
+                             "subset_max path on layer=%d rid=%s",
+                             next_layer_idx, rid)
+                self._subset_max_entry_logged = True
+            self._subset_max_score_one_layer(
+                rid, rs, req_idx, next_layer_idx, quest_query, budget,
                 total_pages, already_fetched)
             return
 
@@ -5123,9 +5246,18 @@ class _Worker:
         # `_tp_broadcast_score_reply` below. _tp_broadcast_bool's TP=1
         # path is a no-op (returns input unchanged), so this is free
         # outside TP>1.
+        # 2026-05-19: in contiguous-reuse mode (dense_layers_mask != 0),
+        # FetchAll's _pending_reuse population skips non-scored layers
+        # (icms_connector.py:4101 _mask_set filter), so a dense L0/L1
+        # redirect via ceiling-snap would leave the intervening reuse
+        # layers (L3-L7 etc.) empty → wait_for_layer short-circuits →
+        # gemma-SWA fallback on qwen3 → corrupted hidden states. Keep
+        # dense scored layers on the Score path; its mask-driven
+        # reuse_through (line 5390) populates every intervening layer.
         ceiling_snap = (effective_budget >= 1.0 and total_pages > 0
                          and not is_decode
-                         and getattr(self, "_supports_fetch_all", False))
+                         and getattr(self, "_supports_fetch_all", False)
+                         and self._geom.dense_layers_mask == 0)
         ceiling_snap = _tp_broadcast_bool(
             ceiling_snap, self._tp_rank, self._tp_size)
         if ceiling_snap:
@@ -5330,8 +5462,17 @@ class _Worker:
         t_score_start = time.perf_counter()
         # Compute reuse range for this stride group.
         num_layers = self._geom.num_layers if self._geom else 48
-        reuse_through = min(
-            next_layer_idx + self._score_stride - 1, num_layers - 1)
+        if (self._geom is not None
+                and self._geom.dense_layers_mask != 0):
+            # Contiguous-reuse: window extends up to the next scored layer
+            # in the mask (exclusive), or to num_layers-1 if this is the
+            # last scored layer. Populates _pending_reuse for every
+            # intervening non-scored layer so they apply this page set.
+            _nxt = self._geom.next_scored_layer_after(next_layer_idx)
+            reuse_through = (_nxt - 1) if _nxt is not None else (num_layers - 1)
+        else:
+            reuse_through = min(
+                next_layer_idx + self._score_stride - 1, num_layers - 1)
 
         # ICMS_TRACE_FLAGS=1: snapshot flag state at the call site. The
         # actual clear happens inside rdma_client.py:193 (when
@@ -5372,6 +5513,18 @@ class _Worker:
                 _pack_fetch_bitmap(already_fetched, total_pages)
                 if is_decode and already_fetched else b""
             )
+            # 2026-05-19 BITMAP-WIRE DIAG: verify bitmap is actually being sent
+            # to server (non-empty bytes + popcount == len(already_fetched)).
+            if os.environ.get("ICMS_DIAG_BITMAP_GROWTH", "0") == "1":
+                _bm_len = len(fetch_bitmap) if fetch_bitmap else 0
+                _bm_popcount = sum(bin(b).count("1") for b in fetch_bitmap) if fetch_bitmap else 0
+                logger.info(
+                    "[diag-wire] rid=%s layer=%d is_decode=%s "
+                    "already_fetched=%d total_pages=%d "
+                    "bitmap_bytes=%d bitmap_popcount=%d k=%d",
+                    rid, next_layer_idx, is_decode,
+                    len(already_fetched), total_pages,
+                    _bm_len, _bm_popcount, k)
             if self._tp_size > 1 and self._tp_rank != 0:
                 reply = None
             else:
@@ -5892,6 +6045,83 @@ class _Worker:
                     rs.last_scores_by_layer[int(next_layer_idx)] = (
                         [float(s) for s in reply.scores]
                         if reply.scores is not None else [])
+                    # Per-score-call snapshot for offline analysis.
+                    # Earlier version keyed by a forward-pass counter
+                    # bumped at start_load_kv, but that callback's
+                    # early-returns (worker=None, meta=None) skipped
+                    # increments — so multiple score calls collapsed
+                    # to the same key and overwrote each other.
+                    # Switched to a per-call counter incremented here,
+                    # guaranteed unique per scoring invocation, so
+                    # prefill picks and decode picks always live in
+                    # separate cells. Key = (call_idx, layer_idx) →
+                    # also stash is_decode at record time so the
+                    # analyzer can tell which calls fired pre- vs
+                    # post-prefill_done flip.
+                    if not hasattr(rs, "picked_call_log"):
+                        rs.picked_call_log = []
+                    _call_idx = len(rs.picked_call_log)
+                    # Diagnostic: compute full per-page per-head Quest
+                    # scores locally (using THIS call's Q + the
+                    # currently-stored summaries). The server's reply
+                    # only returns scores for the picked top-k, so to
+                    # know the needle's rank we must reproduce the
+                    # ranking. Identical math as the server-side AVX2
+                    # kernel: score(p,h) = max(Q_h·kmin_p,h, Q_h·kmax_p,h).
+                    # Stored as (P, H) fp32 tensor. ~32KB per call at
+                    # h32k×4-heads. Gated to score-dump mode so the
+                    # production hot path is unaffected.
+                    _full_scores_ph = None
+                    if os.environ.get("ICMS_DIAG_SCORE_DUMP"):
+                        try:
+                            _items_d = rs.quest_gpu_summaries.get(
+                                next_layer_idx)
+                            if (_items_d
+                                    and isinstance(quest_query,
+                                                    torch.Tensor)):
+                                _items_d = sorted(_items_d,
+                                                   key=lambda t: t[0])[
+                                    :total_pages]
+                                _kmin_t = torch.stack(
+                                    [m for _, m, _ in _items_d], dim=0
+                                ).float()  # (P, H, D)
+                                _kmax_t = torch.stack(
+                                    [m for _, _, m in _items_d], dim=0
+                                ).float()
+                                _q_t = quest_query.detach().cpu().float()
+                                if _q_t.dim() == 3:
+                                    # (tokens, H, D) → token-mean
+                                    _q_t = _q_t.mean(dim=0)
+                                if _q_t.dim() == 2:
+                                    H_q = _q_t.shape[0]
+                                    H_k = _kmin_t.shape[1]
+                                    if H_q != H_k and H_q % H_k == 0:
+                                        _q_t = _q_t.view(
+                                            H_k, H_q // H_k, -1
+                                            ).mean(dim=1)
+                                    if _q_t.shape[0] == H_k:
+                                        _s_lo = (_q_t.unsqueeze(0)
+                                                  * _kmin_t).sum(dim=-1)
+                                        _s_hi = (_q_t.unsqueeze(0)
+                                                  * _kmax_t).sum(dim=-1)
+                                        _full_scores_ph = (
+                                            torch.maximum(_s_lo, _s_hi)
+                                            .half())  # store fp16 to halve size
+                        except Exception as _e_fsc:
+                            logger.warning(
+                                "[icms_diag_score_dump] full-scores "
+                                "compute failed L=%d rid=%s: %s",
+                                next_layer_idx, rid, _e_fsc)
+                    rs.picked_call_log.append({
+                        "call": _call_idx,
+                        "layer": int(next_layer_idx),
+                        "is_decode": bool(self._prefill_done),
+                        "budget": float(effective_budget),
+                        "k": int(k),
+                        "total_pages": int(total_pages),
+                        "picked": [int(p) for p in reply.page_ids],
+                        "full_scores_per_head": _full_scores_ph,
+                    })
                 except Exception as _e_picked:
                     logger.warning(
                         "[icms_diag_score_dump] picked-stash failed "
@@ -5978,6 +6208,23 @@ class _Worker:
             prev_size = len(page_set)
             if reply.page_ids:
                 page_set.update(reply.page_ids)
+            # 2026-05-19 BITMAP-GROWTH DIAG: per-Score-call log of how the
+            # bitmap is growing. Helps diagnose why dense_mode flip doesn't
+            # fire at default _flip_frac=1.0 for sparse-decode-with-budget.
+            # Enable by setting ICMS_DIAG_BITMAP_GROWTH=1.
+            if os.environ.get("ICMS_DIAG_BITMAP_GROWTH", "0") == "1":
+                _reply_n = len(reply.page_ids) if reply.page_ids else 0
+                _new_size = len(page_set)
+                _delta = _new_size - prev_size
+                _dups = _reply_n - _delta
+                logger.info(
+                    "[diag-bitmap] rid=%s layer=%d is_decode=%s "
+                    "reply_n=%d new_pages=%d dups=%d "
+                    "prev_size=%d new_size=%d total_pages=%d frac=%.3f",
+                    rid, next_layer_idx, is_decode,
+                    _reply_n, _delta, _dups,
+                    prev_size, _new_size, total_pages,
+                    (_new_size / total_pages if total_pages else 0.0))
             # 2026-05-07 BUG FIX: server-truth chain-state sync.
             # Symptom: at long context (mistral-nemo 128K), the server's
             # trie has +1 more committed group than the connector's
@@ -6098,6 +6345,20 @@ class _Worker:
                 os.environ.get("ICMS_M4_EARLY_FLIP", "0") == "1"
                 or os.environ.get("ICMS_DECODE_APPLY", "1") == "0"
             )
+            # 2026-05-19 M4 NEAR-MISS DIAG: log every Score call where M4
+            # CONDITION (page_set == prev_size, no new pages) is met,
+            # regardless of whether _m4_flip_enabled. Lets us see if
+            # saturation IS detected but only gating is blocking the flip.
+            if (os.environ.get("ICMS_DIAG_BITMAP_GROWTH", "0") == "1"
+                    and is_decode and len(page_set) == prev_size):
+                logger.info(
+                    "[diag-m4-near] rid=%s layer=%d "
+                    "len_fetched=%d total_pages=%d "
+                    "m4_enabled=%s already_flipped=%s "
+                    "(page_set == prev_size: bitmap saturated)",
+                    rid, next_layer_idx,
+                    len(page_set), total_pages,
+                    _m4_flip_enabled, rs.dense_mode)
             if (is_decode and not rs.dense_mode and len(page_set) == prev_size
                     and _m4_flip_enabled):
                 rs.dense_mode = True
@@ -6300,6 +6561,496 @@ class _Worker:
             "fetched_so_far=%d wall_us=%.1f",
             next_layer_idx, total_pages, k, len(picked),
             len(rs.fetched_pages.get(next_layer_idx, set())), wall_us)
+
+    def _load_subset_heads_config(self):
+        """Lazy-load the per-layer Q-head subset mapping for the
+        ICMS_SCORING_MODE=subset_max path. Cached on self.
+
+        File schema (JSON):
+          {"0": [10, 15], "6": [12, 4], ...}
+            or
+          {"layers": {...}, "k_heads": 2, "model": "qwen3"}
+
+        Layer indices not present in the mapping fall back to the
+        default ICMS_SUBSET_DEFAULT_HEADS (single int q-head) or are
+        skipped entirely (no scoring → dense fall-through).
+        """
+        cached = getattr(self, "_subset_heads_cfg", None)
+        if cached is not None:
+            return cached
+        path = os.environ.get("ICMS_SUBSET_HEADS_JSON", "")
+        cfg: dict[int, list[int]] = {}
+        if path:
+            try:
+                import json as _json
+                with open(path) as _f:
+                    raw = _json.load(_f)
+                if isinstance(raw, dict) and "layers" in raw:
+                    raw = raw["layers"]
+                if isinstance(raw, dict):
+                    for k, v in raw.items():
+                        try:
+                            li = int(k)
+                        except (TypeError, ValueError):
+                            continue
+                        if (isinstance(v, list)
+                                and all(isinstance(x, int) for x in v)):
+                            cfg[li] = list(v)
+                if not cfg:
+                    logger.warning(
+                        "[icms_subset_max] %s parsed but produced empty"
+                        " layer→subset mapping", path)
+            except Exception as _e:
+                logger.warning(
+                    "[icms_subset_max] failed to load %s: %s",
+                    path, _e)
+        else:
+            logger.warning(
+                "[icms_subset_max] ICMS_SUBSET_HEADS_JSON not set; "
+                "subset_max scoring will fall back to all-heads sum.")
+        # Optional default for layers not in the mapping.
+        try:
+            default_h = os.environ.get("ICMS_SUBSET_DEFAULT_HEADS", "")
+            if default_h:
+                cfg.setdefault("__default__",  # type: ignore[arg-type]
+                                [int(x) for x in default_h.split(",")])
+        except Exception:
+            pass
+        self._subset_heads_cfg = cfg
+        return cfg
+
+    def _subset_max_score_one_layer(self, rid, rs, req_idx,
+                                      next_layer_idx,
+                                      quest_query, budget,
+                                      total_pages, already_fetched):
+        """ICMS_SCORING_MODE=subset_max path (2026-05-19, server-fetch
+        version). Per-layer per-Q-head subset_max top-K.
+
+        Mirrors _quest_per_kv_head_score_one_layer's data plane:
+          1. Fetch per-page summaries (kmin, kmax) for THIS layer from
+             the server via fetch_summaries_per_head — the chain on the
+             server has them written by the cache rid's prefill.
+          2. Reshape sink bytes → (kmin, kmax) tensors.
+          3. Apply subset_max scoring: per-channel-max-summed Quest
+             score per Q-head in the configured subset, take per-page
+             MAX across the subset, top-K of that = picks.
+          4. Fetch picked pages' KV via fetch_union_per_head — bytes
+             land in the main KV sink at known offsets.
+          5. Synthesize a ScoreReply with the picks + sink_offsets and
+             route through _pending_scores so the existing apply path
+             (_apply_selective_attention) trims attention to the picks.
+
+        TP=1 only — same constraint as ICMS_ORIGINAL_QUEST and
+        ICMS_QUEST_MODE=per_kv_head. unix-socket client only (the
+        per-head opcodes don't exist on RDMA/shmem clients).
+
+        Empirical (qwen3-30b, h32k, mk1/mk2/mk3, 2026-05-19 offline):
+          * K_heads=1 per layer: ~75% needle pickup at b=0.20.
+          * K_heads=2 per layer: ~85-100% pickup.
+          * K_heads>=4 starts hurting (max() noise). Stay at 1-3.
+
+        Configuration:
+          ICMS_SCORING_MODE=subset_max
+          ICMS_SUBSET_HEADS_JSON=path.json
+          ICMS_SUBSET_DEFAULT_HEADS=10,15
+        """
+        if not isinstance(quest_query, torch.Tensor) or quest_query.ndim < 2:
+            if not getattr(self, "_subset_max_qskip_logged", False):
+                logger.warning("[icms_subset_max] skipping layer=%d: "
+                                "quest_query not 2D Tensor (got %s)",
+                                next_layer_idx, type(quest_query).__name__)
+                self._subset_max_qskip_logged = True
+            return
+        if self._tp_size > 1:
+            if not getattr(self, "_subset_max_tp_warned", False):
+                logger.warning(
+                    "[icms_subset_max] TP=1 only; got tp_size=%d. "
+                    "Falling through.", self._tp_size)
+                self._subset_max_tp_warned = True
+            return
+        if total_pages <= 0 or self._client is None or self._geom is None:
+            return
+        if not hasattr(self._client, "fetch_summaries_per_head"):
+            if not getattr(self, "_subset_max_client_unsupported_warned",
+                            False):
+                logger.warning(
+                    "[icms_subset_max] active client (%s) lacks "
+                    "fetch_summaries_per_head; subset_max requires the "
+                    "unix-socket IcmsClient. No-op.",
+                    type(self._client).__name__)
+                self._subset_max_client_unsupported_warned = True
+            return
+
+        cfg = self._load_subset_heads_config()
+        subset_for_layer = cfg.get(int(next_layer_idx))
+        if subset_for_layer is None:
+            subset_for_layer = cfg.get("__default__")  # type: ignore[arg-type]
+        if not subset_for_layer:
+            if not hasattr(self, "_subset_max_missing_warned"):
+                self._subset_max_missing_warned = set()
+            if next_layer_idx not in self._subset_max_missing_warned:
+                self._subset_max_missing_warned.add(next_layer_idx)
+                logger.warning(
+                    "[icms_subset_max] no subset configured for layer %d; "
+                    "skipping scoring (dense fall-through).",
+                    next_layer_idx)
+            return
+
+        sum_sink = self._ensure_summary_sink(total_pages)
+        if sum_sink is None:
+            return
+        if not getattr(self, "_subset_max_first_call_logged", False):
+            logger.info(
+                "[icms_subset_max] FIRST CALL — subset_max active "
+                "(rid=%s layer=%d total_pages=%d budget=%.3f subset=%s)",
+                rid[:8], next_layer_idx, total_pages, float(budget),
+                subset_for_layer)
+            self._subset_max_first_call_logged = True
+
+        chain = self._rank_chain(rs.chain)
+        icms_rid = self._icms_request_id(rid, 0)
+        t0 = time.perf_counter()
+
+        # ── 1. Fetch per-page summaries for THIS layer from server ──
+        try:
+            with self._rpc_lock:
+                sum_reply = self._client.fetch_summaries_per_head(
+                    request_id=icms_rid, chain=chain,
+                    layer=next_layer_idx,
+                    sink=sum_sink, reuse_through_layer=next_layer_idx)
+        except IcmsError as e:
+            logger.warning(
+                "[icms_subset_max] FetchSummariesPerHead failed at "
+                "layer %d (rid=%s): %r",
+                next_layer_idx, rid[:8], e)
+            return
+
+        P = len(sum_reply.page_ids)
+        if P == 0:
+            return
+        # Pin the page_id ordering invariant: server MUST return
+        # page_ids = [0, 1, ..., P-1] so scorer-returned indices (row
+        # indices into kmin/kmax) coincide with real page IDs we pass
+        # back to fetch_union_per_head. Same invariant the per-kv-head
+        # path pins (see :6947-6953).
+        if (sum_reply.page_ids[0] != 0 or sum_reply.page_ids[-1] != P - 1
+                or len(sum_reply.page_ids) != P):
+            logger.warning(
+                "[icms_subset_max] sum_reply.page_ids violates [0..P-1] "
+                "contract at layer %d (P=%d, head=%s, tail=%s); aborting "
+                "to avoid corrupted KV reads.",
+                next_layer_idx, P, sum_reply.page_ids[:4],
+                sum_reply.page_ids[-4:])
+            return
+
+        # ── 2. Reshape sink bytes → (kmin, kmax) on the GPU ──
+        # Layout: kmin.tobytes() ++ kmax.tobytes(), each [H_kv, D] fp16,
+        # page p at offset slot_base + p * spb. Mirror lines 6975-7035
+        # of the per-kv-head path.
+        H_kv = int(self._geom.num_kv_heads)
+        D = int(self._geom.head_dim)
+        elem = int(self._geom.elem_bytes)
+        spb = int(self._geom.summary_page_bytes)
+        if elem != 2:
+            logger.warning(
+                "[icms_subset_max] elem_bytes=%d not supported in v1 "
+                "(fp16 only); no-op.", elem)
+            return
+        slot_base = int(sum_reply.sink_offsets[0])
+        total_bytes = P * spb
+        contiguous = all(
+            int(sum_reply.sink_offsets[i]) == slot_base + i * spb
+            for i in range(P))
+        device = quest_query.device if quest_query.is_cuda else "cuda"
+        if getattr(sum_sink, "is_gpu_direct", False):
+            gpu_tensor = getattr(sum_sink, "gpu_tensor", None)
+            if gpu_tensor is None:
+                logger.warning(
+                    "[icms_subset_max] GPU-IPC summary sink missing "
+                    "gpu_tensor; aborting layer %d", next_layer_idx)
+                return
+            if contiguous:
+                flat_u8 = gpu_tensor[
+                    slot_base:slot_base + total_bytes]
+            else:
+                flat_u8 = torch.empty(total_bytes, dtype=torch.uint8,
+                                      device=gpu_tensor.device)
+                for i, off in enumerate(sum_reply.sink_offsets):
+                    flat_u8[i * spb:(i + 1) * spb] = \
+                        gpu_tensor[off:off + spb]
+            flat_gpu = flat_u8.view(torch.float16).reshape(
+                P, 2, H_kv, D)
+            if flat_gpu.device != torch.device(device):
+                flat_gpu = flat_gpu.to(device=device, non_blocking=True)
+        else:
+            view = sum_sink.view()
+            if contiguous:
+                host_bytes = bytes(view[slot_base:slot_base + total_bytes])
+            else:
+                host_buf = bytearray(total_bytes)
+                for i, off in enumerate(sum_reply.sink_offsets):
+                    host_buf[i * spb:(i + 1) * spb] = bytes(
+                        view[off:off + spb])
+                host_bytes = bytes(host_buf)
+            flat_cpu = torch.frombuffer(host_bytes, dtype=torch.float16,
+                                          count=P * 2 * H_kv * D).reshape(
+                P, 2, H_kv, D)
+            flat_gpu = flat_cpu.to(device=device, non_blocking=True)
+        kmin = flat_gpu[:, 0, :, :].contiguous()
+        kmax = flat_gpu[:, 1, :, :].contiguous()
+
+        # ── 3. Subset_max scoring on GPU ──
+        # Q pooling — token-mean across the prefill chunk's tokens.
+        q = quest_query.detach()
+        if q.ndim == 3:
+            q = q.mean(dim=0)
+        if q.ndim != 2:
+            return
+        q_f = q.to(torch.float32).to(device)
+        kmin_f = kmin.to(torch.float32)
+        kmax_f = kmax.to(torch.float32)
+        H_q = q_f.shape[0]
+        if H_q % H_kv != 0:
+            logger.warning(
+                "[icms_subset_max] GQA mismatch H_q=%d H_kv=%d; skip.",
+                H_q, H_kv)
+            return
+        group = H_q // H_kv
+
+        # Filter subset to valid head indices.
+        subset_valid = [int(h) for h in subset_for_layer
+                         if 0 <= int(h) < H_q]
+        if not subset_valid:
+            return
+
+        # subset_max: score per Q head in subset, take per-page MAX,
+        # then top-K of that. Picks live in chain-page space (0..P-1).
+        k = max(1, int(P * float(budget)))
+        picked: list[int] = []
+        try:
+            # Quest's upper-bound formula is PER-CHANNEL max, summed
+            # across D — see scripts/utils/subset_max_scoring.py for the
+            # discussion. Matches storage_service/src/scoring/
+            # quest_kernel.h exactly.
+            kmin_exp = kmin_f.repeat_interleave(group, dim=1)
+            kmax_exp = kmax_f.repeat_interleave(group, dim=1)
+            q_b = q_f.unsqueeze(0)
+            per_channel_max = torch.maximum(q_b * kmin_exp,
+                                              q_b * kmax_exp)
+            per_qh = per_channel_max.sum(dim=-1)  # (P, H_q)
+            sub_idx = torch.as_tensor(subset_valid, dtype=torch.long,
+                                        device=per_qh.device)
+            sub_scores = per_qh.index_select(1, sub_idx)
+            page_scores = sub_scores.max(dim=-1).values
+            # Exclude already-fetched pages by setting their score to
+            # -inf so top-K skips them.
+            if already_fetched:
+                for ap in already_fetched:
+                    if 0 <= ap < page_scores.numel():
+                        page_scores[ap] = float("-inf")
+            P = page_scores.numel()
+            k = min(k, P)
+            top_idx = torch.topk(page_scores, k).indices.tolist()
+            # Return chain-page indices (0..P-1, positions in the sorted
+            # kmin tensor) to match the existing quest_local_scorer
+            # return shape and what rs.fetched_pages downstream expects.
+            picked = [int(i) for i in top_idx
+                       if page_scores[i].item() != float("-inf")]
+        except Exception as e:
+            logger.warning("[icms_subset_max] scoring failed at "
+                            "layer %d rid=%s: %s",
+                            next_layer_idx, rid, e)
+
+        if not picked:
+            if not getattr(self, "_subset_max_empty_picks_logged", False):
+                logger.info(
+                    "[icms_subset_max] layer %d picks empty rid=%s — "
+                    "scoring fired but selected 0 pages", next_layer_idx,
+                    rid[:8])
+                self._subset_max_empty_picks_logged = True
+            return
+
+        if not getattr(self, "_subset_max_picks_logged_layers", set()):
+            self._subset_max_picks_logged_layers = set()
+        if next_layer_idx not in self._subset_max_picks_logged_layers:
+            self._subset_max_picks_logged_layers.add(next_layer_idx)
+            logger.info(
+                "[icms_subset_max] layer %d rid=%s picked %d pages, "
+                "subset=%s, first10=%s",
+                next_layer_idx, rid[:8], len(picked), subset_valid,
+                picked[:10])
+
+        if os.environ.get("ICMS_DIAG_SCORE_DUMP", "") and int(self._tp_rank) == 0:
+            try:
+                rs.last_picked_by_layer[int(next_layer_idx)] = list(picked)
+                if int(next_layer_idx) not in rs.last_q_by_layer:
+                    rs.last_q_by_layer[int(next_layer_idx)] = torch.zeros(
+                        1, dtype=torch.uint8)
+                if not hasattr(rs, "picked_call_log"):
+                    rs.picked_call_log = []
+                rs.picked_call_log.append({
+                    "call": len(rs.picked_call_log),
+                    "layer": int(next_layer_idx),
+                    "is_decode": bool(self._prefill_done),
+                    "budget": float(budget),
+                    "k": int(k),
+                    "total_pages": int(total_pages),
+                    "picked": list(picked),
+                    "full_scores_per_head": None,
+                    "scored_heads_subset": list(subset_valid),
+                })
+            except Exception as _e_stash:
+                logger.warning(
+                    "[icms_subset_max] dump stash failed at layer %d "
+                    "rid=%s: %s", next_layer_idx, rid, _e_stash)
+
+        # === APPLY PATH WIRING (2026-05-19 fix per audit) ===
+        # Computing picks alone isn't enough — the attention kernel reads
+        # picked KV bytes from a contiguous "sink" buffer via offsets
+        # carried in _pending_scores[layer][rid]. Without populating
+        # _pending_scores with valid sink_offsets, the apply path
+        # (_apply_selective_attention) never runs and the attention
+        # kernel falls through to the natural (full) block_table —
+        # under ICMS_BENCH_PREFIX_CACHE=0 the haystack pages aren't
+        # all written yet → garbled attention → gibberish output.
+        #
+        # Fix: mirror _quest_per_kv_head_score_one_layer's pattern.
+        # Fire fetch_union_per_head to ask the server to scatter the
+        # picked pages' KV into our sink, then synthesize a ScoreReply
+        # and route through the existing _pending_scores plumbing.
+        if (self._sink_pool is None
+                or not hasattr(self._client, "fetch_union_per_head")):
+            if not getattr(self, "_subset_max_apply_unsupported_warned",
+                            False):
+                logger.warning(
+                    "[icms_subset_max] client lacks fetch_union_per_head "
+                    "or sink_pool missing; apply path cannot be wired.")
+                self._subset_max_apply_unsupported_warned = True
+            return
+
+        # Fetch THIS layer + the next stride-1 layers' KV in one RPC, so
+        # the unscored layers in the stride window have their KV in the
+        # sink at known offsets. Without this, only the scored layer
+        # gets KV; downstream apply for unscored layers reads stale
+        # offsets → garbled attention. Mirrors the BF2 reuse_through
+        # mechanism (line ~4100).
+        num_layers = int(self._geom.num_layers)
+        if self._geom.dense_layers_mask != 0:
+            _nxt = self._geom.next_scored_layer_after(next_layer_idx)
+            reuse_through = (_nxt - 1) if _nxt is not None else (num_layers - 1)
+        else:
+            reuse_through = min(next_layer_idx + self._score_stride - 1,
+                                  num_layers - 1)
+        try:
+            with self._rpc_lock:  # X1 (race-audit): serialize tx_/rx_
+                union_reply = self._client.fetch_union_per_head(
+                    request_id=icms_rid, chain=chain,
+                    layer=next_layer_idx,
+                    sink=self._sink_pool.sink, page_ids=picked,
+                    reuse_through_layer=reuse_through)
+        except IcmsError as e:
+            logger.warning(
+                "[icms_subset_max] FetchUnionPerHead failed at "
+                "layer %d (rid=%s, k=%d, reuse_through=%d): %r",
+                next_layer_idx, rid[:8], len(picked), reuse_through, e)
+            return
+        except Exception as e:
+            logger.warning(
+                "[icms_subset_max] FetchUnionPerHead unexpected at "
+                "layer %d (rid=%s, k=%d): %r",
+                next_layer_idx, rid[:8], len(picked), e)
+            return
+
+        # Synthesize a ScoreReply to drop into _pending_scores. The
+        # apply path doesn't care that we computed picks locally — it
+        # only needs (page_ids, sink_offsets, status). Scores are
+        # decorative (used for perf-sweep histograms only).
+        try:
+            from icms_client.protocol import ScoreReply
+            synth = ScoreReply(
+                request_id=icms_rid,
+                status=0,
+                trie_walk_ns=0,
+                summary_read_ns=0,
+                score_ns=int((time.perf_counter() - t0) * 1e9),
+                sink_write_ns=int(getattr(union_reply,
+                                           "sink_write_ns", 0)),
+                cache_hit=False,
+                concurrent_requests=int(getattr(
+                    union_reply, "concurrent_requests", 0)),
+                server_ingest_to_ready_ns=int(getattr(
+                    union_reply, "server_ingest_to_ready_ns", 0)),
+                effective_supply_bps=int(getattr(
+                    union_reply, "effective_supply_bps", 0)),
+                page_ids=list(picked),
+                scores=[0.0] * len(picked),
+                sink_offsets=list(union_reply.sink_offsets),
+            )
+        except Exception as e:
+            logger.warning(
+                "[icms_subset_max] synth ScoreReply failed at "
+                "layer %d: %s", next_layer_idx, e)
+            return
+
+        attn_layer_name = f"model.layers.{next_layer_idx}.self_attn.attn"
+        with self._score_lock:
+            self._assert_pending_scores_no_clobber(
+                attn_layer_name, rid, source="subset_max-score-landing")
+            self._pending_scores.setdefault(
+                attn_layer_name, {})[rid] = (synth, req_idx)
+
+        # Suspect #2 probe (audit a6818fa, 2026-05-20): is the apply path
+        # silently filtering picks via `pid >= context_pages` because
+        # rs.stored_groups is 0 at write time? context_pages = stored_groups*32.
+        if not getattr(self, "_subset_max_ctx_probe_logged", False):
+            try:
+                _sg = int(getattr(rs, "stored_groups", 0))
+                _ngw = int(getattr(rs, "num_groups_written", 0))
+                _ctx = max(_sg, _ngw) * 32
+                _above = sum(1 for p in picked if p >= _ctx) if _ctx > 0 else len(picked)
+                logger.info(
+                    "[icms_subset_max] CTX-PROBE rid=%s layer=%d P=%d k=%d "
+                    "stored_groups=%d ngw=%d ctx_pages=%d picks_above_ctx=%d "
+                    "picks_minmax=(%d,%d)",
+                    rid[:8], next_layer_idx, P, k, _sg, _ngw, _ctx, _above,
+                    min(picked), max(picked))
+                self._subset_max_ctx_probe_logged = True
+            except Exception:
+                pass
+
+        # Populate _pending_reuse for the stride/contig-reuse window.
+        # on_layer_reuse at each unscored layer pops the entry and promotes
+        # it to _pending_scores with the adjusted sink offsets. Unlike the
+        # FetchAll path (which packs scored-only in the sink, hence
+        # scored_rank delta), fetch_union_per_head packs ALL layers in
+        # [layer..reuse_through_layer] sequentially — see
+        # handlers_per_head.cc handle_fetch_union_per_head's L-loop — so
+        # we use abs-layer delta and populate EVERY layer in the window
+        # (including non-scored gap layers in shifted mode, which need
+        # reuse entries so on_layer_reuse promotes them).
+        actual_k = len(picked)
+        per_layer_bytes = actual_k * int(self._geom.kv_page_bytes)
+        for delta in range(1, reuse_through - next_layer_idx + 1):
+            reuse_layer = next_layer_idx + delta
+            reuse_attn = f"model.layers.{reuse_layer}.self_attn.attn"
+            reuse_offsets = [off + delta * per_layer_bytes
+                              for off in union_reply.sink_offsets]
+            with self._score_lock:
+                self._pending_reuse.setdefault(reuse_attn, {})[rid] = (
+                    synth, reuse_offsets, req_idx)
+
+        wall_us = (time.perf_counter() - t0) * 1e6
+        rs.fetched_pages.setdefault(next_layer_idx, set()).update(picked)
+        self.stats.record_score(wall_us, bool(picked), picked,
+                                  next_layer_idx)
+        # Force-bump silent-fallback-guard counter even at stats level=0.
+        if self.stats.level == 0:
+            self.stats.total_score_calls += 1
+        logger.debug(
+            "[icms_subset_max] layer=%d total_pages=%d k=%d "
+            "subset=%s n_picked=%d sink_offsets=%d wall_us=%.1f",
+            next_layer_idx, total_pages, k, subset_valid, len(picked),
+            len(union_reply.sink_offsets), wall_us)
 
     def _ensure_summary_sink(self, total_pages: int) -> "Sink | None":
         """Lazy-allocate (or grow) the per-head summaries sink.
@@ -6821,17 +7572,29 @@ class _Worker:
         _abs_layer_for_mask = self._extract_layer_idx(layer_name)
         if (_abs_layer_for_mask is not None
                 and not self._geom.is_scored(_abs_layer_for_mask)):
-            from vllm.v1.attention import icms_fetch_state
-            icms_fetch_state.clear()
-            # KV-provenance: this is the non-scored short-circuit path.
-            # Attention will read the NATURAL bt from attn_metadata,
-            # which includes ext_comp blocks that ICMS may not have
-            # populated for this layer. Check per active rid and log
-            # any unpopulated ext_comp blocks in their bt row.
-            if icms_provenance.is_enabled():
-                self._provenance_check_natural_bt(
-                    layer_name, _abs_layer_for_mask, path="nonscored")
-            return
+            # Contiguous-reuse mode (dense_layers_mask != 0): non-scored
+            # layers should already have a pending reuse entry promoted
+            # by on_layer_reuse from the per-layer hook chain. Fall
+            # through to the normal pop+apply so they apply the cached
+            # selection. Only short-circuit (legacy gemma-SWA behavior)
+            # when no pending data exists.
+            _fallthrough = False
+            if self._geom.dense_layers_mask != 0:
+                _canonical_key = (
+                    f"model.layers.{_abs_layer_for_mask}.self_attn.attn")
+                with self._score_lock:
+                    _fallthrough = _canonical_key in self._pending_scores
+            if not _fallthrough:
+                from vllm.v1.attention import icms_fetch_state
+                icms_fetch_state.clear()
+                # KV-provenance: this is the non-scored short-circuit
+                # path. Attention will read the NATURAL bt from
+                # attn_metadata, which includes ext_comp blocks that
+                # ICMS may not have populated for this layer.
+                if icms_provenance.is_enabled():
+                    self._provenance_check_natural_bt(
+                        layer_name, _abs_layer_for_mask, path="nonscored")
+                return
         # 2026-05-16 fix: every write to `_pending_scores` keys by the
         # CONSTRUCTED `f"model.layers.{idx}.self_attn.attn"` (5+ call
         # sites: faps-fast-path-promote ~3793, faps-slow-path-landing
@@ -11019,11 +11782,18 @@ class _Worker:
                     getattr(rs, "last_picked_by_layer", {}))
                 _scores_by_layer = dict(
                     getattr(rs, "last_scores_by_layer", {}))
+                # picked_call_log: ordered list of every score call's
+                # picks for this rid, with the (call_idx, layer,
+                # is_decode, budget, k, total_pages, picked) tuple.
+                # Analyzer should partition by is_decode to separate
+                # prefill from decode-time picks.
+                _picked_call_log = list(getattr(rs, "picked_call_log", []))
                 torch.save({
                     "rid": str(request_id),
                     "summaries": _by_layer,
                     "q_by_layer": _q_by_layer,
                     "picked_by_layer": _picked_by_layer,
+                    "picked_call_log": _picked_call_log,
                     "scores_by_layer": _scores_by_layer,
                     "tp_rank": int(self._tp_rank),
                     "tp_size": int(self._tp_size),
