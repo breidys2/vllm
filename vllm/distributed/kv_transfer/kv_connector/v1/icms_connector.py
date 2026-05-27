@@ -1741,6 +1741,14 @@ class _Scheduler:
 
     def __init__(self, vllm_config):
         self._vllm_config = vllm_config
+        # 2026-05-26: snapshot vLLM's prefix-cache flag so
+        # get_num_new_matched_tokens can short-circuit when prefix
+        # caching is OFF and the model has unscored (SW) layers — see
+        # hybrid-cold-fallback comment in get_num_new_matched_tokens.
+        _cc = getattr(vllm_config, "cache_config", None)
+        self._vllm_prefix_cache_enabled = bool(
+            _cc is not None and getattr(_cc, "enable_prefix_caching", False))
+        self._hybrid_cold_logged = False
         # Per-request: group hashes chain (C1). Populated on first alloc.
         self._chains: dict[str, list[int]] = {}
         # Per-request: in-order CPU block IDs.
@@ -2014,6 +2022,39 @@ class _Scheduler:
             if _ICMS_FULLTRACE_ENABLED:
                 _icms_fulltrace(
                     "gnnmt_exit_force_cold", rid=request.request_id,
+                    returned=(0, False))
+            return 0, False
+        # 2026-05-26 HYBRID-SW COLD FALLBACK: when vLLM's prefix cache is
+        # OFF and the model has non-scored layers (e.g. gemma-3 sliding-
+        # window), reporting matched_tokens > 0 tells vLLM to skip
+        # haystack prefill. ICMS apply only restores K/V for the scored
+        # (dense) layers via the trimmed bt; the SW layers' K/V is never
+        # written into vLLM's freshly-allocated blocks → SW attention
+        # reads stale/uninitialized memory → garbage output that
+        # alternates per cycle as the vLLM block allocator hands back
+        # different block IDs. Force cold-prefill so all 62 gemma-3
+        # layers get fresh K/V; ICMS apply still trims the dense layers
+        # to top-K from the sink. Cost: one full haystack re-prefill
+        # per budget cycle (~1 s at h32k, ~5 s at h128k) — negligible
+        # for sparse RULER cells. ICMS_HYBRID_COLD_DISABLE=1 disables
+        # this safety net for diagnostic A/B.
+        _hybrid_cold = (
+            not getattr(self, "_vllm_prefix_cache_enabled", True)
+            and os.environ.get("ICMS_SCORED_LAYERS", "").strip() != ""
+            and os.environ.get("ICMS_HYBRID_COLD_DISABLE") != "1"
+        )
+        if _hybrid_cold:
+            if not getattr(self, "_hybrid_cold_logged", False):
+                logger.info(
+                    "[icms] hybrid-cold-fallback active: prefix_cache=OFF "
+                    "and ICMS_SCORED_LAYERS set; returning 0 matched_tokens "
+                    "so vLLM cold-prefills all layers (preserves SW-layer "
+                    "KV in models like gemma-3). Set "
+                    "ICMS_HYBRID_COLD_DISABLE=1 to skip this safety net.")
+                self._hybrid_cold_logged = True
+            if _ICMS_FULLTRACE_ENABLED:
+                _icms_fulltrace(
+                    "gnnmt_exit_hybrid_cold", rid=request.request_id,
                     returned=(0, False))
             return 0, False
         # 2026-05-12 CROSS-RID BLOCK ALIASING FALLBACK (Option 1, opt-in):
@@ -2825,9 +2866,27 @@ class _Worker:
         # model geometry. The allocator pairs end-to-end slack with total
         # KV bytes (all layers × pages × kv_page_bytes), so num_layers is
         # required for a well-defined demand number.
+        #
+        # 2026-05-27: for hybrid attention models (gemma-3: 10 dense full-
+        # attention layers + 52 sliding-window layers), only the dense
+        # layers participate in the ICMS K/V path — SW layers use vLLM's
+        # local cache and don't transfer K/V at all. Mirror the sink-sizing
+        # condition at line 2933-2936: when scored_layers_mask is set AND
+        # dense_layers_mask is 0 (i.e., NOT in contiguous-reuse mode used
+        # by qwen3/llama/mistral), use num_scored_layers so the allocator's
+        # demand math counts only the K/V actually transferred. Without
+        # this, gemma-3's allocator over-counts demand by 6.2× (62/10) and
+        # snaps the C budget too low — making C config look closer to A
+        # than it actually is.
+        # The matching slack table must also be dense-only (see
+        # profile_compute_slack.py --scored-layers).
         if self._adaptive_allocator is not None:
             self._adaptive_allocator._kv_page_bytes = self._geom.kv_page_bytes
-            self._adaptive_allocator._num_layers = int(self._geom.num_layers)
+            _alloc_layers = (int(self._geom.num_scored_layers)
+                             if (self._geom.scored_layers_mask != 0
+                                 and self._geom.dense_layers_mask == 0)
+                             else int(self._geom.num_layers))
+            self._adaptive_allocator._num_layers = _alloc_layers
 
         # 2026-05-08 server-audit P0 startup asserts (D3, E4):
         #
@@ -3437,9 +3496,17 @@ class _Worker:
             "set_input_batch_req_ids ran for these rids before the "
             "lookup; otherwise the lookup is routing the wrong rid."
         ) % (len(missing), source, missing[:5])
-        if os.environ.get("ICMS_RID_TO_BT_ROW_FLAG",
-                          "warn") == "strict":
+        _flag = os.environ.get("ICMS_RID_TO_BT_ROW_FLAG", "warn")
+        if _flag == "strict":
             raise RuntimeError(msg)
+        if _flag == "silent":
+            # 2026-05-20: at batch=4+, this WARNING fires per (layer ×
+            # budget × batch) and dominates log volume (~1M+ lines/hr,
+            # 500MB+ logs), serializing the worker on synchronous disk
+            # I/O and capping decode throughput. The check is a known
+            # benign noise source post-fix; set ICMS_RID_TO_BT_ROW_FLAG
+            # =silent on long sparse sweeps to skip the log entirely.
+            return
         logger.warning("%s", msg)
 
     def on_step_start(self, meta: IcmsConnectorMetadata):
@@ -5321,6 +5388,29 @@ class _Worker:
             # subsequent CPU transfer is on a [num_heads, head_dim]-sized
             # tensor (~2 KB), so the H2D vanishes.
             q = quest_query.detach()
+            # 2026-05-26: Q tail-slice for accuracy benches. When the bench
+            # knows the question (+ answer_prefix) is the last N tokens of
+            # the prompt and sets ICMS_Q_TAIL_TOKENS=N, slice quest_query
+            # to its last N tokens BEFORE pooling. This solves the Q-mean
+            # dilution problem on configs where vLLM's prefix cache does
+            # not fully elide the haystack (e.g., gemma-3 with the bench's
+            # chain-floor leaving a 256-token haystack-tail un-elided).
+            # The slice fires only on prefill chunks whose Q includes the
+            # question region (i.e., q.shape[0] > N tells us this is the
+            # final chunk; smaller chunks earlier in prefill are pure
+            # haystack and we let mean-pool run on them — Quest's score
+            # accumulation across chunks is union-based so haystack
+            # chunks' picks compose with the final chunk's picks).
+            # NOTE: q.shape[0] <= N means we're INSIDE the question region
+            # already (or the chunk is naturally smaller than the question);
+            # no slicing needed in that case.
+            if q.ndim == 3:
+                try:
+                    _q_tail = int(os.environ.get("ICMS_Q_TAIL_TOKENS", "0") or "0")
+                except ValueError:
+                    _q_tail = 0
+                if _q_tail > 0 and q.shape[0] > _q_tail:
+                    q = q[-_q_tail:]
             if q.ndim == 3:
                 # 2026-05-11 audit P1 (initial hypothesis) + REVISION:
                 # the original P1 fix assumed `quest_query` contained
@@ -5339,12 +5429,33 @@ class _Worker:
                 # Default 'mean' restored. `ICMS_Q_AGG=last` available
                 # as a knob for diagnostic A/B testing on gemma-3.
                 _q_agg = os.environ.get("ICMS_Q_AGG", "mean").lower()
+                _pre_mean_shape = tuple(q.shape)
                 if q.shape[0] == 1:
                     q = q.squeeze(0)
                 elif _q_agg == "last":
                     q = q[-1]
                 else:  # default 'mean'
                     q = q.mean(dim=0)
+                # 2026-05-26: diagnostic — dump Q hash + norm per (rid, layer,
+                # budget) so we can verify whether marker token changes the
+                # mean-pooled Q across budget cycles. ALSO log pre-mean shape
+                # to distinguish "differing num_tokens" from "differing values".
+                if os.environ.get("ICMS_DIAG_Q_HASH") == "1":
+                    try:
+                        import hashlib as _hl
+                        _q_b = q.detach().to(torch.float32).cpu().numpy().tobytes()
+                        _q_h = _hl.sha1(_q_b).hexdigest()[:16]
+                        _q_norm = float(q.float().norm().item())
+                        _is_decode = bool(getattr(self, "_prefill_done", False))
+                        logger.info("[diag-q] rid=%s layer=%d budget=%.3f "
+                                    "pre_mean_shape=%s post_shape=%s decode=%s "
+                                    "q_norm=%.6f q_sha=%s",
+                                    rid, next_layer_idx,
+                                    float(effective_budget),
+                                    _pre_mean_shape, tuple(q.shape),
+                                    _is_decode, _q_norm, _q_h)
+                    except Exception as _qe:
+                        logger.warning("[diag-q] failed: %s", _qe)
             # q is now [num_heads, head_dim]. Mean-pool for GQA against the
             # rank-local KV-head count: at TP=1 that's geom.num_kv_heads;
             # at TP>1 each rank holds only num_kv_heads/tp_size kv-heads
@@ -6860,12 +6971,81 @@ class _Worker:
                         page_scores[ap] = float("-inf")
             P = page_scores.numel()
             k = min(k, P)
-            top_idx = torch.topk(page_scores, k).indices.tolist()
-            # Return chain-page indices (0..P-1, positions in the sorted
-            # kmin tensor) to match the existing quest_local_scorer
-            # return shape and what rs.fetched_pages downstream expects.
-            picked = [int(i) for i in top_idx
-                       if page_scores[i].item() != float("-inf")]
+            # vAttention hybrid: split budget between top-K (top_idx) and
+            # uniform random tail. ICMS_VATTN_ALPHA=1.0 (default) = pure
+            # subset_max top-K. ICMS_VATTN_ALPHA=0.5 = 50% top-K + 50% random.
+            # ICMS_VATTN_RANDOM_MODE=per_layer (default) freshly samples
+            # the random tail at each scored layer; "per_rid" picks once
+            # per request and reuses across layers.
+            _alpha = float(os.environ.get("ICMS_VATTN_ALPHA", "1.0"))
+            _rand_mode = os.environ.get("ICMS_VATTN_RANDOM_MODE", "per_layer")
+            _alpha = max(0.0, min(1.0, _alpha))
+            if _alpha >= 1.0 - 1e-6:
+                k_topk = k
+                k_sample = 0
+            else:
+                k_topk = max(1, int(round(k * _alpha))) if _alpha > 0 else 0
+                k_sample = k - k_topk
+            top_idx = torch.topk(page_scores, k_topk).indices.tolist() if k_topk > 0 else []
+            picked_topk = [int(i) for i in top_idx
+                            if page_scores[i].item() != float("-inf")]
+            # Fix (a) k_topk under-fill: if -inf masking shrank picked_topk
+            # below the requested k_topk, absorb the deficit into k_sample
+            # so total picks stay near k.
+            _deficit = k_topk - len(picked_topk)
+            if _deficit > 0 and _alpha < 1.0 - 1e-6:
+                k_sample = min(k_sample + _deficit, P - len(picked_topk))
+            picked_sample: list[int] = []
+            if k_sample > 0:
+                import random as _random
+                # already_excluded = already_fetched (downstream skip)
+                # + top-K picks (avoid dup)
+                _exclude = set(picked_topk)
+                if already_fetched:
+                    _exclude |= set(int(p) for p in already_fetched)
+                _cache_attr = "_vattn_random_sample"
+                # Fix (b) per-rid seeded RNG: decouple our sample from
+                # vLLM's set_random_seed(0). For per_rid: seed by rid so all
+                # layers in this request share a stream. For per_layer: seed
+                # by (rid, layer) so each layer gets a different but
+                # reproducible sample.
+                if _rand_mode == "per_rid":
+                    _rng = _random.Random(hash(rid))
+                else:
+                    _rng = _random.Random(hash((rid, int(next_layer_idx))))
+                if _rand_mode == "per_rid":
+                    cached = getattr(rs, _cache_attr, None)
+                    if cached is None:
+                        _cands = [p for p in range(P) if p not in _exclude]
+                        picked_sample = _rng.sample(_cands,
+                                                     min(k_sample, len(_cands)))
+                        setattr(rs, _cache_attr, list(picked_sample))
+                    else:
+                        # Re-use cached sample; drop any in current exclude set
+                        picked_sample = [p for p in cached if p not in _exclude]
+                        if len(picked_sample) < k_sample:
+                            _need = k_sample - len(picked_sample)
+                            _more = [p for p in range(P)
+                                     if p not in _exclude
+                                     and p not in set(picked_sample)]
+                            picked_sample += _rng.sample(_more,
+                                                          min(_need, len(_more)))
+                        # Fix (c): persist the augmented sample so next
+                        # layer's cache reflects what we actually used.
+                        setattr(rs, _cache_attr, list(picked_sample))
+                else:  # per_layer
+                    _cands = [p for p in range(P) if p not in _exclude]
+                    picked_sample = _rng.sample(_cands,
+                                                 min(k_sample, len(_cands)))
+            picked = picked_topk + [int(p) for p in picked_sample]
+            if (_alpha < 1.0 - 1e-6
+                    and not getattr(self, "_vattn_first_logged", False)):
+                logger.info(
+                    "[icms_vattn] FIRST CALL — alpha=%.2f mode=%s "
+                    "k=%d k_topk=%d k_sample=%d rid=%s layer=%d",
+                    _alpha, _rand_mode, k, k_topk, k_sample, rid[:8],
+                    next_layer_idx)
+                self._vattn_first_logged = True
         except Exception as e:
             logger.warning("[icms_subset_max] scoring failed at "
                             "layer %d rid=%s: %s",
