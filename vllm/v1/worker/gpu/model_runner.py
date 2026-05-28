@@ -410,12 +410,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # b≥1.0 ceiling-snap interacts with the demand registry in
             # ways that warrant the slow-path).
             _adaptive = extra.get("adaptive_bandwidth", False)
-            hook_manager.allow_all_pages_shortcut = not _adaptive
-            if _adaptive:
-                logger.info(
-                    "[icms] disabled allow_all_pages_shortcut: "
-                    "adaptive_bandwidth=True conflicts with the "
-                    "b>=1.0 shortcut; b>=1.0 will route through Score")
+            # 2026-05-28: re-enable shortcut for adaptive mode. The b>=1.0
+            # gate inside quest_hooks.py:538 already prevents misuse — it
+            # only triggers when budget is *actually* 1.0. Without this, an
+            # adaptive controller that picks 1.0 (idle / single-request /
+            # demand < link share) gets routed through the slow Score path
+            # instead of the FetchAll fast path, making C strictly slower
+            # than B at every cell where adaptive doesn't engage. Original
+            # disable (2026-05-09→11) was justified vaguely as "demand
+            # registry interacts in ways that warrant the slow-path" — no
+            # concrete bug; the fetch_all corruption it mentioned was a
+            # transport bug, now fixed across all transports.
+            hook_manager.allow_all_pages_shortcut = True
             # Stride gating — mirror the connector's icms_score_stride so
             # the hook skips Q compute on non-stride layers.
             hook_manager.score_stride = max(
