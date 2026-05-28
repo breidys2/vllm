@@ -67,6 +67,30 @@ from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
+
+def _instr_timing(name):
+    """Decorator: wrap a connector method with [INSTR] timing when
+    ICMS_INSTR=1 is set. Logs only if duration > 1ms to avoid spam.
+    Used to identify hot blockers on the TTFT critical path. Can be
+    safely left in code — checks env var at every call, near-zero
+    overhead when disabled.
+    """
+    import functools as _ft
+    def _deco(fn):
+        @_ft.wraps(fn)
+        def _wrapper(self, *args, **kwargs):
+            if os.environ.get("ICMS_INSTR", "0") != "1":
+                return fn(self, *args, **kwargs)
+            _t0 = time.perf_counter()
+            try:
+                return fn(self, *args, **kwargs)
+            finally:
+                _dt = (time.perf_counter() - _t0) * 1000.0
+                if _dt > 1.0:
+                    logger.info("[INSTR] %s: %.2fms", name, _dt)
+        return _wrapper
+    return _deco
+
 # ─── icms_client import ──────────────────────────────────────────────────
 def _ensure_icms_client_on_path():
     here = Path(__file__).resolve()
@@ -1439,6 +1463,7 @@ class IcmsConnector(KVConnectorBase_V1):
         if self._worker is not None:
             self._worker.set_input_batch_req_ids(req_ids)
 
+    @_instr_timing("start_load_kv")
     def start_load_kv(self, forward_context: ForwardContext, **kwargs) -> None:
         """Stash attn_metadata from the forward context and drain metadata."""
         if self._worker is None:
@@ -1452,6 +1477,7 @@ class IcmsConnector(KVConnectorBase_V1):
             return
         self._worker.on_step_start(meta)
 
+    @_instr_timing("wait_for_layer_load")
     def wait_for_layer_load(self, layer_name: str) -> None:
         """Path B: fetch selected KV from icms into GPU + override block table.
 
@@ -1500,7 +1526,18 @@ class IcmsConnector(KVConnectorBase_V1):
             return False
         return bool(getattr(self._worker, "_cached_all_dense", False))
 
-    def save_kv_layer(  # noqa: C901
+    def save_kv_layer(self, layer_name, kv_layer, attn_metadata, **kwargs):
+        _instr_skv = os.environ.get("ICMS_INSTR", "0") == "1"
+        _t_skv0 = time.perf_counter() if _instr_skv else 0.0
+        try:
+            return self._save_kv_layer_impl(layer_name, kv_layer, attn_metadata, **kwargs)
+        finally:
+            if _instr_skv:
+                _dt = (time.perf_counter() - _t_skv0) * 1000.0
+                if _dt > 1.0:
+                    logger.info("[INSTR] save_kv_layer[%s]: %.2fms", layer_name, _dt)
+
+    def _save_kv_layer_impl(  # noqa: C901
         self,
         layer_name: str,
         kv_layer: torch.Tensor,
@@ -1569,10 +1606,12 @@ class IcmsConnector(KVConnectorBase_V1):
                 connector_meta=self._connector_metadata,
             )
 
+    @_instr_timing("wait_for_save")
     def wait_for_save(self) -> None:
         if self._worker is not None:
             self._worker.wait_for_pending_writes()
 
+    @_instr_timing("get_finished")
     def get_finished(
         self, finished_req_ids: set[str],
     ) -> tuple[set[str] | None, set[str] | None]:
@@ -1629,6 +1668,7 @@ class IcmsConnector(KVConnectorBase_V1):
                         request.request_id, _e)
             self._sched.on_alloc(request, blocks)
 
+    @_instr_timing("build_connector_meta")
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput,
     ) -> KVConnectorMetadata:
@@ -1636,6 +1676,7 @@ class IcmsConnector(KVConnectorBase_V1):
             return self._sched.build_meta(scheduler_output)
         return IcmsConnectorMetadata()
 
+    @_instr_timing("request_finished")
     def request_finished(
         self, request: Request, block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
@@ -2025,8 +2066,8 @@ class _Scheduler:
                     returned=(0, False))
             return 0, False
         # 2026-05-26 HYBRID-SW COLD FALLBACK: when vLLM's prefix cache is
-        # OFF and the model has non-scored layers (e.g. gemma-3 sliding-
-        # window), reporting matched_tokens > 0 tells vLLM to skip
+        # OFF and the model is actually hybrid attention (e.g. gemma-3
+        # sliding-window), reporting matched_tokens > 0 tells vLLM to skip
         # haystack prefill. ICMS apply only restores K/V for the scored
         # (dense) layers via the trimmed bt; the SW layers' K/V is never
         # written into vLLM's freshly-allocated blocks → SW attention
@@ -2038,9 +2079,20 @@ class _Scheduler:
         # per budget cycle (~1 s at h32k, ~5 s at h128k) — negligible
         # for sparse RULER cells. ICMS_HYBRID_COLD_DISABLE=1 disables
         # this safety net for diagnostic A/B.
+        # 2026-05-28 FIX: gate was previously
+        # `ICMS_SCORED_LAYERS != ""`, but uniform models (qwen3,
+        # mistral-small) ALSO set ICMS_SCORED_LAYERS to pick which
+        # subset of dense layers to score-and-store. The mistargeted
+        # gate forced cold-prefill EVERY iter for these models —
+        # turning a ~80 ms pf=4096 compute (with ICMS-fetched ctx) into
+        # a ~3.4 s full ctx+pf recompute → 4x TTFT regression at
+        # qwen3 ctx=65k (4605 vs ~1163 ms Apr 27). Re-gated on the
+        # explicit `ICMS_HYBRID_MODEL=1` env var (already set by
+        # `run_full_ttft_sweep.sh` only for gemma-3) so uniform models
+        # are unaffected. ICMS_HYBRID_COLD_DISABLE=1 still overrides.
         _hybrid_cold = (
             not getattr(self, "_vllm_prefix_cache_enabled", True)
-            and os.environ.get("ICMS_SCORED_LAYERS", "").strip() != ""
+            and os.environ.get("ICMS_HYBRID_MODEL", "0") == "1"
             and os.environ.get("ICMS_HYBRID_COLD_DISABLE") != "1"
         )
         if _hybrid_cold:
@@ -2431,6 +2483,26 @@ class _Worker:
         # smoke run can confirm the path actually fired (vs silently
         # falling through to the legacy gate's `return`).
         self._quest_per_head_first_call_logged: bool = False
+
+        # ICMS_SCORING_MODE=per_layer_max_kv: client-side Quest-faithful
+        # scoring on per-head summaries, with optional K random q-token
+        # sampling. The torch.Generator is lazy-allocated on first use so
+        # the scoring device (host vs cuda) doesn't have to be known at
+        # __init__ time. NOT reset between requests — generator state
+        # advances monotonically across all per-layer-max-kv scoring
+        # calls in this process; reproducibility is "same seed → same
+        # full trajectory" (the HF cleanroom impl follows the same rule).
+        self._q_token_sample_generator = None  # type: ignore[var-annotated]
+        self._q_token_sample_seed: int = int(
+            os.environ.get("ICMS_PER_LAYER_SEED_BASE", "0"))
+        self._per_layer_max_kv_first_call_logged: bool = False
+        self._per_layer_max_kv_tp_warned: bool = False
+        self._per_layer_max_kv_client_unsupported_warned: bool = False
+        self._per_layer_max_kv_q_len_warned: bool = False
+        self._per_layer_max_kv_empty_picks_logged: bool = False
+        self._per_layer_max_kv_apply_unsupported_warned: bool = False
+        self._per_layer_max_kv_picks_logged_layers: set[int] = set()
+        self._per_layer_max_kv_ctx_probe_logged: bool = False
 
         # ICMS_DIAG_SLACK: optional C++ poll thread that records each
         # ready-flag's first-non-zero timestamp without holding the GIL.
@@ -2882,11 +2954,41 @@ class _Worker:
         # profile_compute_slack.py --scored-layers).
         if self._adaptive_allocator is not None:
             self._adaptive_allocator._kv_page_bytes = self._geom.kv_page_bytes
-            _alloc_layers = (int(self._geom.num_scored_layers)
-                             if (self._geom.scored_layers_mask != 0
-                                 and self._geom.dense_layers_mask == 0)
-                             else int(self._geom.num_layers))
+            # 2026-05-28 Bug 1 fix: the prior condition checked
+            # `dense_layers_mask == 0` and fired for BOTH qwen3 and
+            # gemma-3 (neither sets ICMS_DENSE_LAYERS), so qwen3's
+            # demand was undercounted by 6× (8 scored vs 48 actual
+            # transferring layers). The correct discriminator is the
+            # ICMS_HYBRID_MODEL env var (set externally for gemma-3
+            # only): hybrid → only scored (=dense) layers transfer;
+            # uniform → all layers transfer using strided selection.
+            _hybrid = os.environ.get("ICMS_HYBRID_MODEL", "0") == "1"
+            if _hybrid:
+                _alloc_layers = int(self._geom.num_scored_layers)
+            else:
+                _alloc_layers = int(self._geom.num_layers)
             self._adaptive_allocator._num_layers = _alloc_layers
+            # 2026-05-28 Bug 3 fix: per-rank demand registered against
+            # the FULL link bandwidth, but the physical BF2 link is
+            # shared by all TP ranks. Divide link share by tp_size so
+            # each rank's `my_share` reflects its true fraction of the
+            # shared link. Without this, demand never crowds the link
+            # and adaptive picks budget=1.0 everywhere (paper bench:
+            # qwen3 ctx=128k → 4.7 GB/s "demand" vs 11 GB/s "share"
+            # → budget=1.0; with fix: per-rank share = 5.5 GB/s → real
+            # page-skipping engages).
+            if self._tp_size > 1:
+                self._adaptive_allocator._link_bw = (
+                    self._adaptive_allocator._link_bw / float(self._tp_size))
+                logger.info("[icms] adaptive link_bw per-rank: %.1f MB/s "
+                            "(full link / tp_size=%d)",
+                            self._adaptive_allocator._link_bw / 1e6,
+                            self._tp_size)
+            logger.info("[icms] adaptive num_layers=%d "
+                        "(hybrid=%s, num_scored=%d, num_full=%d)",
+                        _alloc_layers, _hybrid,
+                        self._geom.num_scored_layers,
+                        self._geom.num_layers)
 
         # 2026-05-08 server-audit P0 startup asserts (D3, E4):
         #
@@ -3509,6 +3611,7 @@ class _Worker:
             return
         logger.warning("%s", msg)
 
+    @_instr_timing("on_step_start")
     def on_step_start(self, meta: IcmsConnectorMetadata):
         """Called from start_load_kv. Drains scheduler metadata into caches."""
         t_step = time.perf_counter()
@@ -3847,6 +3950,11 @@ class _Worker:
         pre-populated _pending_reuse[layer] entries into _pending_scores
         (same pattern as on_layer_reuse).
         """
+        # 2026-05-28 INSTR-FA: tag entry with layer + initial path. Path
+        # is filled in below as the branch is taken (fast/slow/invalidated/
+        # no-pending).
+        _instr_fa = os.environ.get("ICMS_INSTR", "0") == "1"
+        _t_fa_enter = time.perf_counter() if _instr_fa else 0.0
         num_layers = self._geom.num_layers if self._geom else 48
         attn_layer_name = f"model.layers.{next_layer_idx}.self_attn.attn"
 
@@ -3879,7 +3987,25 @@ class _Worker:
                            + int(getattr(rs, "stored_groups", 0)))
         _committed_at_dispatch = int(getattr(
             rs, "_fetch_all_committed_at_dispatch", 0))
-        if (getattr(rs, "_fetch_all_complete", False)
+        # 2026-05-28 INVALIDATION GATE: the audit-Finding-4 invalidation
+        # is correct for CHUNKED prefill where successive chunks
+        # commit new ctx-prefix groups, BUT in non-chunked single-shot
+        # prefill (paper bench's perf-sweep at TP=2 with
+        # max_num_batched_tokens ≥ ctx+pf) the per-layer
+        # save_kv_layer of THIS forward's pf tokens grows the
+        # counter mid-forward. Each scored layer (6/12/18/24/30/36/42)
+        # then sees `_committed_now > _committed_at_dispatch`, drops
+        # `_fetch_all_complete`, and the slow path re-issues fetch_all
+        # → 7 redundant fetches per iter, ~400 ms each = ~2.8 s of
+        # serial waits on the TTFT critical path. Observed at qwen3
+        # ctx=65k pf=4096 = 5226 ms vs Apr 27's 1163 ms.
+        # Fix: gate the invalidation on `ICMS_FAPS_INVALIDATE_ON_GROWTH=1`
+        # opt-in (chunked-prefill paths can re-enable). Default off so
+        # single-shot prefill keeps the fast-path hit.
+        _faps_inv_enabled = (
+            os.environ.get("ICMS_FAPS_INVALIDATE_ON_GROWTH", "0") == "1")
+        if (_faps_inv_enabled
+                and getattr(rs, "_fetch_all_complete", False)
                 and _committed_now > _committed_at_dispatch):
             rs._fetch_all_complete = False
             with self._score_lock:
@@ -3910,6 +4036,11 @@ class _Worker:
                     logger.info(
                         "[diag-faps] fast-path MISS rid=%s layer=%d",
                         rid[:8], next_layer_idx)
+                if _instr_fa:
+                    logger.info(
+                        "[INSTR-FA] layer=%d path=fast-MISS dt_us=%.1f",
+                        next_layer_idx,
+                        (time.perf_counter() - _t_fa_enter) * 1e6)
                 return
             # Tuple grew from 2- to 3-element on 2026-05-05 (added
             # req_idx) to fix the multi-rid stride-reuse path that was
@@ -3932,6 +4063,11 @@ class _Worker:
                     "[diag-faps] fast-path HIT rid=%s layer=%d k=%d sink_off_n=%d",
                     rid[:8], next_layer_idx, len(reply.page_ids),
                     len(reuse_offsets))
+            if _instr_fa:
+                logger.info(
+                    "[INSTR-FA] layer=%d path=fast-HIT dt_us=%.1f",
+                    next_layer_idx,
+                    (time.perf_counter() - _t_fa_enter) * 1e6)
             return
 
         # Slow path: first scoring boundary for this request — issue
@@ -4042,6 +4178,7 @@ class _Worker:
                 reply = None
             else:
                 with self._rpc_lock:  # X1 (race-audit): serialize tx_/rx_
+                    _t_rpc0 = time.perf_counter() if _instr_fa else 0.0
                     reply = self._client.fetch_all(
                         request_id=icms_rid,
                         chain=self._rank_chain(rs.chain),
@@ -4060,6 +4197,14 @@ class _Worker:
                         demand_bps=ab_demand_bps,
                         compute_supply_bps=ab_compute_supply_bps,
                     )
+                    if _instr_fa:
+                        logger.info(
+                            "[INSTR-FA] layer=%d path=slow-RPC dt_us=%.1f "
+                            "total_pages=%d reuse_through=%d use_flags=%d",
+                            next_layer_idx,
+                            (time.perf_counter() - _t_rpc0) * 1e6,
+                            total_pages, reuse_through,
+                            int(os.environ.get("ICMS_REPLY_EARLY", "1") == "1"))
         except Exception as e:
             # 2026-05-08: keep at warning so future silent-failure
             # regressions are visible (debug-level masked the qwen3
@@ -5208,6 +5353,22 @@ class _Worker:
                              next_layer_idx, rid)
                 self._subset_max_entry_logged = True
             self._subset_max_score_one_layer(
+                rid, rs, req_idx, next_layer_idx, quest_query, budget,
+                total_pages, already_fetched)
+            return
+
+        # ICMS_SCORING_MODE=per_layer_max_kv — Quest-faithful client-side
+        # scoring on per-head summaries (fetched via opcode 25/27, same as
+        # subset_max). The K=16 random q-token sampling + per-token MAX +
+        # per-KV-head MAX collapse produces the +50pp lift over baseline
+        # sparse on qwen3-30b mk2/mk3 at h=32k/64k (validated by the HF
+        # cleanroom impl at scripts/utils/quest_faithful_hf.py).
+        #
+        # MUST PRECEDE the per_kv_head branch below so that setting both
+        # ICMS_SCORING_MODE=per_layer_max_kv AND ICMS_QUEST_MODE=per_kv_head
+        # routes to the new mode (the per_kv_head branch otherwise wins).
+        if os.environ.get("ICMS_SCORING_MODE", "") == "per_layer_max_kv":
+            self._per_layer_max_kv_score_one_layer(
                 rid, rs, req_idx, next_layer_idx, quest_query, budget,
                 total_pages, already_fetched)
             return
@@ -7242,6 +7403,401 @@ class _Worker:
             next_layer_idx, total_pages, k, subset_valid, len(picked),
             len(union_reply.sink_offsets), wall_us)
 
+    def _get_q_token_sample_generator(self, device):
+        """Lazy-init the per-worker torch.Generator for q-token sampling.
+
+        Generator is bound to a single device (host vs cuda); recreated +
+        re-seeded if a later call presents a different device. The seed
+        is read from ``ICMS_PER_LAYER_SEED_BASE`` at ``__init__`` time and
+        cached on ``self._q_token_sample_seed`` — runtime env changes are
+        ignored to preserve "single process → reproducible trajectory".
+        """
+        g = self._q_token_sample_generator
+        if g is None or g.device != device:
+            g = torch.Generator(device=device)
+            g.manual_seed(int(self._q_token_sample_seed))
+            self._q_token_sample_generator = g
+        return g
+
+    def _per_layer_max_kv_score_one_layer(self, rid, rs, req_idx,
+                                            next_layer_idx,
+                                            quest_query, budget,
+                                            total_pages, already_fetched):
+        """ICMS_SCORING_MODE=per_layer_max_kv path (2026-05-28).
+
+        Quest-faithful client-side scoring on per-head summaries with
+        optional K random q-token sampling. Mirrors
+        ``_subset_max_score_one_layer``'s plumbing verbatim; only the
+        scoring math is swapped. See
+        ``scripts/utils/per_layer_max_kv_scoring.py`` for the math and
+        ``scripts/utils/quest_faithful_hf.py`` for the equivalence
+        reference (asserted in
+        ``tests/test_per_layer_max_kv_scoring.py``).
+
+        Algorithm (paper config: qtok_pool=max, qhd_pool=mean, K=16
+        random, kv_reduce=max):
+          1. Fetch per-page (kmin, kmax) summaries for THIS layer.
+          2. Optionally sub-sample K q-token positions per call.
+          3. Per-(page, KV head) Quest score; collapse across KV via MAX.
+          4. Top-B pages once at layer level; broadcast to all KV heads.
+          5. fetch_union_per_head + _pending_scores plumbing (subset_max
+             pattern).
+
+        TP=1 only — server is not rank-aware in v1, so we hard-fail at
+        TP>1 instead of falling through to legacy. Synthesis review
+        flagged the legacy fallback as a silent correctness hazard
+        (per_layer_max_kv with no allreduce diverges across ranks).
+
+        Configuration:
+          ICMS_SCORING_MODE=per_layer_max_kv (REQUIRED to enter this path)
+          ICMS_Q_TOKEN_POOL=max|mean              (default: "max")
+          ICMS_Q_HEAD_POOL=mean|max               (default: "mean")
+          ICMS_Q_TOKEN_SAMPLE_COUNT=int           (default: 0 = no sample)
+          ICMS_Q_TOKEN_SAMPLE_MODE=none|strided|random  (default: "random")
+          ICMS_PER_LAYER_SEED_BASE=int            (default: 0; PROCESS-WIDE)
+          ICMS_PER_LAYER_MAX_KV_REDUCE=max|sum|mean     (default: "max")
+        """
+        # ── 0. Guards (mirror subset_max) ──────────────────────────────
+        if not isinstance(quest_query, torch.Tensor) or quest_query.ndim < 2:
+            if not self._per_layer_max_kv_q_len_warned:
+                logger.warning("[icms_per_layer_max_kv] skipping layer=%d: "
+                                "quest_query not 2/3-D Tensor (got %s)",
+                                next_layer_idx, type(quest_query).__name__)
+                self._per_layer_max_kv_q_len_warned = True
+            return
+        if self._tp_size > 1:
+            if not self._per_layer_max_kv_tp_warned:
+                logger.error(
+                    "[icms_per_layer_max_kv] TP=1 ONLY (got tp_size=%d). "
+                    "per_layer_max_kv requires cross-rank allreduce(MAX) "
+                    "before topk; not implemented in v1. Path is a no-op "
+                    "under TP>1 to avoid silent cross-rank picks divergence.",
+                    self._tp_size)
+                self._per_layer_max_kv_tp_warned = True
+            return
+        # Hard-assert no adaptive allocator: per_layer_max_kv interacts
+        # badly with per-layer budget changes (R1 from synthesis review)
+        # — picked sets become non-monotonic across layers in the same
+        # request → cumulative already_fetched contains pages that
+        # wouldn't be picked at the higher budget. Defer adaptive support
+        # to a follow-up PR; loud-fail here so nobody silently combines
+        # the two in production.
+        if self._adaptive_allocator is not None:
+            raise RuntimeError(
+                "[icms_per_layer_max_kv] _adaptive_allocator is not None: "
+                "per_layer_max_kv is incompatible with adaptive budgeting "
+                "in v1. Unset the adaptive flag or pin a static budget.")
+        if total_pages <= 0 or self._client is None or self._geom is None:
+            return
+        if not hasattr(self._client, "fetch_summaries_per_head"):
+            if not self._per_layer_max_kv_client_unsupported_warned:
+                logger.warning(
+                    "[icms_per_layer_max_kv] active client (%s) lacks "
+                    "fetch_summaries_per_head; per_layer_max_kv requires "
+                    "the unix-socket IcmsClient. No-op.",
+                    type(self._client).__name__)
+                self._per_layer_max_kv_client_unsupported_warned = True
+            return
+
+        sum_sink = self._ensure_summary_sink(total_pages)
+        if sum_sink is None:
+            return
+
+        # Env knobs (read each call so tests can flip them per-fixture;
+        # the seed is NOT re-read — see _get_q_token_sample_generator).
+        qtok_pool = os.environ.get("ICMS_Q_TOKEN_POOL", "max")
+        qhd_pool = os.environ.get("ICMS_Q_HEAD_POOL", "mean")
+        k_sample = int(os.environ.get("ICMS_Q_TOKEN_SAMPLE_COUNT", "0"))
+        sample_mode = os.environ.get("ICMS_Q_TOKEN_SAMPLE_MODE", "random")
+        kv_reduce = os.environ.get("ICMS_PER_LAYER_MAX_KV_REDUCE", "max")
+
+        if not self._per_layer_max_kv_first_call_logged:
+            logger.info(
+                "[icms_per_layer_max_kv] FIRST CALL — env active "
+                "(rid=%s layer=%d total_pages=%d budget=%.3f "
+                "qtok_pool=%s qhd_pool=%s K=%d sample_mode=%s "
+                "kv_reduce=%s seed_base=%d q.shape=%s)",
+                rid[:8], next_layer_idx, total_pages, float(budget),
+                qtok_pool, qhd_pool, k_sample, sample_mode, kv_reduce,
+                int(self._q_token_sample_seed), tuple(quest_query.shape))
+            self._per_layer_max_kv_first_call_logged = True
+
+        chain = self._rank_chain(rs.chain)
+        icms_rid = self._icms_request_id(rid, 0)
+        t0 = time.perf_counter()
+
+        # ── 1. Fetch per-page summaries for THIS layer from server ──
+        try:
+            with self._rpc_lock:
+                sum_reply = self._client.fetch_summaries_per_head(
+                    request_id=icms_rid, chain=chain,
+                    layer=next_layer_idx,
+                    sink=sum_sink, reuse_through_layer=next_layer_idx)
+        except IcmsError as e:
+            logger.warning(
+                "[icms_per_layer_max_kv] FetchSummariesPerHead failed at "
+                "layer %d (rid=%s): %r",
+                next_layer_idx, rid[:8], e)
+            return
+
+        P = len(sum_reply.page_ids)
+        if P == 0:
+            return
+        if (sum_reply.page_ids[0] != 0
+                or sum_reply.page_ids[-1] != P - 1
+                or len(sum_reply.page_ids) != P):
+            logger.warning(
+                "[icms_per_layer_max_kv] sum_reply.page_ids violates "
+                "[0..P-1] contract at layer %d (P=%d, head=%s, tail=%s); "
+                "aborting to avoid corrupted KV reads.",
+                next_layer_idx, P, sum_reply.page_ids[:4],
+                sum_reply.page_ids[-4:])
+            return
+
+        # ── 2. Reshape sink bytes → (kmin, kmax) on the GPU ──
+        H_kv = int(self._geom.num_kv_heads)
+        D = int(self._geom.head_dim)
+        elem = int(self._geom.elem_bytes)
+        spb = int(self._geom.summary_page_bytes)
+        if elem != 2:
+            logger.warning(
+                "[icms_per_layer_max_kv] elem_bytes=%d not supported in "
+                "v1 (fp16 only); no-op.", elem)
+            return
+        slot_base = int(sum_reply.sink_offsets[0])
+        total_bytes = P * spb
+        contiguous = all(
+            int(sum_reply.sink_offsets[i]) == slot_base + i * spb
+            for i in range(P))
+        device = quest_query.device if quest_query.is_cuda else "cuda"
+        if getattr(sum_sink, "is_gpu_direct", False):
+            gpu_tensor = getattr(sum_sink, "gpu_tensor", None)
+            if gpu_tensor is None:
+                logger.warning(
+                    "[icms_per_layer_max_kv] GPU-IPC summary sink missing "
+                    "gpu_tensor; aborting layer %d", next_layer_idx)
+                return
+            if contiguous:
+                flat_u8 = gpu_tensor[
+                    slot_base:slot_base + total_bytes]
+            else:
+                flat_u8 = torch.empty(total_bytes, dtype=torch.uint8,
+                                      device=gpu_tensor.device)
+                for i, off in enumerate(sum_reply.sink_offsets):
+                    flat_u8[i * spb:(i + 1) * spb] = \
+                        gpu_tensor[off:off + spb]
+            flat_gpu = flat_u8.view(torch.float16).reshape(
+                P, 2, H_kv, D)
+            if flat_gpu.device != torch.device(device):
+                flat_gpu = flat_gpu.to(device=device, non_blocking=True)
+        else:
+            view = sum_sink.view()
+            if contiguous:
+                host_bytes = bytes(view[slot_base:slot_base + total_bytes])
+            else:
+                host_buf = bytearray(total_bytes)
+                for i, off in enumerate(sum_reply.sink_offsets):
+                    host_buf[i * spb:(i + 1) * spb] = bytes(
+                        view[off:off + spb])
+                host_bytes = bytes(host_buf)
+            flat_cpu = torch.frombuffer(host_bytes, dtype=torch.float16,
+                                          count=P * 2 * H_kv * D).reshape(
+                P, 2, H_kv, D)
+            flat_gpu = flat_cpu.to(device=device, non_blocking=True)
+        kmin = flat_gpu[:, 0, :, :].contiguous()
+        kmax = flat_gpu[:, 1, :, :].contiguous()
+
+        # ── 3. per_layer_max_kv scoring on GPU ──
+        # quest_query shape: (q_len, H_q, D) at prefill scoring, or
+        # (1, H_q, D) at decode. Caller is responsible for the q-token
+        # dimension; we sample/aggregate inside the scorer helper.
+        q = quest_query.detach()
+        if q.ndim == 2:
+            # decode: synthesize the q_len=1 dim.
+            q = q.unsqueeze(0)
+        if q.ndim != 3:
+            return
+        q_dev = q.to(device=device, dtype=torch.float32, non_blocking=True)
+
+        from scripts.utils.per_layer_max_kv_scoring import (
+            per_layer_max_kv_topk,
+        )
+        try:
+            generator = self._get_q_token_sample_generator(q_dev.device) \
+                if sample_mode == "random" else None
+            picks_t = per_layer_max_kv_topk(
+                q_dev, kmin, kmax,
+                budget=float(budget),
+                q_token_pool=qtok_pool, q_head_pool=qhd_pool,
+                kv_reduce=kv_reduce,
+                q_token_sample_count=k_sample,
+                q_token_sample_mode=sample_mode,
+                generator=generator,
+                exclude_pages=already_fetched if already_fetched else None,
+            )
+            picked = [int(p) for p in picks_t.tolist()]
+            k = picks_t.numel()
+        except Exception as e:
+            logger.warning("[icms_per_layer_max_kv] scoring failed at "
+                            "layer %d rid=%s: %s",
+                            next_layer_idx, rid, e)
+            return
+
+        if not picked:
+            if not self._per_layer_max_kv_empty_picks_logged:
+                logger.info(
+                    "[icms_per_layer_max_kv] layer %d picks empty "
+                    "rid=%s — scoring fired but selected 0 pages",
+                    next_layer_idx, rid[:8])
+                self._per_layer_max_kv_empty_picks_logged = True
+            return
+
+        if next_layer_idx not in self._per_layer_max_kv_picks_logged_layers:
+            self._per_layer_max_kv_picks_logged_layers.add(next_layer_idx)
+            logger.info(
+                "[icms_per_layer_max_kv] layer %d rid=%s picked %d pages, "
+                "first10=%s",
+                next_layer_idx, rid[:8], len(picked), picked[:10])
+
+        if os.environ.get("ICMS_DIAG_SCORE_DUMP", "") \
+                and int(self._tp_rank) == 0:
+            try:
+                rs.last_picked_by_layer[int(next_layer_idx)] = list(picked)
+                if int(next_layer_idx) not in rs.last_q_by_layer:
+                    rs.last_q_by_layer[int(next_layer_idx)] = torch.zeros(
+                        1, dtype=torch.uint8)
+                if not hasattr(rs, "picked_call_log"):
+                    rs.picked_call_log = []
+                rs.picked_call_log.append({
+                    "call": len(rs.picked_call_log),
+                    "layer": int(next_layer_idx),
+                    "is_decode": bool(self._prefill_done),
+                    "budget": float(budget),
+                    "k": int(k),
+                    "total_pages": int(total_pages),
+                    "picked": list(picked),
+                    "full_scores_per_head": None,
+                    "mode": "per_layer_max_kv",
+                })
+            except Exception as _e_stash:
+                logger.warning(
+                    "[icms_per_layer_max_kv] dump stash failed at layer "
+                    "%d rid=%s: %s", next_layer_idx, rid, _e_stash)
+
+        # ── 4. Apply path wiring (mirror subset_max verbatim) ──
+        if (self._sink_pool is None
+                or not hasattr(self._client, "fetch_union_per_head")):
+            if not self._per_layer_max_kv_apply_unsupported_warned:
+                logger.warning(
+                    "[icms_per_layer_max_kv] client lacks "
+                    "fetch_union_per_head or sink_pool missing; apply "
+                    "path cannot be wired.")
+                self._per_layer_max_kv_apply_unsupported_warned = True
+            return
+
+        num_layers = int(self._geom.num_layers)
+        if self._geom.dense_layers_mask != 0:
+            _nxt = self._geom.next_scored_layer_after(next_layer_idx)
+            reuse_through = (_nxt - 1) if _nxt is not None \
+                else (num_layers - 1)
+        else:
+            reuse_through = min(
+                next_layer_idx + self._score_stride - 1,
+                num_layers - 1)
+        try:
+            with self._rpc_lock:
+                union_reply = self._client.fetch_union_per_head(
+                    request_id=icms_rid, chain=chain,
+                    layer=next_layer_idx,
+                    sink=self._sink_pool.sink, page_ids=picked,
+                    reuse_through_layer=reuse_through)
+        except IcmsError as e:
+            logger.warning(
+                "[icms_per_layer_max_kv] FetchUnionPerHead failed at "
+                "layer %d (rid=%s, k=%d, reuse_through=%d): %r",
+                next_layer_idx, rid[:8], len(picked), reuse_through, e)
+            return
+        except Exception as e:
+            logger.warning(
+                "[icms_per_layer_max_kv] FetchUnionPerHead unexpected at "
+                "layer %d (rid=%s, k=%d): %r",
+                next_layer_idx, rid[:8], len(picked), e)
+            return
+
+        try:
+            from icms_client.protocol import ScoreReply
+            synth = ScoreReply(
+                request_id=icms_rid,
+                status=0,
+                trie_walk_ns=0,
+                summary_read_ns=0,
+                score_ns=int((time.perf_counter() - t0) * 1e9),
+                sink_write_ns=int(getattr(union_reply,
+                                           "sink_write_ns", 0)),
+                cache_hit=False,
+                concurrent_requests=int(getattr(
+                    union_reply, "concurrent_requests", 0)),
+                server_ingest_to_ready_ns=int(getattr(
+                    union_reply, "server_ingest_to_ready_ns", 0)),
+                effective_supply_bps=int(getattr(
+                    union_reply, "effective_supply_bps", 0)),
+                page_ids=list(picked),
+                scores=[0.0] * len(picked),
+                sink_offsets=list(union_reply.sink_offsets),
+            )
+        except Exception as e:
+            logger.warning(
+                "[icms_per_layer_max_kv] synth ScoreReply failed at "
+                "layer %d: %s", next_layer_idx, e)
+            return
+
+        attn_layer_name = f"model.layers.{next_layer_idx}.self_attn.attn"
+        with self._score_lock:
+            self._assert_pending_scores_no_clobber(
+                attn_layer_name, rid,
+                source="per_layer_max_kv-score-landing")
+            self._pending_scores.setdefault(
+                attn_layer_name, {})[rid] = (synth, req_idx)
+
+        if not self._per_layer_max_kv_ctx_probe_logged:
+            try:
+                _sg = int(getattr(rs, "stored_groups", 0))
+                _ngw = int(getattr(rs, "num_groups_written", 0))
+                _ctx = max(_sg, _ngw) * 32
+                _above = (sum(1 for p in picked if p >= _ctx)
+                          if _ctx > 0 else len(picked))
+                logger.info(
+                    "[icms_per_layer_max_kv] CTX-PROBE rid=%s layer=%d "
+                    "P=%d k=%d stored_groups=%d ngw=%d ctx_pages=%d "
+                    "picks_above_ctx=%d picks_minmax=(%d,%d)",
+                    rid[:8], next_layer_idx, P, k, _sg, _ngw, _ctx,
+                    _above, min(picked), max(picked))
+                self._per_layer_max_kv_ctx_probe_logged = True
+            except Exception:
+                pass
+
+        # _pending_reuse for stride/contig-reuse window.
+        actual_k = len(picked)
+        per_layer_bytes = actual_k * int(self._geom.kv_page_bytes)
+        for delta in range(1, reuse_through - next_layer_idx + 1):
+            reuse_layer = next_layer_idx + delta
+            reuse_attn = f"model.layers.{reuse_layer}.self_attn.attn"
+            reuse_offsets = [off + delta * per_layer_bytes
+                              for off in union_reply.sink_offsets]
+            with self._score_lock:
+                self._pending_reuse.setdefault(reuse_attn, {})[rid] = (
+                    synth, reuse_offsets, req_idx)
+
+        wall_us = (time.perf_counter() - t0) * 1e6
+        rs.fetched_pages.setdefault(next_layer_idx, set()).update(picked)
+        self.stats.record_score(wall_us, bool(picked), picked,
+                                  next_layer_idx)
+        logger.debug(
+            "[icms_per_layer_max_kv] layer=%d total_pages=%d k=%d "
+            "n_picked=%d sink_offsets=%d wall_us=%.1f",
+            next_layer_idx, total_pages, k, len(picked),
+            len(union_reply.sink_offsets), wall_us)
+
     def _ensure_summary_sink(self, total_pages: int) -> "Sink | None":
         """Lazy-allocate (or grow) the per-head summaries sink.
 
@@ -7723,7 +8279,20 @@ class _Worker:
             # Tracing must never crash the forward path. Log + swallow.
             logger.debug("provenance check failed: %s", _e)
 
-    def wait_for_layer(self, layer_name: str):
+    def wait_for_layer(self, layer_name: str):  # noqa: C901
+        """Path B: fetch selected KV from icms → GPU + modify block table rows."""
+        _instr_wfl = os.environ.get("ICMS_INSTR", "0") == "1"
+        _t_wfl0 = time.perf_counter() if _instr_wfl else 0.0
+        try:
+            return self._wait_for_layer_impl(layer_name)
+        finally:
+            if _instr_wfl:
+                _dt = (time.perf_counter() - _t_wfl0) * 1000.0
+                if _dt > 1.0:  # only log layers that took >1ms
+                    logger.info("[INSTR] wait_for_layer[%s]: %.2fms",
+                                layer_name, _dt)
+
+    def _wait_for_layer_impl(self, layer_name: str):
         """Path B: fetch selected KV from icms → GPU + modify block table rows.
 
         For each pending Score result at this layer, fetches the winning
@@ -8006,6 +8575,16 @@ class _Worker:
                 and 0 <= abs_layer < len(self._slack_t_after_spin)):
             self._slack_t_after_spin[abs_layer] = t_after_spin
         spin_us = (t_after_spin - t_layer_start) * 1e6
+        # 2026-05-28 INSTR-WFL: per-layer breakdown. Captures:
+        #   - ready_at_call: was the per-layer flag already set on entry?
+        #   - spin_us: time spinning on is_layer_ready (only counts when
+        #     ready_at_call=False)
+        # Followed by INSTR-WFL-POST below for everything after the spin.
+        # Aggregator: /tmp/agg_instr.py -- grep "WFL " to filter.
+        if os.environ.get("ICMS_INSTR", "0") == "1" and abs_layer is not None:
+            logger.info(
+                "[INSTR-WFL] layer=%d ready=%d spin_us=%.1f",
+                abs_layer, int(ready_at_call), spin_us)
         # ICMS_DIAG_LAYER_ARRIVAL=1: log per-layer arrival timing relative
         # to step start. Lets us pin down whether per-stride RDMA writes are
         # blocking compute (compute waits) or arriving early (compute slow).
@@ -8124,6 +8703,19 @@ class _Worker:
                     layer_name, reply, req_idx, rid,
                     _capture=_captures)
                 apply_us = (time.perf_counter() - t_apply_start) * 1e6
+                # 2026-05-28 INSTR-APPLY: per-(rid, layer) apply timing.
+                # Combined with INSTR-WFL `spin_us`, fully accounts for
+                # wait_for_layer's wall time. Reply page count + reuse
+                # offset count exposes per-layer transfer scale so we
+                # can see if apply time scales with k or is fixed-cost.
+                if os.environ.get("ICMS_INSTR", "0") == "1":
+                    _abs_l = self._extract_layer_idx(layer_name)
+                    logger.info(
+                        "[INSTR-APPLY] layer=%s abs=%s rid=%s "
+                        "apply_us=%.1f n_pages=%d n_sink_off=%d",
+                        layer_name, str(_abs_l), rid[:8], apply_us,
+                        len(reply.page_ids),
+                        len(getattr(reply, "sink_offsets", []) or []))
                 self._ttft_add(
                     rid,
                     num_waits=1,
@@ -10057,13 +10649,33 @@ class _Worker:
         t_save_enter = time.perf_counter()
         self._ttft_emit(t_save_enter)
         self._slack_emit_and_reset()
+        _instr_on = os.environ.get("ICMS_INSTR", "0") == "1"
+        # 2026-05-28: ICMS_SKIP_WAIT_FOR_SAVE=1 makes this whole method a
+        # no-op (after the cheap _ttft/slack emit). The deferred extract
+        # + WriteGroup pipeline still runs on the background thread; the
+        # per-rid drain happens in on_request_finished (which fires
+        # AFTER first-token emission, off the TTFT critical path).
+        # Safe for single-rid bench at TP>1 only: in batched mode the
+        # cross-rid memcpy race re-emerges and in multi-iter prefill
+        # bench the per-rid drain at on_request_finished still serializes
+        # iter N's writes vs iter N+1's reads on the BF2 link.
+        if (os.environ.get("ICMS_SKIP_WAIT_FOR_SAVE", "0") == "1"
+                and not self._is_multi_rid_mode()):
+            if _instr_on:
+                logger.info("[INSTR] wait_for_pending_writes SKIPPED: %.2fms",
+                            (time.perf_counter() - t_save_enter) * 1000.0)
+            return
         # 2026-05-09 N2 deferral: drain any pending WriteGroup ok-bits
         # from the previous iter's pipeline-thread flushes BEFORE the
         # memcpy gate. This runs `_tp_broadcast_bool` on the forward
         # thread (the only legal place for collective NCCL on the TP
         # comm) and applies the symmetric ledger bumps. Closes the
         # TP>1 pipeline-thread NCCL collision the audit identified.
+        _t_drain0 = time.perf_counter()
         self._drain_pending_flush_queue()
+        if _instr_on:
+            logger.info("[INSTR] drain_pending_flush_queue: %.2fms",
+                        (time.perf_counter() - _t_drain0) * 1000.0)
         if not (self._gpu_kv_caches and self._attn_metadata is not None
                 and self._requests and not self._skip_extract):
             # Nothing to extract — still flip the prefill_done flag.
@@ -10109,9 +10721,19 @@ class _Worker:
         # RPCs + summary compute keep running async on the pipeline
         # thread — they don't touch GPU pages anymore.
         #
-        # Default ON. Set ICMS_GATE_MEMCPY=0 to disable (debug only;
-        # reintroduces the corruption in batched mode).
-        _gate_memcpy = os.environ.get("ICMS_GATE_MEMCPY", "1") == "1"
+        # 2026-05-28: default ON only in multi-rid (batched) mode where
+        # the cross-rid race can actually occur. In single-rid mode
+        # (max_num_seqs=1 and ICMS_ALLOW_BATCH=0) only one request's
+        # apply can ever be in flight at a time, so freeing the prior
+        # prefill's pages can't be racing the pipeline thread's memcpy.
+        # The instrumented smoke (2026-05-28) measured this gate at
+        # ~460 ms/iter on the TTFT critical path at qwen3 TP=2 ctx=2k
+        # pf=4096 — pure overhead in single-rid mode.
+        # ICMS_GATE_MEMCPY=1 still forces the gate ON regardless;
+        # ICMS_GATE_MEMCPY=0 still forces it OFF (debug only — in
+        # batched mode this reintroduces the corruption).
+        _gate_default = "1" if self._is_multi_rid_mode() else "0"
+        _gate_memcpy = os.environ.get("ICMS_GATE_MEMCPY", _gate_default) == "1"
         memcpy_done = threading.Event() if _gate_memcpy else None
 
         def _task():
@@ -10136,12 +10758,16 @@ class _Worker:
                     "ICMS_GATE_MEMCPY_TIMEOUT_S", "120.0"))
             except ValueError:
                 _memcpy_timeout_s = 120.0
+            _t_memcpy0 = time.perf_counter()
             if not memcpy_done.wait(timeout=_memcpy_timeout_s):
                 logger.warning(
                     "ICMS memcpy gate timed out (%.1fs) — falling "
                     "through; GPU pages may be freed before extract "
                     "completes (cross-rid KV corruption risk).",
                     _memcpy_timeout_s)
+            if _instr_on:
+                logger.info("[INSTR] memcpy_done.wait: %.2fms",
+                            (time.perf_counter() - _t_memcpy0) * 1000.0)
 
         # Optional measurement mode: block until this prefill's writes
         # complete before returning. Default behavior leaves writes async
@@ -10212,6 +10838,7 @@ class _Worker:
                     "ICMS_BLOCK_WRITES_DRAIN_TIMEOUT_S", "180.0"))
             except ValueError:
                 _drain_timeout_s = 180.0
+            _t_blockw0 = time.perf_counter()
             try:
                 drained = self._write_pipeline.drain(timeout=_drain_timeout_s)
                 if not drained:
@@ -10220,11 +10847,17 @@ class _Worker:
                         _drain_timeout_s)
             except Exception:
                 logger.exception("ICMS_BLOCK_WRITES drain failed")
+            if _instr_on:
+                logger.info("[INSTR] BLOCK_WRITES drain: %.2fms",
+                            (time.perf_counter() - _t_blockw0) * 1000.0)
 
         if not self._prefill_done:
             self._reset_apply_caches_for_prefill_done()
             self._prefill_done = True
             logger.info("Prefill done. Switching to dense decode.")
+        if _instr_on:
+            logger.info("[INSTR] wait_for_pending_writes TOTAL: %.2fms",
+                        (time.perf_counter() - t_save_enter) * 1000.0)
 
     def _diag_full_dense_flip_snapshot(self, rs, flipping_layer: int) -> None:
         """ICMS_DIAG_FULL: dump rs metadata at the moment dense_mode flips.
@@ -11727,6 +12360,7 @@ class _Worker:
 
     # ─── request lifecycle ───────────────────────────────────────────────
 
+    @_instr_timing("on_request_finished")
     def on_request_finished(self, request_id: str):
         # Drain the deferred-write pipeline before touching this
         # request's state. The pipeline's extract + flush tasks for
@@ -11779,8 +12413,13 @@ class _Worker:
                 os.environ.get("ICMS_DRAIN_TIMEOUT_S", "600.0"))
         except ValueError:
             _drain_timeout_s = 600.0
+        _instr_on_orf = os.environ.get("ICMS_INSTR", "0") == "1"
+        _t_drainrid0 = time.perf_counter()
         ok = self._write_pipeline.drain_rid(
             request_id, timeout=_drain_timeout_s)
+        if _instr_on_orf:
+            logger.info("[INSTR] on_request_finished.drain_rid: %.2fms",
+                        (time.perf_counter() - _t_drainrid0) * 1000.0)
         drain_us = (time.perf_counter() - t0) * 1e6
         if not ok:
             logger.warning(
