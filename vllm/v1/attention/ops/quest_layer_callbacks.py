@@ -76,6 +76,11 @@ class QuestLayerCallbackRegistry:
     def __init__(self) -> None:
         self._pre: list[LayerCallback] = []
         self._post: list[LayerCallback] = []
+        # capture-q callbacks: fn(layer_idx, q) where q is the model's REAL
+        # post-q_norm/post-RoPE query at self.attn(q,k,v). Used to score Quest
+        # pages with the genuine query instead of reconstructing it via
+        # _compute_exact_q (which diverges; see project_quest_q_reconstruction_bug).
+        self._capture: list = []
         self._enabled: bool = True
 
     def register_pre(self, fn: LayerCallback) -> None:
@@ -84,9 +89,13 @@ class QuestLayerCallbackRegistry:
     def register_post(self, fn: LayerCallback) -> None:
         self._post.append(fn)
 
+    def register_capture_q(self, fn) -> None:
+        self._capture.append(fn)
+
     def clear(self) -> None:
         self._pre.clear()
         self._post.clear()
+        self._capture.clear()
 
     def enable(self) -> None:
         self._enabled = True
@@ -96,7 +105,18 @@ class QuestLayerCallbackRegistry:
 
     @property
     def has_callbacks(self) -> bool:
-        return bool(self._pre) or bool(self._post)
+        return bool(self._pre) or bool(self._post) or bool(self._capture)
+
+    def fire_capture_q(self, layer_idx, q):
+        if not self._enabled:
+            return
+        for fn in self._capture:
+            try:
+                fn(layer_idx, q)
+            except Exception:
+                logger.exception(
+                    "quest capture-q callback %s failed at layer=%d",
+                    fn, layer_idx)
 
     def fire_pre(self, layer_idx, positions, hidden_states, residual, key):
         if not self._enabled:
@@ -249,6 +269,27 @@ def _quest_fire_post_layer_fake(
     return None
 
 
+def _quest_capture_q_impl(
+    marker: int,
+    layer_idx: int,
+    q: torch.Tensor,
+) -> None:
+    # Side-effecting op (mutates_args=["q"] anti-DCE; we don't modify q).
+    # Hands the model's REAL post-q_norm/post-RoPE query to the registry so
+    # Quest scores with it instead of the reconstructed _compute_exact_q Q.
+    reg = _CURRENT_REGISTRY
+    if reg is not None:
+        reg.fire_capture_q(layer_idx, q)
+
+
+def _quest_capture_q_fake(
+    marker: int,
+    layer_idx: int,
+    q: torch.Tensor,
+) -> None:
+    return None
+
+
 _REGISTERED = False
 
 
@@ -272,6 +313,12 @@ def _ensure_ops_registered() -> None:
         mutates_args=["hidden_states"],
         fake_impl=_quest_fire_post_layer_fake,
     )
+    direct_register_custom_op(
+        op_name="quest_capture_q",
+        op_func=_quest_capture_q_impl,
+        mutates_args=["q"],
+        fake_impl=_quest_capture_q_fake,
+    )
     _REGISTERED = True
 
 
@@ -287,6 +334,7 @@ _ensure_ops_registered()
 SPLITTING_OPS: list[str] = [
     "vllm::quest_fire_pre_layer",
     "vllm::quest_fire_post_layer",
+    "vllm::quest_capture_q",
 ]
 
 
@@ -322,3 +370,13 @@ def fire_post_layer(model: Any, layer_idx: int, positions: torch.Tensor,
         return
     torch.ops.vllm.quest_fire_post_layer(
         marker, layer_idx, positions, hidden_states, residual, True)
+
+
+def capture_q(model: Any, layer_idx: int, q: torch.Tensor) -> None:
+    """Emit the capture-q op so the registry receives the model's genuine
+    post-q_norm/post-RoPE query for `layer_idx`. Always emits (Dynamo can't
+    bake an early-return); the op impl handles the no-registry sentinel.
+    Caller (model.forward) gates on a per-module flag so the op is only
+    emitted when ICMS_REAL_Q_CAPTURE=1."""
+    marker = getattr(model, "quest_layer_callbacks_marker", 0) or 0
+    torch.ops.vllm.quest_capture_q(marker, layer_idx, q)

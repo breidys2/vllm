@@ -346,6 +346,15 @@ class Qwen3MoeAttention(nn.Module):
         k_by_head = self.k_norm(k_by_head)
         k = k_by_head.view(k.shape)
         q, k = self.rotary_emb(positions, q, k)
+        # ICMS Quest real-query capture (ICMS_REAL_Q_CAPTURE=1): hand the
+        # genuine post-q_norm/post-RoPE query to the Quest registry so page
+        # scoring uses it instead of the diverging _compute_exact_q
+        # reconstruction. Gated on a per-module flag set by register_callbacks;
+        # a no-op (attr absent) in all default runs. Emitted via a custom op
+        # so the compiled/Dynamo path doesn't strip it.
+        if getattr(self, "_quest_capture_enabled", False):
+            from vllm.v1.attention.ops.quest_layer_callbacks import capture_q
+            capture_q(self._quest_marker_model, self._quest_layer_idx, q)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output

@@ -10915,11 +10915,4 @@ class _Worker:
         return h
 
 
-# ── IcmsConnector facade moved to icms_connector_facade.py (behavior-preserving
-#    split). Re-exported here so the public path
-#    'vllm...v1.icms_connector.IcmsConnector' (and all test importers) resolve
-#    unchanged. Placed at end-of-file so _Worker (referenced function-locally by
-#    the facade at instantiation time) is fully defined first. ──
-from vllm.distributed.kv_transfer.kv_connector.v1.icms_connector_facade import (  # noqa: E402
-    IcmsConnector,
-)
+

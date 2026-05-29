@@ -91,6 +91,12 @@ class QuestHookManager:
         self._q_proj_weights: dict[int, torch.Tensor] = {}
         # layer_idx -> rotary embedding module (for post-rope Q)
         self._rotary_embs: dict[int, nn.Module] = {}
+        # layer_idx -> (q_norm_weight [head_dim], eps) for models with QK-Norm
+        # (qwen3, qwen3-moe, gemma3). Absent for llama/mistral. The real
+        # forward applies this per-head RMSNorm over head_dim BETWEEN q_proj
+        # and RoPE (qwen3_moe.py:341-348); omitting it dots a pre-q_norm Q
+        # against post-k_norm K summaries → scrambled Quest page ranking.
+        self._q_norm_weights: dict[int, tuple[torch.Tensor, float]] = {}
 
         # Per-step state: layer_idx -> selected page indices
         self._current_selections: dict[int, torch.Tensor] = {}
@@ -102,6 +108,15 @@ class QuestHookManager:
         # Set by register_callbacks(); None when using the legacy
         # register_hooks() path.
         self._registry: Any | None = None
+        # ICMS_REAL_Q_CAPTURE=1: capture the model's genuine post-q_norm/
+        # post-RoPE query at self.attn(q,k,v) and score Quest pages with it
+        # instead of reconstructing via _compute_exact_q (which diverges,
+        # cos 0.966; see project_quest_q_reconstruction_bug_2026-05-28).
+        import os as _os_q
+        self._real_q_capture: bool = (
+            _os_q.environ.get("ICMS_REAL_Q_CAPTURE", "0") == "1")
+        # layer_idx -> captured real query [num_tokens, H_q, D]; cleared per step.
+        self._captured_q: dict[int, torch.Tensor] = {}
 
     def register_hooks(
         self,
@@ -256,6 +271,26 @@ class QuestHookManager:
         registry.register_pre(self._registry_pre_callback)
         registry.register_post(self._registry_post_callback)
 
+        # Real-query capture: register the capture callback and tag each
+        # attention module so its forward emits the capture op (gated on
+        # the per-module _quest_capture_enabled flag). target_module bears
+        # the registry marker (attach_registry set it above).
+        if self._real_q_capture:
+            registry.register_capture_q(self._registry_capture_q_callback)
+            _li = 0
+            for _name, _mod in model.named_modules():
+                if isinstance(_mod, decoder_layer_cls):
+                    _attn = getattr(_mod, "self_attn", None)
+                    if _attn is not None:
+                        _attn._quest_marker_model = target_module
+                        _attn._quest_layer_idx = _li
+                        _attn._quest_capture_enabled = True
+                    _li += 1
+            logger.info(
+                "[quest] real-query capture ENABLED on %d attention modules "
+                "(ICMS_REAL_Q_CAPTURE=1) — scoring will use the model's "
+                "genuine post-q_norm/post-RoPE query.", _li)
+
         self._active = True
         logger.info(
             "Registered Quest callbacks via registry on %s "
@@ -310,6 +345,25 @@ class QuestHookManager:
             output=synthetic_output,
         )
 
+    def _registry_capture_q_callback(self, layer_idx, q):
+        """Stash the model's genuine post-q_norm/post-RoPE query for a layer.
+
+        ``q`` is the first arg to ``self.attn(q, k, v)`` — shape
+        ``[num_tokens, H_q*head_dim]`` (rank-local under TP). Reshape to
+        ``[num_tokens, H_q, head_dim]`` to match the connector's scoring
+        consumer (and the HF cleanroom layout). detach() only — no D2H, no
+        sync; cheap enough to leave on the forward path.
+        """
+        if self._head_dim is None:
+            return
+        try:
+            H = q.shape[-1] // self._head_dim  # rank-local H_q
+            self._captured_q[int(layer_idx)] = (
+                q.detach().view(-1, H, self._head_dim))
+        except Exception:
+            logger.exception("quest capture-q stash failed at layer=%d",
+                             layer_idx)
+
     def get_selection(self, layer_idx: int) -> torch.Tensor | None:
         """Get the computed page selection for a layer (if available)."""
         return self._current_selections.get(layer_idx)
@@ -317,6 +371,7 @@ class QuestHookManager:
     def clear_selections(self) -> None:
         """Clear all computed selections (called at end of each step)."""
         self._current_selections.clear()
+        self._captured_q.clear()
 
     # -- Weight extraction ---------------------------------------------------
 
@@ -392,6 +447,24 @@ class QuestHookManager:
             rotary_emb = getattr(self_attn, "rotary_emb", None)
             if rotary_emb is not None:
                 self._rotary_embs[layer_idx] = rotary_emb
+
+            # Cache q_norm (QK-Norm) for qwen3/qwen3-moe/gemma3. The real
+            # forward applies this per-head RMSNorm over head_dim AFTER
+            # q_proj and BEFORE RoPE (qwen3_moe.py:341-348). Without it the
+            # scoring Q is scale-mismatched against the post-k_norm K
+            # summaries the server computes. No-op for llama/mistral (the
+            # attribute is absent → dict miss → skipped in _compute_exact_q).
+            q_norm = getattr(self_attn, "q_norm", None)
+            if q_norm is not None:
+                qn_weight = getattr(q_norm, "weight", None)
+                qn_eps = getattr(q_norm, "variance_epsilon", None)
+                if qn_eps is None:
+                    qn_eps = getattr(q_norm, "eps", 1e-6)
+                if qn_weight is not None:
+                    self._q_norm_weights[layer_idx] = (
+                        qn_weight.data,
+                        float(qn_eps),
+                    )
 
         logger.info(
             "Extracted Quest Q weights for %d/%d layers "
@@ -605,7 +678,19 @@ class QuestHookManager:
         if self.stats is not None:
             self.stats.begin_q_compute(next_layer_idx)
 
-        query = self._compute_exact_q(residual, next_layer_idx, positions)
+        # Real-query capture: prefer the model's genuine query over the
+        # reconstruction. At fire_post_layer(L) we have captured_q[L] (layer
+        # L's true post-q_norm/post-RoPE query) but score next_layer_idx=L+1.
+        # Using L's real q for L+1's scoring is the "adjacent-layer real q"
+        # variant: it eliminates the q_norm + residual-ordering + RoPE
+        # reconstruction errors (cos 0.62/0.966) at the cost of a 1-layer
+        # query offset (adjacent queries are highly correlated). Falls back
+        # to reconstruction when capture is off or the layer wasn't captured.
+        query = None
+        if self._real_q_capture:
+            query = self._captured_q.get(layer_idx)
+        if query is None:
+            query = self._compute_exact_q(residual, next_layer_idx, positions)
 
         if self.stats is not None:
             self.stats.end_q_compute(next_layer_idx)
@@ -826,10 +911,50 @@ class QuestHookManager:
         # -> [B, q_size]
         q = h_normed @ q_w.t()
 
+        # QK-Norm: qwen3/qwen3-moe/gemma3 apply a per-head RMSNorm over
+        # head_dim AFTER q_proj and BEFORE RoPE (qwen3_moe.py:341-348). The K
+        # cache the server summarizes is post-k_norm, so the scoring Q MUST be
+        # post-q_norm or the per-channel scales mismatch and Quest page
+        # ranking is scrambled on every scored layer. No-op when q_norm wasn't
+        # captured (llama/mistral have none).
+        qn = self._q_norm_weights.get(next_layer_idx)
+        if qn is not None and self._head_dim is not None:
+            qn_w, qn_eps = qn
+            qn_w = qn_w.to(device)
+            # Reshape flat [num_tokens, q_size] → [num_tokens, n_heads, head_dim],
+            # RMSNorm over the last dim, reshape back — mirrors the real
+            # forward's view(..., n_heads, head_dim) → q_norm → view(q.shape).
+            orig_shape = q.shape
+            q_bh = q.view(-1, q.shape[-1] // self._head_dim, self._head_dim)
+            qn_var = q_bh.to(torch.float32).pow(2).mean(-1, keepdim=True)
+            q_bh = q_bh * torch.rsqrt(qn_var + qn_eps)
+            q_bh = (q_bh * qn_w).to(q.dtype)
+            q = q_bh.view(orig_shape)
+
         # Apply rotary embedding so the captured Q is post-rope, aligned
         # with the K cache. The attention path does rope in-place on the
         # flat [num_tokens, q_size] tensor; mirror that here.
         rotary_emb = self._rotary_embs.get(next_layer_idx)
+        # ROPE PROBE: log the positions fed to RoPE once at layer 0. If these
+        # are chunk-RELATIVE (0..N) rather than ABSOLUTE (~haystack_len), the
+        # scoring Q is rotated at the wrong frequencies → diverges from the
+        # model's true query (2026-05-28 investigation).
+        import os as _os_rp
+        if (_os_rp.environ.get("ICMS_ROPE_PROBE", "") == "1"
+                and next_layer_idx == 0
+                and getattr(self, "_rope_probe_n", 0) < 8
+                and positions is not None):
+            self._rope_probe_n = getattr(self, "_rope_probe_n", 0) + 1
+            try:
+                _p = positions.flatten()
+                logger.info(
+                    "[rope-probe #%d] layer0 _compute_exact_q positions: "
+                    "n=%d first3=%s last3=%s min=%d max=%d",
+                    self._rope_probe_n,
+                    _p.numel(), _p[:3].tolist(), _p[-3:].tolist(),
+                    int(_p.min()), int(_p.max()))
+            except Exception:
+                pass
         if (
             rotary_emb is not None
             and positions is not None
