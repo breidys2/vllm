@@ -18,7 +18,10 @@ import time
 
 from vllm.logger import init_logger
 
-logger = init_logger(__name__)
+# Log under the original connector logger name (behavior-preserving
+# split): all split modules share one logger so log-name filtering,
+# grep, and assertLogs see the same name as before.
+logger = init_logger("vllm.distributed.kv_transfer.kv_connector.v1.icms_connector")
 
 
 def _instr_timing(name):
