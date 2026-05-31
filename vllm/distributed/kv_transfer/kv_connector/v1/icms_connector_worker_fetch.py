@@ -211,10 +211,14 @@ class _WorkerFetchApplyMixin:
                     rid[:8], next_layer_idx, len(reply.page_ids),
                     len(reuse_offsets))
             if _instr_fa:
+                _n_reply = (len(reply.page_ids)
+                            if reply is not None else 0)
                 logger.info(
-                    "[INSTR-FA] layer=%d path=fast-HIT dt_us=%.1f",
+                    "[INSTR-FA] layer=%d path=fast-HIT dt_us=%.1f "
+                    "n_pages_reply=%d (NO WIRE — reuse-cache hit)",
                     next_layer_idx,
-                    (time.perf_counter() - _t_fa_enter) * 1e6)
+                    (time.perf_counter() - _t_fa_enter) * 1e6,
+                    _n_reply)
             return
 
         # Slow path: first scoring boundary for this request — issue
@@ -343,12 +347,37 @@ class _WorkerFetchApplyMixin:
                         compute_supply_bps=ab_compute_supply_bps,
                     )
                     if _instr_fa:
+                        _rpc_dt_us = (time.perf_counter() - _t_rpc0) * 1e6
+                        _n_reply = (len(reply.page_ids)
+                                    if reply is not None else 0)
+                        _layers_covered = (reuse_through
+                                           - next_layer_idx + 1)
+                        # Per-rank bytes: kv_page_bytes is FULL page (all KV
+                        # heads). TP fan-out: each rank reads its share via
+                        # kv_page_bytes / tp_size; assert at line 684-693
+                        # guarantees clean divisibility.
+                        _per_rank_page_bytes = (
+                            int(self._geom.kv_page_bytes)
+                            // max(1, int(self._tp_size)))
+                        _bytes_per_rank = (_n_reply * _per_rank_page_bytes
+                                           * _layers_covered)
+                        _bytes_full = (_n_reply
+                                       * int(self._geom.kv_page_bytes)
+                                       * _layers_covered)
+                        _wire_GBps = (_bytes_per_rank
+                                      / max(1.0, _rpc_dt_us)
+                                      * 1e6 / 1e9)
                         logger.info(
                             "[INSTR-FA] layer=%d path=slow-RPC dt_us=%.1f "
-                            "total_pages=%d reuse_through=%d use_flags=%d",
-                            next_layer_idx,
-                            (time.perf_counter() - _t_rpc0) * 1e6,
-                            total_pages, reuse_through,
+                            "total_pages_req=%d n_pages_reply=%d "
+                            "layers_covered=%d bytes_per_rank_MB=%.2f "
+                            "bytes_full_MB=%.2f wire_GBps=%.3f "
+                            "reuse_through=%d use_flags=%d",
+                            next_layer_idx, _rpc_dt_us, total_pages,
+                            _n_reply, _layers_covered,
+                            _bytes_per_rank / (1 << 20),
+                            _bytes_full / (1 << 20), _wire_GBps,
+                            reuse_through,
                             int(os.environ.get("ICMS_REPLY_EARLY", "1") == "1"))
         except Exception as e:
             # 2026-05-08: keep at warning so future silent-failure
@@ -495,13 +524,21 @@ class _WorkerFetchApplyMixin:
             # wait_for_layer anyway), and compute the per-layer offset
             # from scored_rank delta, not the abs_layer delta.
             _mask_set = self._geom.scored_layers_mask != 0
-            if _mask_set:
+            # 2026-05-29 ICMS_FULL_FETCH=1: server's lifted Phase-2
+            # writes ALL 48 layers (not just scored); populate
+            # _pending_reuse for every reuse layer, not just scored
+            # ones, and use raw abs_layer delta (sink slot index ==
+            # layer index when sink is sized for num_layers).
+            _full_fetch = (
+                os.environ.get("ICMS_FULL_FETCH", "0") == "1")
+            _skip_nonscored = _mask_set and not _full_fetch
+            if _mask_set and not _full_fetch:
                 _base_scored_rank = self._geom.scored_rank(next_layer_idx)
             for delta in range(1, reuse_through - next_layer_idx + 1):
                 reuse_layer = next_layer_idx + delta
-                if _mask_set and not self._geom.is_scored(reuse_layer):
+                if _skip_nonscored and not self._geom.is_scored(reuse_layer):
                     continue
-                if _mask_set:
+                if _mask_set and not _full_fetch:
                     effective_delta = (
                         self._geom.scored_rank(reuse_layer)
                         - _base_scored_rank)
@@ -747,8 +784,33 @@ class _WorkerFetchApplyMixin:
         # attention falls back to natural full-context bt (e.g. SW layers in
         # gemma-3 attend over the full prefill, with their own SW mask).
         _abs_layer_for_mask = self._extract_layer_idx(layer_name)
+        # 2026-05-29 ICMS_FULL_FETCH=1: in B-full-fetch mode the server
+        # writes ALL 48 layers' KV to the sink and _pending_reuse is
+        # populated for every layer (see fetch_all reuse loop above),
+        # so non-scored layers should NOT short-circuit — they must
+        # fall through to pop+apply so attention reads from the sink
+        # (where Phase-2 just landed full-page data) rather than from
+        # vLLM's natural bt.
+        # CRITICAL gate (2026-05-29 v2): the lift is ONLY safe when this
+        # specific call has data pending for the layer (B fetch_all path
+        # populates _pending_reuse for all 48 layers). For C (Score
+        # path), only the scored layer + its reuse range get data; other
+        # non-scored layers must still short-circuit or wait_for_layer
+        # spins to its 5s flag-timeout. Probe the pending dicts to
+        # distinguish: presence ⇒ B full-fetch, absence ⇒ C/legacy.
+        _full_fetch_wfl = (
+            os.environ.get("ICMS_FULL_FETCH", "0") == "1")
+        _has_pending_for_layer = False
+        if _full_fetch_wfl and _abs_layer_for_mask is not None:
+            _canonical = (
+                f"model.layers.{_abs_layer_for_mask}.self_attn.attn")
+            with self._score_lock:
+                _has_pending_for_layer = (
+                    _canonical in self._pending_scores
+                    or _canonical in self._pending_reuse)
         if (_abs_layer_for_mask is not None
-                and not self._geom.is_scored(_abs_layer_for_mask)):
+                and not self._geom.is_scored(_abs_layer_for_mask)
+                and not _has_pending_for_layer):
             # Contiguous-reuse mode (dense_layers_mask != 0): non-scored
             # layers should already have a pending reuse entry promoted
             # by on_layer_reuse from the per-layer hook chain. Fall
@@ -1502,7 +1564,12 @@ class _WorkerFetchApplyMixin:
         if (layer_idx_for_cache is not None
                 and cached_start >= 0
                 and rs._apply_cached_phys_blocks_dev is not None
-                and rs._apply_cached_new_bt is not None):
+                and rs._apply_cached_new_bt is not None
+                # Faithful Quest: the fast-path cached bt carries no per-head
+                # mask, so force the slow path (which rebuilds bt + head_mask)
+                # for every faithful layer. Correctness over the stride-reuse
+                # speedup; the baseline is not perf-sensitive.
+                and os.environ.get("ICMS_SCORING_MODE") != "faithful_quest"):
             delta = layer_idx_for_cache - cached_start
             # 2026-05-11 audit fix #21: invalidate the cached new_bt
             # if the cumulative-page set grew between the slow path's
@@ -2775,12 +2842,67 @@ class _WorkerFetchApplyMixin:
         # correctness during debugging.
         if os.environ.get("ICMS_SKIP_BT_OVERRIDE") != "1":
             from vllm.v1.attention import icms_fetch_state
+            # ── Faithful Quest per-KV-head mask, aligned to new_bt columns ──
+            # [#1 GPU-VALIDATION POINT] new_bt = [context blocks ++ continuation
+            # blocks]. The context columns are in `cumulative_pids` order (see
+            # the phys_blocks_for_bt_dev build, ~L2062-2068); continuation
+            # columns (j >= n_ctx) are the query's own window → unmasked (1) for
+            # every head, matching HF's locally_have ∪ partial-last-page.
+            # _pending_faithful_masks[layer_name][rid] holds the full [H_kv, P]
+            # page-id-keyed selection mask (None on every non-faithful path).
+            _faithful_hm_state = None
+            _fmasks = self._pending_faithful_masks.get(layer_name)
+            _full_sel = _fmasks.get(rid) if _fmasks else None
+            if _full_sel is not None:
+                try:
+                    _Hkv, _P = _full_sel.shape
+                    _bt_ctx = cumulative_pids if cumulative_pids else valid_pids
+                    _ncol = int(new_bt.shape[1])
+                    _hm = torch.ones(_Hkv, _ncol, dtype=torch.int8,
+                                     device=_full_sel.device)
+                    _ctx_ids = [int(p) for p in (_bt_ctx or [])][:_ncol]
+                    if _ctx_ids:
+                        _cols = torch.as_tensor(
+                            [p if 0 <= p < _P else 0 for p in _ctx_ids],
+                            dtype=torch.long, device=_full_sel.device)
+                        _hm[:, :_cols.numel()] = _full_sel.index_select(
+                            1, _cols).to(torch.int8)
+                    _faithful_hm_state = _hm.unsqueeze(0).contiguous()  # [1,H_kv,ncol]
+                except Exception as _e_hm:
+                    logger.warning(
+                        "[faithful_quest] head_mask build failed layer=%s "
+                        "rid=%s: %r — falling back to dense-over-union",
+                        layer_name, rid[:8], _e_hm)
+                    _faithful_hm_state = None
+            # ICMS_FAITHFUL_DEBUG_BT=1: one-shot layer-0 dump to VERIFY the
+            # bt-column ↔ page-id alignment (the #1 correctness risk). Compare
+            # new_bt context columns against cumulative_pids/valid_pids; the
+            # per-head mask sums should equal B_eff (+ continuation count).
+            if (_faithful_hm_state is not None
+                    and os.environ.get("ICMS_FAITHFUL_DEBUG_BT") == "1"
+                    and layer_idx_for_cache == 0
+                    and not getattr(self, "_faithful_bt_dbg_logged", False)):
+                self._faithful_bt_dbg_logged = True
+                try:
+                    _nb0 = new_bt.detach().cpu().tolist()[0]
+                    logger.info(
+                        "[faithful-bt-dbg] layer0 rid=%s ctx_pages=%d ncol=%d "
+                        "new_bt[:8]=%s cumulative_pids[:8]=%s "
+                        "valid_pids[:8]=%s hm_sum_per_head=%s",
+                        rid[:8], context_pages, int(new_bt.shape[1]),
+                        _nb0[:8],
+                        (list(cumulative_pids)[:8] if cumulative_pids else None),
+                        list(valid_pids)[:8],
+                        _faithful_hm_state[0].sum(dim=1).cpu().tolist())
+                except Exception:
+                    pass
             _state_slow = icms_fetch_state.IcmsFetchState(
                 key_cache=main_key,
                 value_cache=main_value,
                 block_table=new_bt,
                 seq_lens=new_sl,
                 max_seq_len=new_seq_len,
+                head_mask=_faithful_hm_state,
             )
             if _capture is not None:
                 _capture.append((req_idx, _state_slow))

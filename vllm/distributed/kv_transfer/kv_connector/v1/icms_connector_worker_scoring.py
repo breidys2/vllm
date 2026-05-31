@@ -21,6 +21,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.icms_connector_trace import _i
 from vllm.distributed.kv_transfer.kv_connector.v1.icms_connector_trace import _icms_trace
 from vllm.distributed.kv_transfer.kv_connector.v1.icms_connector_trace import _pack_fetch_bitmap
 from vllm.distributed.kv_transfer.kv_connector.v1.icms_connector_tp import _tp_allreduce_max_int
+from vllm.distributed.kv_transfer.kv_connector.v1.icms_connector_tp import _tp_allreduce_max_tensor
 from vllm.distributed.kv_transfer.kv_connector.v1.icms_connector_tp import _tp_broadcast_bool
 from vllm.distributed.kv_transfer.kv_connector.v1.icms_connector_tp import _tp_broadcast_score_reply
 from vllm.distributed.kv_transfer.kv_connector.v1 import icms_connector_trace as _trace
@@ -96,7 +97,24 @@ class _WorkerScoringMixin:
             # Stride modular gate: only consulted in legacy mode. With
             # contiguous-reuse every scored layer fires Score and the next
             # scored layer in the mask delimits the reuse window.
+            #
+            # 2026-05-30 fix (workflow wrrwqsdto): when scored_layers_mask
+            # is set, the is_scored() filter at line 91 already enforced
+            # selectivity and the mask itself encodes the (possibly
+            # non-uniform) stride. The absolute-index modulo here is then
+            # redundant AND wrong for masks not aligned to score_stride
+            # — e.g. gemma-3's hybrid mask {5,11,17,23,29,35,41,47,53,59}
+            # under stride=6: every scored layer satisfies idx%6==5, so
+            # EVERY scored gemma layer was being routed to on_layer_reuse,
+            # bypassing _on_layer_score_impl and the register_request call
+            # → adaptive allocator never saw a single gemma-3 request →
+            # C-config effectively ran at full budget. qwen3 + mistral
+            # scored masks are stride-6-aligned by construction, so for
+            # them the gate is already a no-op on every scored layer and
+            # this change is byte-identical.
+            _mask_is_stride = self._geom.scored_layers_mask != 0
             if (not _contiguous_reuse
+                    and not _mask_is_stride
                     and (next_layer_idx % self._score_stride) != 0):
                 self.on_layer_reuse(next_layer_idx, budget, stats)
                 if _diag:
@@ -556,6 +574,26 @@ class _WorkerScoringMixin:
     def _score_one_request(self, rid, rs, req_idx, next_layer_idx,
                            quest_query, budget, stats, connector_meta):
         """Score a single request against ICMS and store the result."""
+        # 2026-05-29 single-pass INSTR: wrap whole call to bound the full
+        # Score-path overhead per scored-layer boundary. Inner INSTRs
+        # (Q-CPU, SCORE-RPC, TP-BCAST) decompose where the time goes.
+        _instr_sco = os.environ.get("ICMS_INSTR", "0") == "1"
+        _t_sco_enter = time.perf_counter() if _instr_sco else 0.0
+        try:
+            return self.__score_one_request_impl(
+                rid, rs, req_idx, next_layer_idx,
+                quest_query, budget, stats, connector_meta)
+        finally:
+            if _instr_sco:
+                logger.info(
+                    "[INSTR-SCORE-TOTAL] layer=%d rid=%s total_us=%.1f",
+                    next_layer_idx, rid[:8],
+                    (time.perf_counter() - _t_sco_enter) * 1e6)
+
+    def __score_one_request_impl(self, rid, rs, req_idx, next_layer_idx,
+                                  quest_query, budget, stats,
+                                  connector_meta):
+        """Score a single request against ICMS and store the result."""
 
         # Score against icms trie. Works when the trie has data from a
         # prior request or prior prefill pass. If the trie is empty
@@ -848,10 +886,20 @@ class _WorkerScoringMixin:
         # MUST PRECEDE the per_kv_head branch below so that setting both
         # ICMS_SCORING_MODE=per_layer_max_kv AND ICMS_QUEST_MODE=per_kv_head
         # routes to the new mode (the per_kv_head branch otherwise wins).
-        if os.environ.get("ICMS_SCORING_MODE", "") == "per_layer_max_kv":
+        # ICMS_SCORING_MODE=faithful_quest — FAITHFUL Quest baseline
+        # (per_kv_head selection + per-head exclusivity mask, matches
+        # scripts/utils/quest_faithful_hf.py). Reuses the per_layer_max_kv
+        # plumbing verbatim (summaries fetch → score → fetch_union → apply);
+        # only the scoring call is swapped (per_layer_max_kv_per_head_topk →
+        # union materialize + [H_kv,P] per-head mask) and the mask is stashed
+        # for the Triton attention backend. TP=1 only (per-head selection is
+        # NOT MAX-allreduce-composable).
+        _scoring_mode = os.environ.get("ICMS_SCORING_MODE", "")
+        if _scoring_mode in ("per_layer_max_kv", "faithful_quest"):
             self._per_layer_max_kv_score_one_layer(
                 rid, rs, req_idx, next_layer_idx, quest_query, budget,
-                total_pages, already_fetched)
+                total_pages, already_fetched,
+                faithful=(_scoring_mode == "faithful_quest"))
             return
 
         # ICMS_QUEST_MODE=per_kv_head — server-fetched summaries +
@@ -993,6 +1041,22 @@ class _WorkerScoringMixin:
         # Marshal query to fp32 numpy, mean-pooling Q heads per KV-head
         # group for GQA.
         geom = self._geom
+        if os.environ.get("ICMS_DIAG_GEOM", "0") == "1" and not getattr(
+                self, "_diag_geom_logged", False):
+            self._diag_geom_logged = True
+            logger.warning(
+                "[diag-geom-entry] rank=%d tp=%d model=%s geom_is_None=%s "
+                "geom.num_kv_heads=%s geom.num_layers=%s qq_type=%s qq_ndim=%s "
+                "qq_shape=%s",
+                self._tp_rank, self._tp_size, self._model_name,
+                geom is None,
+                (geom.num_kv_heads if geom is not None else "N/A"),
+                (geom.num_layers if geom is not None else "N/A"),
+                type(quest_query).__name__,
+                (quest_query.ndim if isinstance(quest_query, torch.Tensor)
+                 else "n/a"),
+                (tuple(quest_query.shape)
+                 if isinstance(quest_query, torch.Tensor) else "n/a"))
         _diag_q_n = getattr(self, "_diag_q_shape_count", 0)
         if (isinstance(quest_query, torch.Tensor)
                 and os.environ.get("ICMS_DIAG_Q_SHAPE", "0") == "1"
@@ -1113,6 +1177,16 @@ class _WorkerScoringMixin:
                 if (local_kv_heads >= 1 and num_heads >= local_kv_heads
                         and num_heads % local_kv_heads == 0):
                     heads_per_group = num_heads // local_kv_heads
+                    if os.environ.get("ICMS_DIAG_GEOM", "0") == "1":
+                        logger.warning(
+                            "[diag-geom] rank=%d tp=%d model=%s "
+                            "geom.num_kv_heads(FULL?)=%d full_kv=%d "
+                            "local_kv=%d q_heads=%d heads_per_group=%d "
+                            "(EXPECT mistral full_kv=8 local_kv=4; "
+                            "if full_kv=4 local_kv=2 => DOUBLE-DIVIDE BUG)",
+                            self._tp_rank, self._tp_size, self._model_name,
+                            geom.num_kv_heads, full_kv_heads, local_kv_heads,
+                            num_heads, heads_per_group)
                     grouped = q.reshape(
                         local_kv_heads, heads_per_group, head_dim)
                     pool = os.environ.get("ICMS_Q_GQA_POOL", "mean").lower()
@@ -1128,7 +1202,18 @@ class _WorkerScoringMixin:
                     else:  # default: mean
                         q = grouped.mean(dim=1)
                     # q: [local_kv_heads, head_dim]
+            # [INSTR-Q-CPU] GPU→CPU drain (also implicit cuda sync on
+            # default stream). Suspected cost at high-ctx with many TP
+            # callsites; isolate here so the next two milestones can
+            # attribute SCORE-RPC vs Q-CPU separately.
+            _instr_qcpu = os.environ.get("ICMS_INSTR", "0") == "1"
+            _t_qcpu0 = time.perf_counter() if _instr_qcpu else 0.0
             q = q.reshape(-1).to(dtype=torch.float32, device="cpu")
+            if _instr_qcpu:
+                logger.info(
+                    "[INSTR-Q-CPU] layer=%d q_drain_us=%.1f",
+                    next_layer_idx,
+                    (time.perf_counter() - _t_qcpu0) * 1e6)
             q_np = q.contiguous().numpy()
         else:
             q_np = np.asarray(quest_query, dtype=np.float32).ravel()
@@ -1379,8 +1464,29 @@ class _WorkerScoringMixin:
                     # safe — see flush_cond rationale on _RequestState).
                     _flush_seq_at_attempt = rs.flush_seq
                     try:
+                        _instr_srpc = (os.environ.get("ICMS_INSTR", "0")
+                                       == "1")
+                        _t_srpc0 = (time.perf_counter()
+                                    if _instr_srpc else 0.0)
                         with self._rpc_lock:  # X1 (race-audit): serialize tx_/rx_
                             reply = self._client.score(**_score_kwargs)
+                        if _instr_srpc:
+                            # [INSTR-SCORE-RPC] wall time around the wire
+                            # round-trip + server-side scoring. Server's
+                            # `reply.score_ns` gives the server-side
+                            # compute time; wire_us - score_ns = wire RTT
+                            # + queue latency on both sides.
+                            _wire_us = (time.perf_counter()
+                                        - _t_srpc0) * 1e6
+                            _srv_score_us = (
+                                int(getattr(reply, "score_ns", 0)) // 1000
+                                if reply is not None else 0)
+                            logger.info(
+                                "[INSTR-SCORE-RPC] layer=%d wire_us=%.1f "
+                                "server_score_us=%d wire_minus_server_us=%.1f",
+                                next_layer_idx, _wire_us,
+                                _srv_score_us,
+                                _wire_us - _srv_score_us)
                         break
                     except IcmsError as _e:
                         if _e.status != errno.ENOENT:
@@ -1489,6 +1595,7 @@ class _WorkerScoringMixin:
         if self._tp_size > 1:
             try:
                 _trace = os.environ.get("ICMS_NCCL_TRACE", "0") == "1"
+                _instr_tpb = os.environ.get("ICMS_INSTR", "0") == "1"
                 if _trace:
                     torch.cuda.synchronize()
                 _t0 = time.perf_counter()
@@ -1501,6 +1608,13 @@ class _WorkerScoringMixin:
                     logger.info("[nccl-trace] phase=score_reply_broadcast "
                                  "rank=%d layer=%d us=%.1f",
                                  self._tp_rank, next_layer_idx, nccl_bcast_us)
+                if _instr_tpb:
+                    # [INSTR-TP-BCAST] Score-reply NCCL broadcast (rank-0
+                    # → peers). Already fused 4→2 collectives earlier
+                    # today; this confirms it's still cheap.
+                    logger.info(
+                        "[INSTR-TP-BCAST] layer=%d bcast_us=%.1f",
+                        next_layer_idx, nccl_bcast_us)
             except Exception as e:
                 logger.warning("Score: reply broadcast failed: %s", e)
                 reply = None
@@ -2898,8 +3012,17 @@ class _WorkerScoringMixin:
     def _per_layer_max_kv_score_one_layer(self, rid, rs, req_idx,
                                             next_layer_idx,
                                             quest_query, budget,
-                                            total_pages, already_fetched):
+                                            total_pages, already_fetched,
+                                            faithful=False):
         """ICMS_SCORING_MODE=per_layer_max_kv path (2026-05-28).
+
+        When ``faithful=True`` (ICMS_SCORING_MODE=faithful_quest) the scoring
+        call is swapped to per-KV-head distinct selection
+        (``per_layer_max_kv_per_head_topk``): the materialized page-set becomes
+        the UNION of per-head picks (fed to the unchanged ``fetch_union_per_head``)
+        and the per-head ``[H_kv, P]`` selection mask is stashed in
+        ``_pending_faithful_masks`` for the Triton attention backend to enforce
+        per-head exclusivity. Faithful mode is TP=1 only.
 
         Quest-faithful client-side scoring on per-head summaries with
         optional K random q-token sampling. Mirrors
@@ -2941,16 +3064,22 @@ class _WorkerScoringMixin:
                                 next_layer_idx, type(quest_query).__name__)
                 self._per_layer_max_kv_q_len_warned = True
             return
-        if self._tp_size > 1:
-            if not self._per_layer_max_kv_tp_warned:
-                logger.error(
-                    "[icms_per_layer_max_kv] TP=1 ONLY (got tp_size=%d). "
-                    "per_layer_max_kv requires cross-rank allreduce(MAX) "
-                    "before topk; not implemented in v1. Path is a no-op "
-                    "under TP>1 to avoid silent cross-rank picks divergence.",
-                    self._tp_size)
-                self._per_layer_max_kv_tp_warned = True
-            return
+        if faithful and self._tp_size > 1:
+            raise RuntimeError(
+                "[faithful_quest] per-KV-head distinct selection is NOT "
+                "MAX-allreduce-composable across ranks (unlike per_layer_max_kv); "
+                "faithful_quest is TP=1 only. Got tp_size=%d — run the baseline "
+                "at TP=1, or implement the per-rank per-head all-gather first."
+                % self._tp_size)
+        if self._tp_size > 1 and not self._per_layer_max_kv_tp_warned:
+            logger.info(
+                "[icms_per_layer_max_kv] TP=%d: cross-rank allreduce(MAX) of "
+                "per-page scores ENABLED (accuracy-path TP support; one extra "
+                "NCCL all-reduce per scored layer, not perf-optimized). All "
+                "ranks score rank-local KV heads, MAX-combine, then top-k → "
+                "identical picks.",
+                self._tp_size)
+            self._per_layer_max_kv_tp_warned = True
         # Hard-assert no adaptive allocator: per_layer_max_kv interacts
         # badly with per-layer budget changes (R1 from synthesis review)
         # — picked sets become non-monotonic across layers in the same
@@ -2982,7 +3111,10 @@ class _WorkerScoringMixin:
         # Env knobs (read each call so tests can flip them per-fixture;
         # the seed is NOT re-read — see _get_q_token_sample_generator).
         qtok_pool = os.environ.get("ICMS_Q_TOKEN_POOL", "max")
-        qhd_pool = os.environ.get("ICMS_Q_HEAD_POOL", "mean")
+        # Faithful per_kv_head uses per-Q-head scoring (q_head_pool='max', the
+        # HF install_quest default); per_layer_max_kv defaults to 'mean'.
+        qhd_pool = os.environ.get(
+            "ICMS_Q_HEAD_POOL", "max" if faithful else "mean")
         k_sample = int(os.environ.get("ICMS_Q_TOKEN_SAMPLE_COUNT", "0"))
         sample_mode = os.environ.get("ICMS_Q_TOKEN_SAMPLE_MODE", "random")
         kv_reduce = os.environ.get("ICMS_PER_LAYER_MAX_KV_REDUCE", "max")
@@ -3035,6 +3167,19 @@ class _WorkerScoringMixin:
         D = int(self._geom.head_dim)
         elem = int(self._geom.elem_bytes)
         spb = int(self._geom.summary_page_bytes)
+        if os.environ.get("ICMS_DIAG_GEOM", "0") == "1" and not getattr(
+                self, "_diag_plmk_logged", False):
+            self._diag_plmk_logged = True
+            _qqs = (tuple(quest_query.shape)
+                    if isinstance(quest_query, torch.Tensor) else "n/a")
+            logger.warning(
+                "[diag-plmk-geom] rank=%d tp=%d model=%s "
+                "H_kv(geom.num_kv_heads)=%d D=%d spb=%d elem=%d "
+                "total_pages=%d quest_query.shape=%s "
+                "(EXPECT mistral H_kv=8; H_kv=4 => geom WRONG => "
+                "summary reshape+rank-slice both broken)",
+                self._tp_rank, self._tp_size, self._model_name,
+                H_kv, D, spb, elem, total_pages, _qqs)
         if elem != 2:
             logger.warning(
                 "[icms_per_layer_max_kv] elem_bytes=%d not supported in "
@@ -3083,6 +3228,25 @@ class _WorkerScoringMixin:
         kmin = flat_gpu[:, 0, :, :].contiguous()
         kmax = flat_gpu[:, 1, :, :].contiguous()
 
+        # ── per_layer_max_kv TP>1 KV-head slice (accuracy-path fix 2026-05-29) ──
+        # The server is NOT rank-aware: the summary fetch returns ALL H_kv KV
+        # heads to every rank ([P, H_kv, D] with H_kv = full num_kv_heads). But
+        # the captured scoring Q is rank-LOCAL (H_q/tp_size heads). If we score
+        # the rank-local Q against the full-H_kv summaries, the scorer computes
+        # GQA group = H_q_local // H_kv_full (e.g. 16//4=4) instead of the true
+        # 8, mis-pairing each rank's Q heads across ALL kv heads → wrong page
+        # scores (verified: page_scores diverge by ~110, top-403 overlap 215/403
+        # vs TP=1; slicing → bit-identical, 403/403). So restrict the summaries
+        # to this rank's local KV heads; rank r owns kv[r*Hl:(r+1)*Hl]. After the
+        # slice group = H_q_local // H_kv_local = 8 (correct) and each rank scores
+        # its local Q↔local KV; the downstream allreduce(MAX) over the [P] page
+        # scores then MAX-combines ranks → global max over all kv heads = TP=1.
+        if self._tp_size > 1 and H_kv % self._tp_size == 0:
+            _hkv_local = H_kv // self._tp_size
+            _lo = int(self._tp_rank) * _hkv_local
+            kmin = kmin[:, _lo:_lo + _hkv_local, :].contiguous()
+            kmax = kmax[:, _lo:_lo + _hkv_local, :].contiguous()
+
         # Full-tensor summary dump (cross-impl numerical diff). Fires ONCE at
         # the first layer-0 scoring call. Writes [P, H_kv, D] kmin/kmax so we
         # can numerically compare vLLM's server-fetched summaries against the
@@ -3095,14 +3259,23 @@ class _WorkerScoringMixin:
                 _qd = quest_query.detach()
                 if _qd.ndim == 2:
                     _qd = _qd.unsqueeze(0)
+                # ── DIAGNOSTIC rank-aware variant (commented 2026-05-29; revive
+                # for TP>1 dumps so ranks don't clobber one file — used to prove
+                # the KV-slice fix: concat per-rank kmin → bit-identical TP=1).
+                # Uncomment these two and swap _tdump → _tdump_rank below:
+                # _tdump_rank = f"{_tdump}.rank{int(self._tp_rank)}"
+                _tp_meta = {"tp_rank": int(self._tp_rank),
+                            "tp_size": int(self._tp_size)}
                 torch.save({
-                    "impl": "vllm", "layer": 0, "P": int(P),
+                    "impl": "vllm", "layer": 0, "P": int(P), **_tp_meta,
                     "kmin": kmin.detach().to(torch.float32).cpu(),
                     "kmax": kmax.detach().to(torch.float32).cpu(),
-                    "q": _qd.to(torch.float32).cpu(),  # [q_len, H_q, D]
-                }, _tdump)
+                    "q": _qd.to(torch.float32).cpu(),  # [q_len, H_q(_local), D]
+                }, _tdump)  # revive TP>1: _tdump → _tdump_rank
                 logger.info("[icms_per_layer_max_kv] tensor dump → %s "
-                            "(P=%d kmin=%s)", _tdump, P, tuple(kmin.shape))
+                            "(rank=%d P=%d kmin=%s q=%s)", _tdump,
+                            int(self._tp_rank), P, tuple(kmin.shape),
+                            tuple(_qd.shape))
             except Exception as _e_td:
                 logger.warning("[icms_per_layer_max_kv] tensor dump failed: %s",
                                _e_td)
@@ -3117,6 +3290,45 @@ class _WorkerScoringMixin:
             q = q.unsqueeze(0)
         if q.ndim != 3:
             return
+        # Question-only-Q: when the bench's chain cache leaves a haystack tail
+        # un-elided, phase-2 re-prefills it, so this prefill quest_query pools
+        # (q_token_pool=max) over up to hundreds of *haystack* tokens and
+        # pollutes page selection — the dominant cause of vLLM<HF on
+        # per_layer_max_kv. Restrict scoring to the last N (question) tokens.
+        #   ICMS_Q_TAIL_FILE=<path>: EXACT per-example mode. The bench writes
+        #     the precise question token count (len(scored)-len(ctx)) to this
+        #     file before each phase-2 generate; read it fresh each call so
+        #     every example trims to exactly its own question (no guesswork,
+        #     no over-trim). Safe under max_num_seqs=1 (requests serialized).
+        #   ICMS_Q_TAIL_TOKENS=N: fixed fallback when no file is set.
+        # Decode (q_len=1) is never sliced. Default off = existing path
+        # byte-identical. The q.shape[0] > N guard means earlier pure-haystack
+        # prefill chunks (q_len <= N) are left alone.
+        _q_tail = 0
+        try:
+            _qfile = os.environ.get("ICMS_Q_TAIL_FILE", "")
+            if _qfile:
+                _q_tail = int((open(_qfile).read().strip() or "0"))
+            else:
+                _q_tail = int(os.environ.get("ICMS_Q_TAIL_TOKENS", "0") or "0")
+        except (ValueError, OSError):
+            _q_tail = 0
+        if _q_tail > 0 and q.shape[0] > _q_tail:
+            q = q[-_q_tail:]
+        # ── DIAGNOSTIC (commented 2026-05-29; revive by uncommenting) ──
+        # One-time Q-TAIL trim probe — used to prove the question-only-Q trim
+        # fires at TP>1 (pre_qlen=32295→post_qlen=38). Confirmed working; muted
+        # to keep production logs clean.
+        # if not getattr(self, "_q_tail_diag_logged", False):
+        #     self._q_tail_diag_logged = True
+        #     logger.info(
+        #         "[icms_per_layer_max_kv] Q-TAIL DIAG: ICMS_Q_TAIL_FILE=%r "
+        #         "_q_tail=%d pre_qlen=%d post_qlen=%d (trim %s)",
+        #         os.environ.get("ICMS_Q_TAIL_FILE", ""), int(_q_tail),
+        #         int(quest_query.shape[0]) if quest_query.ndim >= 1 else -1,
+        #         int(q.shape[0]),
+        #         "FIRED" if (_q_tail > 0 and int(q.shape[0]) <= int(_q_tail))
+        #         else "NO-OP")
         q_dev = q.to(device=device, dtype=torch.float32, non_blocking=True)
 
         # q_norm liveness probe: log per-head RMS spread of the scoring Q at
@@ -3140,6 +3352,7 @@ class _WorkerScoringMixin:
 
         from scripts.utils.per_layer_max_kv_scoring import (
             per_layer_max_kv_topk,
+            per_layer_max_kv_per_head_topk,
         )
         # Two K=16 random-sample seeding modes:
         #   stream   (default): one process-wide torch.Generator advances
@@ -3178,17 +3391,47 @@ class _WorkerScoringMixin:
             # Optional dump capture (cross-impl parity diagnostic).
             _dump_path = os.environ.get("ICMS_PER_LAYER_MAX_KV_DUMP", "")
             cap = {} if _dump_path else None
-            picks_t = per_layer_max_kv_topk(
-                q_dev, kmin, kmax,
-                budget=float(budget),
-                q_token_pool=qtok_pool, q_head_pool=qhd_pool,
-                kv_reduce=kv_reduce,
-                q_token_sample_count=k_sample,
-                q_token_sample_mode=sample_mode,
-                generator=generator,
-                exclude_pages=already_fetched if already_fetched else None,
-                capture=cap,
-            )
+            # TP>1: inject the cross-rank MAX-combine of per-page scores so all
+            # ranks pick identical pages (rank-local heads → global via NCCL
+            # all-reduce). None at TP=1 (byte-identical). Fires symmetrically:
+            # all ranks score the same scored layer in index order.
+            _tp_arm = self._tp_size
+            _tp_fn = ((lambda _t: _tp_allreduce_max_tensor(_t, _tp_arm))
+                      if _tp_arm > 1 else None)
+            if faithful:
+                # FAITHFUL per-KV-head selection: each KV head picks its own
+                # top-B; materialize the UNION (fed to the unchanged fetch),
+                # stash the [H_kv, P] per-head mask for the attention kernel.
+                # No tp_allreduce (per-head selection is not MAX-composable;
+                # TP=1 guarded above).
+                # TODO(faithful): per-head cumulative exclude_per_head to mirror
+                # HF state.selected masking across decode iterations; for the
+                # single-shot prefill scoring already_fetched is empty.
+                union_t, _faithful_sel = per_layer_max_kv_per_head_topk(
+                    q_dev, kmin, kmax,
+                    budget=float(budget),
+                    q_token_pool=qtok_pool, q_head_pool=qhd_pool,
+                    q_token_sample_count=k_sample,
+                    q_token_sample_mode=sample_mode,
+                    generator=generator,
+                    exclude_per_head=None,
+                    capture=cap,
+                )
+                picks_t = union_t
+            else:
+                _faithful_sel = None
+                picks_t = per_layer_max_kv_topk(
+                    q_dev, kmin, kmax,
+                    budget=float(budget),
+                    q_token_pool=qtok_pool, q_head_pool=qhd_pool,
+                    kv_reduce=kv_reduce,
+                    q_token_sample_count=k_sample,
+                    q_token_sample_mode=sample_mode,
+                    generator=generator,
+                    exclude_pages=already_fetched if already_fetched else None,
+                    capture=cap,
+                    tp_allreduce_max_fn=_tp_fn,
+                )
             picked = [int(p) for p in picks_t.tolist()]
             k = picks_t.numel()
             # ── Write JSONL dump line ──────────────────────────────────
@@ -3204,14 +3447,42 @@ class _WorkerScoringMixin:
                     _lk = int(next_layer_idx)
                     _ci = rs._per_layer_max_kv_dump_call_idx.get(_lk, 0)
                     rs._per_layer_max_kv_dump_call_idx[_lk] = _ci + 1
+                    import base64 as _b64
                     q_bytes = q_dev.detach().to(torch.float32).contiguous().cpu().numpy().tobytes()
                     kmin_bytes = kmin.detach().to(torch.float32).contiguous().cpu().numpy().tobytes()
                     kmax_bytes = kmax.detach().to(torch.float32).contiguous().cpu().numpy().tobytes()
                     q_first10 = q_dev.detach().flatten()[:10].to(torch.float32).cpu().tolist()
                     picks_sorted = sorted(picked)
+
+                    def _f16b64(t):
+                        # fp16 little-endian base64 (compact, lossless-enough for
+                        # rank/score profiling). Returns ("", []) on failure.
+                        try:
+                            arr = t.detach().to(torch.float16).contiguous().cpu().numpy()
+                            return (_b64.b64encode(arr.tobytes()).decode("ascii"),
+                                    list(arr.shape))
+                        except Exception:
+                            return ("", [])
+
+                    # Full post-exclusion page-score vector (from scorer capture)
+                    # so the offline profiler can recover the answer-page rank.
+                    _ps = (cap or {}).get("page_scores")
+                    _ps_b64, _ps_shape = _f16b64(_ps) if _ps is not None else ("", [])
+                    # Full q vector [q_len, H_q, D] (decode q_len=1 → tiny).
+                    _q_b64, _q_shape = _f16b64(q_dev)
+                    if not hasattr(self, "_diag_rid_ord"):
+                        self._diag_rid_ord = {}
+                    _rord = self._diag_rid_ord.setdefault(
+                        str(rid), len(self._diag_rid_ord))
                     rec = {
                         "impl": "vllm_connector",
+                        "tp_rank": int(self._tp_rank),
+                        "tp_size": int(self._tp_size),
+                        "req_ord": int(_rord),
                         "rid_short": str(rid)[:8],
+                        "rid": str(rid),
+                        "is_decode": bool(self._prefill_done),
+                        "cum_selected": int(len(already_fetched)) if already_fetched else 0,
                         "layer": _lk,
                         "call_idx": int(_ci),
                         "q_shape": list(q_dev.shape),
@@ -3222,10 +3493,15 @@ class _WorkerScoringMixin:
                         "P": int(P),
                         "B_eff": int(k),
                         "sampled_positions": (cap or {}).get("sampled_positions"),
+                        "picks": picks_sorted,
                         "picks_first50": picks_sorted[:50],
                         "n_picks": len(picks_sorted),
                         "picks_sha": _hl.sha256(
                             _json.dumps(picks_sorted).encode()).hexdigest()[:32],
+                        "page_scores_b64": _ps_b64,
+                        "page_scores_shape": _ps_shape,
+                        "q_b64": _q_b64,
+                        "q_b64_shape": _q_shape,
                         "qtok_pool": qtok_pool, "qhd_pool": qhd_pool,
                         "kv_reduce": kv_reduce,
                         "k_sample": int(k_sample),
@@ -3352,12 +3628,24 @@ class _WorkerScoringMixin:
             return
 
         attn_layer_name = f"model.layers.{next_layer_idx}.self_attn.attn"
+        # Faithful Quest: stash the FULL [H_kv, P] page-id-keyed mask (NOT
+        # union-slot order). The apply path indexes it by the trimmed
+        # block_table's context page order (valid_pids / cumulative_pids), so
+        # the mask stays correct even when the union is filtered/reordered
+        # downstream. Robust against the audit's #1 risk (mask must key to the
+        # post-fetch block-table order).
+        _faithful_hm = None
+        if faithful and _faithful_sel is not None:
+            _faithful_hm = _faithful_sel.contiguous()  # [H_kv, P] bool
         with self._score_lock:
             self._assert_pending_scores_no_clobber(
                 attn_layer_name, rid,
                 source="per_layer_max_kv-score-landing")
             self._pending_scores.setdefault(
                 attn_layer_name, {})[rid] = (synth, req_idx)
+            if _faithful_hm is not None:
+                self._pending_faithful_masks.setdefault(
+                    attn_layer_name, {})[rid] = _faithful_hm
 
         if not self._per_layer_max_kv_ctx_probe_logged:
             try:
@@ -3387,6 +3675,11 @@ class _WorkerScoringMixin:
             with self._score_lock:
                 self._pending_reuse.setdefault(reuse_attn, {})[rid] = (
                     synth, reuse_offsets, req_idx)
+                # Faithful: the scored layer's per-head mask reuses across the
+                # stride window (same union order → same [H_kv, U] mask).
+                if _faithful_hm is not None:
+                    self._pending_faithful_masks.setdefault(
+                        reuse_attn, {})[rid] = _faithful_hm
 
         wall_us = (time.perf_counter() - t0) * 1e6
         rs.fetched_pages.setdefault(next_layer_idx, set()).update(picked)

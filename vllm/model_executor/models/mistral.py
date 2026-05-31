@@ -136,6 +136,15 @@ class MistralAttention(LlamaAttention):
         if self.do_llama_4_scaling:
             attn_scale = self._get_llama_4_attn_scale(positions)
             q = (q * attn_scale).to(q.dtype)
+        # ICMS Quest real-query capture (ICMS_REAL_Q_CAPTURE=1 / stop-world):
+        # MistralAttention overrides LlamaAttention.forward, so the capture must
+        # be wired here too. Capture the FINAL post-RoPE (+ optional Llama-4
+        # scaling) query the model attends with. Gated on a per-module flag set
+        # by register_callbacks; a no-op (attr absent) in default runs. Mirrors
+        # qwen3_moe.py.
+        if getattr(self, "_quest_capture_enabled", False):
+            from vllm.v1.attention.ops.quest_layer_callbacks import capture_q
+            capture_q(self._quest_marker_model, self._quest_layer_idx, q)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output

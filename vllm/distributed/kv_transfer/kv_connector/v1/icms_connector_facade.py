@@ -423,6 +423,7 @@ class IcmsConnector(KVConnectorBase_V1):
     #  Scheduler-side abstract methods
     # ══════════════════════════════════════════════════════════════════════
 
+    @_instr_timing("get_num_new_matched_tokens")
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int,
     ) -> tuple[int | None, bool]:
@@ -431,6 +432,7 @@ class IcmsConnector(KVConnectorBase_V1):
                 request, num_computed_tokens)
         return 0, False
 
+    @_instr_timing("update_state_after_alloc")
     def update_state_after_alloc(
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int,
     ) -> None:

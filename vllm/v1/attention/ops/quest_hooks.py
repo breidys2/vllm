@@ -75,6 +75,16 @@ class QuestHookManager:
         # Q. Set by the callsite from the connector's icms_score_stride.
         # Default 1 = every layer scored (no stride gating).
         self.score_stride = 1
+        # 2026-05-30 fix (workflow wrrwqsdto): explicit set of scored layer
+        # indices for hybrid models whose dense layers do NOT align to the
+        # absolute-index modulo (e.g. gemma-3 dense layers {5,11,17,...,59}
+        # under score_stride=6). When non-None, the stride-modular gates at
+        # ~line 404 and ~line 724 treat any layer IN this set as
+        # stride-aligned regardless of the modulo check, restoring the
+        # save_kv_layer(quest_query=...) path so the connector's adaptive
+        # allocator can register_request. For uniform models the harness
+        # leaves this None (legacy modulo-only behavior preserved).
+        self.scored_layers_set: frozenset[int] | None = None
         # When True, budget >= 1.0 shortcuts to the FetchAll path (kFetchAll
         # on the ICMS server). Set to False for adaptive allocators whose
         # "1.0 on idle" output should still exercise the stride-gated Score
@@ -117,6 +127,17 @@ class QuestHookManager:
             _os_q.environ.get("ICMS_REAL_Q_CAPTURE", "0") == "1")
         # layer_idx -> captured real query [num_tokens, H_q, D]; cleared per step.
         self._captured_q: dict[int, torch.Tensor] = {}
+        # ICMS_STOP_WORLD_SCORE=1: score each scored layer S from its capture
+        # callback (which fires just before S's attention → wait_for_layer(S))
+        # using the GENUINE q_S, instead of scoring S a layer early in
+        # _on_layer_complete with a reconstructed/adjacent query. The
+        # adjacent-layer offset is fatal (HF offset=1 -> 0.0 acc; see
+        # project_quest_q_reconstruction_bug_2026-05-28). Stop-world implies
+        # real-q capture. Default OFF -> connector + hook behavior unchanged.
+        self._stop_world: bool = (
+            _os_q.environ.get("ICMS_STOP_WORLD_SCORE", "0") == "1")
+        if self._stop_world:
+            self._real_q_capture = True
 
     def register_hooks(
         self,
@@ -150,7 +171,7 @@ class QuestHookManager:
             return 0
 
         # Extract weights before registering hooks
-        self._extract_layer_weights(model)
+        self._extract_layer_weights(model, decoder_layer_cls=decoder_layer_cls)
 
         count = 0
         pre_hook_layer0 = 0
@@ -242,7 +263,7 @@ class QuestHookManager:
             return 0
 
         # Cache LayerNorm + Q-proj + rotary weights for every layer.
-        self._extract_layer_weights(model)
+        self._extract_layer_weights(model, decoder_layer_cls=decoder_layer_cls)
 
         # Attach the registry to the module that owns the for-layer loop.
         # The patched forward calls torch.ops.vllm.quest_fire_*_layer with
@@ -250,7 +271,7 @@ class QuestHookManager:
         # custom-op impl looks up the registry from a process-global table
         # using that marker. We attach to the *inner* model (Qwen3MoeModel,
         # LlamaModel, ...) since that's where the for-layer loop lives.
-        target_module = self._find_layers_parent(model)
+        target_module = self._find_layers_parent(model, decoder_layer_cls=decoder_layer_cls)
         if target_module is None:
             target_module = model
         registry = getattr(target_module, "quest_layer_callbacks", None)
@@ -299,18 +320,35 @@ class QuestHookManager:
         return count
 
     @staticmethod
-    def _find_layers_parent(model: nn.Module) -> nn.Module | None:
+    def _find_layers_parent(
+        model: nn.Module,
+        decoder_layer_cls: type | None = None,
+    ) -> nn.Module | None:
         """Locate the inner module whose ``self.layers`` is the decoder
-        ModuleList. Mirrors ``_extract_layer_weights``'s walk."""
+        ModuleList. Mirrors ``_extract_layer_weights``'s walk.
+
+        2026-05-30 fix: for multimodal hosts (e.g. Gemma3ForConditionalGeneration)
+        the named_modules DFS visits self.vision_tower BEFORE self.language_model,
+        so the FIRST ``.layers`` match is the vision encoder's
+        ``vision_tower.vision_model.encoder.layers`` (27 SigLip layers), NOT the
+        62 Gemma3DecoderLayer language layers. When decoder_layer_cls is
+        provided, scan ALL candidates and prefer the one whose first element
+        is an instance of decoder_layer_cls. Falls back to first-match if no
+        class-typed candidate exists (legacy byte-identical for uniform models)."""
+        candidates = []
         for _name, mod in model.named_modules():
             layers = getattr(mod, "layers", None)
             if layers is None:
                 continue
-            # Heuristic: the layers attr should be a ModuleList of
-            # decoder layers, not a single layer or some other module.
-            if isinstance(layers, (nn.ModuleList, nn.Sequential)) and len(layers) > 0:
-                return mod
-        return None
+            if not (isinstance(layers, (nn.ModuleList, nn.Sequential))
+                    and len(layers) > 0):
+                continue
+            candidates.append(mod)
+        if decoder_layer_cls is not None:
+            for mod in candidates:
+                if isinstance(mod.layers[0], decoder_layer_cls):
+                    return mod
+        return candidates[0] if candidates else None
 
     def _registry_pre_callback(self, layer_idx, positions, hidden_states,
                                 residual, model):
@@ -363,6 +401,88 @@ class QuestHookManager:
         except Exception:
             logger.exception("quest capture-q stash failed at layer=%d",
                              layer_idx)
+            return
+        # Stop-world: score THIS layer now with its genuine query. This runs
+        # before self.attn(layer_idx) -> wait_for_layer(layer_idx), so the
+        # connector's pending-score entry is populated in time for the wait to
+        # pop + apply it (no connector changes). Gated; OFF by default.
+        if self._stop_world:
+            self._stop_world_score(int(layer_idx),
+                                   self._captured_q[int(layer_idx)])
+
+    def _stop_world_score(self, target_idx: int, query: "torch.Tensor") -> None:
+        """Fire the Quest Score for the CURRENT scored layer using its genuine
+        captured query (exact-layer q), mirroring _on_layer_complete's dispatch.
+
+        Only the b<1.0 q-based score is fired here; the b>=1.0 all-pages
+        prefetch and non-stride reuse stay in _on_layer_complete /
+        _on_layer0_pre (fired ahead-of-time, no q needed) so they keep their
+        compute/IO overlap and are not double-fired. The connector's
+        save_kv_layer / wait / apply path is unchanged."""
+        if self.kv_connector is None or query is None:
+            return
+        # M4 dense-mode short-circuit (same as _on_layer_complete).
+        if (getattr(self.kv_connector, "is_dense_for_active_request", None)
+                is not None
+                and self.kv_connector.is_dense_for_active_request()):
+            return
+        # Only stride-aligned (scored) layers score here; non-stride layers
+        # reuse the owner's selection via _on_layer_complete's reuse path.
+        # 2026-05-30: scored_layers_set short-circuits the absolute modulo
+        # for hybrid models (e.g. gemma-3) whose dense layers don't align
+        # to score_stride. Uniform models leave scored_layers_set=None.
+        _idx = int(target_idx)
+        is_stride = (
+            (self.scored_layers_set is not None and _idx in self.scored_layers_set)
+            or self.score_stride <= 1
+            or (_idx % self.score_stride) == 0)
+        if not is_stride:
+            return
+        budget = self.budget_computer.compute_budget(
+            approximate_scores=torch.empty(0),
+            layer_idx=target_idx,
+            num_layers=self.num_layers,
+        )
+        # b>=1.0 all-pages is fired ahead-of-time by _on_layer_complete /
+        # _on_layer0_pre — don't double-fire (and it needs no query).
+        if budget >= 1.0 and self.allow_all_pages_shortcut:
+            return
+        layer_name = f"layer_{target_idx}"
+        if self.cpu_scoring:
+            try:
+                self.kv_connector.save_kv_layer(
+                    layer_name=layer_name,
+                    kv_layer=torch.empty(0),
+                    attn_metadata=None,
+                    quest_query=query,
+                    next_layer_idx=target_idx,
+                    budget=budget,
+                    quest_stats=self.stats,
+                )
+            except Exception:
+                logger.exception(
+                    "stop-world cpu-score failed at layer=%d", target_idx)
+        else:
+            selected = self.page_selector.select_pages(
+                query=query,
+                layer_idx=target_idx,
+                budget=budget,
+                stats=self.stats,
+            )
+            self._current_selections[target_idx] = selected
+            try:
+                self.kv_connector.save_kv_layer(
+                    layer_name=layer_name,
+                    kv_layer=torch.empty(0),
+                    attn_metadata=None,
+                    next_layer_idx=target_idx,
+                    budget=budget,
+                    quest_selected_pages=selected,
+                    quest_stats=self.stats,
+                )
+            except Exception:
+                logger.exception(
+                    "stop-world gpu-score failed at layer=%d", target_idx)
 
     def get_selection(self, layer_idx: int) -> torch.Tensor | None:
         """Get the computed page selection for a layer (if available)."""
@@ -375,19 +495,41 @@ class QuestHookManager:
 
     # -- Weight extraction ---------------------------------------------------
 
-    def _extract_layer_weights(self, model: nn.Module) -> None:
+    def _extract_layer_weights(
+        self,
+        model: nn.Module,
+        decoder_layer_cls: type | None = None,
+    ) -> None:
         """Walk the model to extract LayerNorm and Q projection weights.
 
         For each layer i, caches:
         - self._layernorm_weights[i] = (weight, eps)
         - self._q_proj_weights[i] = W_Q  [q_size, hidden_size]
-        """
+
+        2026-05-30 fix: for multimodal hosts (gemma-3), the FIRST ``.layers``
+        match under model.named_modules() is the vision encoder's
+        ModuleList (27 SigLip layers), NOT the language decoder (62 layers).
+        Walking the first match cached vision-tower Q-projection weights
+        (head_dim=72) into _q_proj_weights instead of the language model's
+        Gemma3DecoderLayer Q-projections (head_dim=128), so every
+        language-layer forward hook missed the lookup and save_kv_layer
+        was never dispatched → adaptive bypassed entirely.
+        When decoder_layer_cls is provided, prefer the candidate whose
+        first element is an instance of that class."""
         layers_module = None
+        layer_candidates = []
         for name, mod in model.named_modules():
-            # Find the layers container (e.g., model.model.layers)
             if name.endswith(".layers") or name == "layers":
-                layers_module = mod
-                break
+                layer_candidates.append((name, mod))
+        if decoder_layer_cls is not None:
+            for _name, mod in layer_candidates:
+                if (hasattr(mod, "__len__") and len(mod) > 0
+                        and isinstance(mod[0], decoder_layer_cls)):
+                    layers_module = mod
+                    break
+        if layers_module is None and layer_candidates:
+            # Legacy fallback (uniform models): first match.
+            layers_module = layer_candidates[0][1]
 
         if layers_module is None:
             logger.warning(
@@ -634,8 +776,12 @@ class QuestHookManager:
         # layers reuse the prior stride group's Score result and route
         # through the connector's reuse path without computing Q.
         # Independent of budget — non-stride layers never consult Q.
+        # 2026-05-30: scored_layers_set short-circuits the absolute
+        # modulo for hybrid models — see __init__ note for rationale.
         is_stride_layer = (
-            self.score_stride <= 1
+            (self.scored_layers_set is not None
+             and next_layer_idx in self.scored_layers_set)
+            or self.score_stride <= 1
             or (next_layer_idx % self.score_stride) == 0
         )
         if not is_stride_layer:
@@ -672,6 +818,15 @@ class QuestHookManager:
                     )
                 except Exception:
                     pass
+            return
+
+        # Stop-world: do NOT score this stride layer a step early with a
+        # reconstructed/adjacent query. Its genuine q_{next_layer_idx} is
+        # captured at next_layer_idx's own forward and scored from the capture
+        # callback (_stop_world_score) just before its attention. We've already
+        # let the b>=1.0 all-pages prefetch + non-stride reuse fire above, so
+        # only the b<1.0 q-based score is skipped here.
+        if self._stop_world:
             return
 
         # Compute exact Q for the next layer (timed for stats).
@@ -813,6 +968,14 @@ class QuestHookManager:
                     )
                 except Exception:
                     pass
+            return
+
+        # Stop-world: layer 0's genuine q_0 is captured at layer 0's own
+        # forward and scored from the capture callback (_stop_world_score) just
+        # before layer 0's attention — this finally retires the broken layer-0
+        # _compute_exact_q reconstruction. (b>=1.0 all-pages already fired
+        # above.) Skip the ahead-of-time reconstruction score here.
+        if self._stop_world:
             return
 
         # Layer 0 is always a stride-aligned layer under the

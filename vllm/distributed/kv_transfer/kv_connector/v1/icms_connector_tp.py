@@ -308,6 +308,38 @@ def _tp_allreduce_max_int(value: int, tp_size: int) -> int:
         return int(value)
 
 
+def _tp_allreduce_max_tensor(t: "torch.Tensor", tp_size: int) -> "torch.Tensor":
+    """All-reduce-MAX of a 1-D GPU score vector across TP ranks.
+
+    per_layer_max_kv TP=2 support (2026-05-29, accuracy-path; hacky but
+    correct): at TP>1 each rank computes per-page scores over its RANK-LOCAL
+    KV heads only. kv_reduce=MAX means "page is strong in ANY KV head", so the
+    globally-correct page score is the MAX across ALL ranks' heads. This
+    MAX-combines the per-rank `[P]` score vectors so every rank then runs the
+    SAME top-k → identical picks (no cross-rank divergence). The `[P]` shape is
+    rank-symmetric (all ranks see the same haystack → same page count), so the
+    collective never mismatches. Must fire symmetrically (it does: all ranks
+    score the same scored layers in index order). NOT perf-optimized — one
+    extra NCCL all-reduce per scored layer; fine for accuracy runs, fold into
+    the perf path later. TP=1 → unchanged. On failure → local tensor (picks
+    then diverge per rank; the warning makes it visible)."""
+    if tp_size <= 1:
+        return t
+    import torch.distributed as dist  # noqa: E402
+    from vllm.distributed.parallel_state import get_tp_group
+    try:
+        tp_group = get_tp_group()
+        dev_group = _get_icms_nccl_group() or tp_group.device_group
+        tc = (t if t.is_cuda else t.cuda()).contiguous().float()
+        dist.all_reduce(tc, op=dist.ReduceOp.MAX, group=dev_group)
+        return tc
+    except Exception as e:
+        logger.warning(
+            "[icms-tp] _tp_allreduce_max_tensor failed: %r — per_layer_max_kv "
+            "picks will diverge across ranks (incoherent attention)", e)
+        return t
+
+
 def _tp_allreduce_min_int(value: int, tp_size: int) -> int:
     """All-reduce-MIN of an int64 across TP ranks.
 

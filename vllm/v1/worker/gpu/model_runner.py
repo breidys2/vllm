@@ -427,6 +427,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hook_manager.score_stride = max(
                 1, int(extra.get("icms_score_stride", 1))
             )
+            # 2026-05-30 fix (workflow wrrwqsdto): when ICMS_SCORED_LAYERS
+            # is set, parse it into a frozenset and hand to the hook so the
+            # absolute-modulo stride gates at quest_hooks.py:404 and 724
+            # treat every layer in the set as stride-aligned. Required for
+            # hybrid models like gemma-3 whose dense layer indices
+            # {5,11,17,...,59} don't align to score_stride=6. For uniform
+            # models the env isn't set and the hook keeps legacy behavior.
+            import os as _os_scored
+            _scored_env = _os_scored.environ.get("ICMS_SCORED_LAYERS", "")
+            if _scored_env:
+                try:
+                    hook_manager.scored_layers_set = frozenset(
+                        int(x) for x in _scored_env.split(",") if x.strip())
+                except ValueError:
+                    pass
 
             # Prefer the registry path (PIECEWISE-CUDAGraph compatible).
             # ICMS_LEGACY_FORWARD_HOOKS=1 forces the old register_forward_hook

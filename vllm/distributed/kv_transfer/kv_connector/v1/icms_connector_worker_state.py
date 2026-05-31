@@ -580,6 +580,13 @@ class _WorkerStateMixin:
             inner.pop(request_id, None)
         for inner in self._pending_scores.values():
             inner.pop(request_id, None)
+        # Faithful Quest per-head masks (dormant unless faithful_quest).
+        _pfm = getattr(self, "_pending_faithful_masks", None)
+        if _pfm:
+            for inner in _pfm.values():
+                inner.pop(request_id, None)
+            self._pending_faithful_masks = {
+                k: v for k, v in _pfm.items() if v}
         self._pending_reuse  = {k: v for k, v in self._pending_reuse.items()  if v}
         self._pending_scores = {k: v for k, v in self._pending_scores.items() if v}
         # Step 2 per-rid Condition (2026-05-09 → 2026-05-10 audit #5):

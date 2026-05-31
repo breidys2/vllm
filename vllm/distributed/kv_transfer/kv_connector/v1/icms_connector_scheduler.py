@@ -463,7 +463,40 @@ class _Scheduler:
         # the queue, re-lookup. If still missed, Condition.wait until
         # the generation advances (or timeout). Loop with bounded
         # retries × small timeout — worst case ~600ms per warm rid.
-        if matched_groups == 0 and len(chain) >= 4:
+        # 2026-05-29 TP>1 prefix-cache bypass: at TP>1 with
+        # VLLM_WORKER_MULTIPROC_METHOD=spawn the worker and scheduler run
+        # in SEPARATE processes; _stored_chain_queue / _stored_chain_cond /
+        # _stored_chain_generation live in icms_connector_trace as Python
+        # module globals which do NOT cross process boundaries. The
+        # wait_for predicate `_stored_chain_generation > gen_at_wait` can
+        # therefore never fire at TP>1, so this loop always full-timeouts
+        # at 3 x ICMS_STORED_CHAIN_WAIT_MS = 600ms per warm-prefix lookup.
+        # When vllm_prefix_cache_enabled=True, vLLM's own
+        # find_longest_cache_hit (called BEFORE the connector at
+        # vllm/v1/core/sched/scheduler.py:601-613) already covers any
+        # reusable haystack from prior iters within the same run, so
+        # returning matched_groups=0 here is benign — vLLM elides the
+        # haystack on its own. The single-rid TP=1 warm-prefix path also
+        # doesn't need this wait (the eager _lookup_stored_prefix above
+        # already resolves on iter 2+ because on_finished_record_stored
+        # ran synchronously between iters). The only regime where this
+        # wait is genuinely needed is the 2026-05-09 v2 race: TP=1 +
+        # max_num_seqs>=2 batched per-batch/per-budget + BLOCK_WRITES=1 +
+        # prefix_caching=False; that path keeps _vllm_prefix_cache_enabled
+        # =False and so still runs the wait below.
+        #
+        # Defense-in-depth: getattr default is False (preserve legacy wait
+        # when attribute is missing). _Scheduler.__init__ unconditionally
+        # sets the attr at line 51-52, so the default is dead code today;
+        # but if a future refactor drops that init, defaulting to False
+        # silently keeps the v2 race protection rather than skipping it.
+        # ICMS_STORED_CHAIN_WAIT_SKIP_DISABLE=1 restores the original wait
+        # for diagnostics or if a future regression emerges.
+        _skip_stored_chain_wait = (
+            bool(getattr(self, "_vllm_prefix_cache_enabled", False))
+            and os.environ.get(
+                "ICMS_STORED_CHAIN_WAIT_SKIP_DISABLE", "0") != "1")
+        if matched_groups == 0 and len(chain) >= 4 and not _skip_stored_chain_wait:
             try:
                 _wait_count = int(
                     os.environ.get("ICMS_STORED_CHAIN_WAIT_COUNT", "3"))
@@ -492,6 +525,22 @@ class _Scheduler:
                     _trace._stored_chain_cond.wait_for(
                         lambda: _trace._stored_chain_generation > gen_at_wait,
                         timeout=_wait_timeout_s)
+        elif matched_groups == 0 and len(chain) >= 4 and _skip_stored_chain_wait:
+            # When skipping the cross-process wait, opportunistically drain
+            # any queued chains that landed BETWEEN the line-403 drain and
+            # this point (TP=1 worker-thread same-process race) and
+            # re-lookup once. Zero added latency vs. the wait path.
+            for c, n in _drain_stored_chain_queue():
+                self.record_stored_chain(c, n)
+            matched_groups = self._lookup_stored_prefix(chain)
+            if not getattr(self, "_stored_chain_wait_skip_logged", False):
+                logger.info(
+                    "[icms-stored-chain-wait-skip] active: vLLM prefix "
+                    "cache is ON; skipping cross-iter stored-chain "
+                    "wait_for (dead code at TP>1 spawn; same-process drain "
+                    "preserved). Set ICMS_STORED_CHAIN_WAIT_SKIP_DISABLE=1 "
+                    "to restore the original wait.")
+                self._stored_chain_wait_skip_logged = True
         logger.debug(
             "prefix_lookup: rid=%s chain_len=%d stored=%d matched=%d",
             rid, len(chain), len(self._stored_chains), matched_groups,

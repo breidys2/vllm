@@ -514,6 +514,7 @@ class TritonAttentionImpl(AttentionImpl):
         _sw_fix = _icms_os.environ.get("ICMS_SW_LAYER_FIX") == "1"
         from vllm.v1.attention import icms_fetch_state as _icms_mod
         _icms_state = _icms_mod.get_active()
+        _icms_head_mask = None  # faithful_quest per-KV-head mask (None = dense)
         if _icms_state is not None and _sw_fix and self.sliding_window is not None:
             # SW layer + fix-enabled: skip the ICMS override, use natural
             # block_table. Note `self.sliding_window` here is a tuple
@@ -560,6 +561,9 @@ class TritonAttentionImpl(AttentionImpl):
             # practice, but recompute defensively in case ICMS ever changes
             # the per-block layout for TP shards.
             descale_shape = (cu_seqlens_q.shape[0] - 1, key_cache.shape[2])
+            # ICMS faithful Quest: per-KV-head selection mask aligned to the
+            # trimmed block_table (None on non-faithful paths → dense over union).
+            _icms_head_mask = getattr(_icms_state, "head_mask", None)
 
         unified_attention(
             q=query[:num_actual_tokens],
@@ -588,6 +592,7 @@ class TritonAttentionImpl(AttentionImpl):
             sinks=self.sinks,
             output_scale=output_scale,
             mm_prefix_range=mm_prefix_range_tensor,
+            icms_head_mask=_icms_head_mask,
         )
 
         return output

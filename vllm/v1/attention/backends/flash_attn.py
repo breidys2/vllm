@@ -717,6 +717,18 @@ class FlashAttentionImpl(AttentionImpl):
             scheduler_metadata = attn_metadata.scheduler_metadata
 
             if _icms_state is not None:
+                # Faithful Quest requires per-KV-head masking, which only the
+                # Triton backend implements. If a head_mask reached FlashAttn,
+                # the mask would be silently ignored → the run would be
+                # dense-over-union, NOT faithful. Fail loud: faithful_quest must
+                # set VLLM_ATTENTION_BACKEND=TRITON_ATTN.
+                if getattr(_icms_state, "head_mask", None) is not None:
+                    raise RuntimeError(
+                        "[faithful_quest] FlashAttention cannot apply the "
+                        "per-KV-head selection mask; run with "
+                        "VLLM_ATTENTION_BACKEND=TRITON_ATTN (the Triton kernel "
+                        "implements the mask). Refusing to silently run "
+                        "dense-over-union.")
                 key_cache = _icms_state.key_cache
                 value_cache = _icms_state.value_cache
                 block_table = _icms_state.block_table

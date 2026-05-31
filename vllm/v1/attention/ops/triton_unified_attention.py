@@ -105,6 +105,17 @@ def kernel_unified_attention_2d(
     num_seqs: tl.int32,
     BLOCK_M: tl.constexpr,  # int
     USE_FP8: tl.constexpr,  # bool
+    # ── ICMS faithful Quest per-KV-head selection mask ─────────────────────
+    # When USE_ICMS_HEAD_MASK, each KV head attends ONLY to the union blocks it
+    # selected (per_kv_head exclusivity, matching quest_faithful_hf). The mask
+    # is [num_seqs, num_kv_heads, max_num_blocks] (1=attend, 0=skip); the apply
+    # path pre-marks continuation blocks as 1 so the local window stays visible
+    # to every head. Defaults make this a no-op for every non-faithful caller.
+    icms_head_mask_ptr=None,
+    icms_hm_stride_0: tl.int64 = 0,
+    icms_hm_stride_1: tl.int64 = 0,
+    icms_hm_stride_2: tl.int64 = 0,
+    USE_ICMS_HEAD_MASK: tl.constexpr = False,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -314,6 +325,22 @@ def kernel_unified_attention_2d(
                     & is_valid
                 )
                 seq_mask |= q_in_range & k_in_range
+
+        # ICMS faithful Quest: restrict THIS kv head to the union blocks it
+        # selected (+ continuation blocks, pre-marked 1 in the mask). The block
+        # index into the trimmed block_table is seq_offset // BLOCK_SIZE (one
+        # page per block). No-op unless USE_ICMS_HEAD_MASK.
+        if USE_ICMS_HEAD_MASK:
+            icms_blk = seq_offset // BLOCK_SIZE  # [TILE_SIZE]
+            icms_hm = tl.load(
+                icms_head_mask_ptr
+                + seq_idx * icms_hm_stride_0
+                + kv_head_idx * icms_hm_stride_1
+                + icms_blk * icms_hm_stride_2,
+                mask=tile_mask,
+                other=0,
+            )
+            seq_mask = seq_mask & (icms_hm[None, :] > 0)
 
         # S : (BLOCK_M, TILE_SIZE)
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
@@ -911,6 +938,10 @@ def unified_attention(
     # Optional tensor for prefix lengths (PrefixLM support)
     mm_prefix_range=None,
     use_alibi_sqrt=False,
+    # ICMS faithful Quest per-KV-head selection mask
+    # [num_seqs, num_kv_heads, max_num_blocks] (int8/int1, 1=attend). Only the
+    # 2D kernel path (which ICMS forces) consumes it; None elsewhere.
+    icms_head_mask=None,
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
@@ -1040,6 +1071,15 @@ def unified_attention(
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             USE_FP8=output_scale is not None,
+            # ICMS faithful Quest per-KV-head mask (None → no-op constexpr).
+            icms_head_mask_ptr=icms_head_mask,
+            icms_hm_stride_0=(icms_head_mask.stride(0)
+                              if icms_head_mask is not None else 0),
+            icms_hm_stride_1=(icms_head_mask.stride(1)
+                              if icms_head_mask is not None else 0),
+            icms_hm_stride_2=(icms_head_mask.stride(2)
+                              if icms_head_mask is not None else 0),
+            USE_ICMS_HEAD_MASK=icms_head_mask is not None,
         )
     else:
         kernel_unified_attention_3d[

@@ -31,6 +31,13 @@ class IcmsFetchState:
     block_table: torch.Tensor
     seq_lens: torch.Tensor
     max_seq_len: int
+    # ── Faithful Quest (ICMS_SCORING_MODE=faithful_quest) ──────────────────
+    # Per-KV-head selection mask over the union block_table columns. When set,
+    # the attention backend (Triton) restricts each KV head to ONLY the union
+    # slots that head actually selected — reproducing HF per_kv_head's per-head
+    # exclusivity. Shape [N, H_kv, max_k] bool (True = attend); None for every
+    # non-faithful path → existing dense-over-union attention is byte-identical.
+    head_mask: Optional[torch.Tensor] = None
 
 
 _active: Optional[IcmsFetchState] = None

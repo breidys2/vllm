@@ -128,6 +128,13 @@ class _WorkerBase:
         # stride=1 → per-layer scoring, stride=6 → strided, stride=48 → single
         self._score_stride = max(1, score_stride)
 
+        # Stash the raw __init__ param for the [INSTR-MODEL] startup dump
+        # (which fires after geom resolution in _connect()). The adaptive
+        # allocator divides this by tp_size at line 660-662, so we keep the
+        # raw full-link value here for visibility into the original wire
+        # budget regardless of whether adaptive is on.
+        self._link_bandwidth_bps: float = float(link_bandwidth_bps)
+
         # Adaptive bandwidth allocator (optional).
         self._adaptive_allocator = None
         if adaptive_bandwidth:
@@ -308,6 +315,12 @@ class _WorkerBase:
         # Key: layer_name → dict[request_id → (reply, req_idx_in_batch)]
         self._pending_scores: dict[str, dict[str, tuple]] = {}
         self._pending_reuse: dict[str, dict[str, tuple]] = {}
+        # Faithful Quest (ICMS_SCORING_MODE=faithful_quest): per-KV-head
+        # selection mask, union-slot-ordered, stashed alongside _pending_scores
+        # so the apply path can attach it to IcmsFetchState.head_mask.
+        # Key: layer_name → dict[request_id → head_mask_pk (Tensor [H_kv, U])].
+        # Empty/unused on every non-faithful path.
+        self._pending_faithful_masks: dict[str, dict[str, "torch.Tensor"]] = {}
         self._score_lock = threading.Lock()
         # 2026-05-08 race-audit X1 wrap-or-nullcontext gate.
         #
@@ -606,6 +619,33 @@ class _WorkerBase:
             logger.info("[icms] dense_layers mask=0x%x popcount=%d "
                          "(contiguous-reuse enabled)",
                          _dense_mask, bin(_dense_mask).count("1"))
+        # 2026-05-29 ICMS_SW_LAYERS: bitmask of SW (sliding-window)
+        # layers. The connector skips K/V serialization for them in
+        # WriteGroup; server must mirror via --sw-layers. Required for
+        # gemma-3 hybrid (52 SW layers) where the previous null-block
+        # K/V garbage inflated WriteGroup frames to 263 MB > 128 MiB
+        # wire cap. For uniform models (qwen3, mistral), leave unset
+        # (mask=0 → byte-identical legacy behavior).
+        _sw_spec = os.environ.get("ICMS_SW_LAYERS", "")
+        _sw_mask = parse_scored_layers(_sw_spec)
+        if _sw_mask != 0 and self._geom.num_layers < 64:
+            _sw_mask &= ((1 << self._geom.num_layers) - 1)
+        if _sw_mask != 0:
+            # SW and scored masks must be disjoint (a layer can't be
+            # both scored and SW).
+            _bad_sw = _sw_mask & self._geom.scored_layers_mask
+            if _bad_sw:
+                raise ValueError(
+                    f"ICMS_SW_LAYERS bitmask 0x{_sw_mask:x} overlaps "
+                    f"ICMS_SCORED_LAYERS (conflict bits 0x{_bad_sw:x}). "
+                    f"A layer cannot be both scored and SW.")
+            self._geom = _dataclasses.replace(self._geom,
+                                               sw_layers_mask=_sw_mask)
+            logger.info(
+                "[icms] sw_layers mask=0x%x popcount=%d "
+                "(K/V write-skip enabled; %d K/V layers in WriteGroup)",
+                _sw_mask, bin(_sw_mask).count("1"),
+                self._geom.num_kv_layers)
         # KV on-disk layout from env. Must match server --kv-layout.
         _kv_layout_str = os.environ.get("ICMS_KV_LAYOUT", "layer-major").lower()
         if _kv_layout_str in ("page-major", "page_major", "page"):
@@ -670,6 +710,49 @@ class _WorkerBase:
                         self._geom.num_scored_layers,
                         self._geom.num_layers)
 
+        # [INSTR-MODEL] one-shot dump of finalized geometry + link bw so
+        # the smoke can ground the transfer-overhead math on actual values
+        # (instead of assumed num_layers / num_kv_heads / link_bw).
+        if os.environ.get("ICMS_INSTR", "0") == "1":
+            _per_rank_page_bytes = (
+                int(self._geom.kv_page_bytes)
+                // max(1, int(self._tp_size)))
+            logger.info(
+                "[INSTR-MODEL] name=%s num_layers=%d num_scored_layers=%d "
+                "num_kv_heads=%d head_dim=%d elem_bytes=%d "
+                "kv_page_bytes=%d kv_page_bytes_per_rank=%d tp_size=%d "
+                "link_bandwidth_bps=%.3e link_GBps=%.3f",
+                self._geom.name, int(self._geom.num_layers),
+                int(self._geom.num_scored_layers),
+                int(self._geom.num_kv_heads), int(self._geom.head_dim),
+                int(self._geom.elem_bytes),
+                int(self._geom.kv_page_bytes), _per_rank_page_bytes,
+                int(self._tp_size), float(self._link_bandwidth_bps),
+                float(self._link_bandwidth_bps) / 1e9)
+
+        # 2026-05-29 ICMS_MAX_PAGES sink-clamp: self._k is set from
+        # max_model_len / PAGE_TOKENS at __init__ to ensure the sink can
+        # hold a worst-case full-ctx fetch. For shorter ctx cells (e.g.
+        # mistral-small ctx=65k with max_model_len=131k) this over-
+        # provisions the sink by ~2× and pushes the B-full-fetch sink to
+        # 20 GB/rank — OOM at gpu_memory_utilization=0.80. ICMS_MAX_PAGES
+        # lets the operator cap self._k to the actual pages exercised in
+        # this run; per_layer_bytes shrinks proportionally. Unset = no-op
+        # (preserves byte-identical behavior). Set per-cell by
+        # run_full_ttft_sweep.sh as `ctx_max // PAGE_TOKENS + slack`.
+        try:
+            _max_pages_env = int(
+                os.environ.get("ICMS_MAX_PAGES", "0") or 0)
+        except ValueError:
+            _max_pages_env = 0
+        if _max_pages_env > 0 and _max_pages_env < self._k:
+            logger.info(
+                "[icms-max-pages] clamping self._k %d -> %d (sink "
+                "per_layer_bytes drops %.1fx; check the sweep harness "
+                "if you didn't expect this)",
+                self._k, _max_pages_env, self._k / _max_pages_env)
+            self._k = _max_pages_env
+
         # 2026-05-08 server-audit P0 startup asserts (D3, E4):
         #
         # D3: TP fan-out per-rank slicing in worker_pool.cc:107 requires
@@ -730,10 +813,54 @@ class _WorkerBase:
         # non-scored reuse layers) reads from slot abs_layer — so the
         # sink MUST be sized for num_layers. Sizing for num_scored_layers
         # would silently truncate reuse reads on layers > scored_rank.
-        _eff_layers = (int(self._geom.num_scored_layers)
-                       if (self._geom.scored_layers_mask != 0
-                           and self._geom.dense_layers_mask == 0)
-                       else int(self._geom.num_layers))
+        # 2026-05-29 ICMS_FULL_FETCH=1 (B-full-fetch path): force the
+        # sink to hold num_layers (not num_scored_layers) so the server's
+        # lifted Phase-2 RDMA write loop (worker_pool.cc:1417-1429 +
+        # 1797-1834 with !fetch_all_layers gate) has room for all 48
+        # layers' KV. Guards:
+        #   - reject hybrid SWA models (dense_layers_mask != 0):
+        #     gemma-3 SW layers have undefined apply semantics under
+        #     full-fetch.
+        #   - clamp _sink_slots to 1: at 6× more layers, _sink_slots>1
+        #     would 6× the GPU memory pressure (>60 GB/rank, infeasible).
+        #     Also disables multi-rid (ICMS_ALLOW_BATCH) safely.
+        _full_fetch_mode = (
+            os.environ.get("ICMS_FULL_FETCH", "0") == "1")
+        if _full_fetch_mode:
+            if self._geom.dense_layers_mask != 0:
+                raise RuntimeError(
+                    "ICMS_FULL_FETCH=1 is incompatible with hybrid "
+                    "models (dense_layers_mask != 0). gemma-3 SW layer "
+                    "apply path is undefined under full-fetch. "
+                    "Use ICMS_FULL_FETCH=0 for hybrid models.")
+            if self._is_multi_rid_mode():
+                raise RuntimeError(
+                    "ICMS_FULL_FETCH=1 requires single-rid mode "
+                    "(max_num_seqs=1 AND ICMS_ALLOW_BATCH unset). "
+                    "Multi-rid at 6× sink size would OOM the GPU.")
+            # 2026-05-30: use num_kv_layers, NOT num_layers. For uniform
+            # models (sw_mask=0) num_kv_layers == num_layers so this is
+            # byte-identical. For SW models like gemma-3 (sw_mask!=0),
+            # num_kv_layers=10 instead of 62 → sink shrinks from 62 GB
+            # to 10 GB per rank. The original 2026-05-29 SW-skip refactor
+            # missed this site, causing 62 GB sink + 25 GB model + 32 GB
+            # vLLM KV = 119 GB > 93 GB cap → OOM at first kv_cache alloc.
+            _eff_layers = int(self._geom.num_kv_layers)
+            if self._sink_slots != 1:
+                logger.warning(
+                    "[icms-full-fetch] clamping _sink_slots %d -> 1 "
+                    "to fit %d-layer sink in GPU memory",
+                    self._sink_slots, _eff_layers)
+                self._sink_slots = 1
+            logger.info(
+                "[icms-full-fetch] ACTIVE: sink sized for num_layers=%d "
+                "(was num_scored=%d); _sink_slots=1",
+                _eff_layers, int(self._geom.num_scored_layers))
+        else:
+            _eff_layers = (int(self._geom.num_scored_layers)
+                           if (self._geom.scored_layers_mask != 0
+                               and self._geom.dense_layers_mask == 0)
+                           else int(self._geom.num_layers))
         sink_layers = max(self._score_stride, _eff_layers)
         # B1: scale the sink to hold `_sink_slots` concurrent dumps.
         # Default _sink_slots=1 preserves legacy behavior; under
@@ -741,6 +868,12 @@ class _WorkerBase:
         # offset allocator has room for N parallel Score / FetchAll
         # writes without colliding.
         total_sink = sink_layers * per_layer_bytes * self._sink_slots
+        if _full_fetch_mode:
+            logger.info(
+                "[icms-full-fetch] sink total: %.2f GB per rank "
+                "(num_layers=%d * per_layer_bytes=%d * slots=%d)",
+                total_sink / (1 << 30), sink_layers, per_layer_bytes,
+                self._sink_slots)
         # Allocate a per-layer ready-flag sink (one u32 per model layer)
         # alongside the main KV sink. The server flips slots via small
         # RDMA writes and the connector polls them to overlap compute

@@ -598,6 +598,19 @@ class _WorkerWritePipelineMixin:
                             self._tp_rank, layer_name)
             return
 
+        # 2026-05-29 SW-skip: short-circuit BEFORE the GPU→CPU memcpy.
+        # SW layers carry no K/V in the trie; the previous code path
+        # uselessly transferred + serialized null-block garbage for
+        # gemma-3's 52 SW layers, inflating the WriteGroup frame to
+        # 263 MB > 128 MiB wire cap. For uniform models (sw_mask==0)
+        # is_sw is always False → byte-identical legacy behavior.
+        if self._geom.is_sw(layer_idx):
+            if _diag_n13:
+                logger.info(
+                    "[diag-extract] rank=%d layer=%s SKIP=sw_layer",
+                    self._tp_rank, layer_name)
+            return
+
         # KV cache layout: standard FA backend uses
         #   [2 (K+V), num_blocks, block_size, num_kv_heads, head_dim]
         # but TRITON_ATTN backend (used for gemma-3 sliding-window-attention
@@ -1198,17 +1211,40 @@ class _WorkerWritePipelineMixin:
         buf = rs.active_group_buffers.get(group_idx)
         if buf is None:
             # Summary region is packed by scored_rank; size accordingly.
+            # 2026-05-29 SW-skip: kv_blob region is packed by num_kv_layers
+            # (= num_layers - num_sw_layers). For uniform models with
+            # sw_layers_mask==0, num_kv_layers == num_layers ⇒
+            # byte-identical to legacy.
             buf = _GroupBuffer(
                 summary_blob=bytearray(
                     geom.num_scored_layers * geom.summary_group_bytes),
-                kv_blob=bytearray(geom.num_layers * geom.kv_group_bytes),
+                kv_blob=bytearray(
+                    geom.num_kv_layers * geom.kv_group_bytes),
                 filled=set(),
-                num_layers=geom.num_layers,
+                # 2026-05-30 (re-RCA wj3qp74qx): use num_kv_layers, NOT
+                # num_layers. SW layers short-circuit before filled.add()
+                # below, so len(filled) maxes at num_kv_layers * 32 (=320
+                # for gemma-3). With num_layers=62 here, is_complete()
+                # required 1984 and was structurally False forever →
+                # pipeline never auto-flushed → 128 groups serialized
+                # through on_request_finished's forward-thread drain
+                # (15s drain_rid) AND every flush is_partial=True →
+                # trie undercount → no inter-iter elision → re-extract
+                # full prefix every iter → 22s TTFT. For uniform models
+                # (sw_mask=0) num_kv_layers == num_layers ⇒ byte-identical.
+                num_layers=geom.num_kv_layers,
                 pages_in_group=_GROUP_BLOCKS,
             )
             rs.active_group_buffers[group_idx] = buf
 
-        # KV: K || V byte concatenation (C4). Always stored (every layer).
+        # 2026-05-29 SW-skip: SW layers carry no K/V in the trie; skip
+        # serialization. Server's per_group_bytes excludes SW layers
+        # (mirror via --sw-layers). For uniform models (sw_mask==0)
+        # this branch is never taken.
+        if geom.is_sw(layer_idx):
+            return
+
+        # KV: K || V byte concatenation (C4). Stored for every non-SW layer.
         # Bug 11 family fix (2026-04-30): preserve full model precision by
         # serializing raw model_dtype bytes (no fp16 down-cast). The
         # legacy `.to(torch.float16)` was a bf16↔fp16 round-trip for bf16
@@ -1289,10 +1325,15 @@ class _WorkerWritePipelineMixin:
         # Must mirror the server's kv_offset() — both sides agree via
         # the kv_layout config. Offsets here are relative to the start
         # of the KV region (buf.kv_blob does not include summaries).
+        # 2026-05-29 SW-skip: use kv_layer_rank (== layer when sw_mask==0)
+        # so the KV region is packed by physical write rank, excluding
+        # SW layers. Server-side per_group_bytes mirror must use the
+        # same num_kv_layers count.
+        _kv_rank = geom.kv_layer_rank(layer_idx)
         if geom.kv_layout == KvLayout.LAYER_MAJOR:
-            k_off = layer_idx * geom.kv_group_bytes + page_in_group * kpb
+            k_off = _kv_rank * geom.kv_group_bytes + page_in_group * kpb
         else:  # PAGE_MAJOR
-            k_off = page_in_group * geom.num_layers * kpb + layer_idx * kpb
+            k_off = page_in_group * geom.num_kv_layers * kpb + _kv_rank * kpb
         buf.kv_blob[k_off:k_off + len(kv_bytes)] = kv_bytes
 
         # Summary: only compute + store for scored layers. Non-scored layers
