@@ -106,6 +106,104 @@ class IcmsConnector(KVConnectorBase_V1):
         # over all N pages. Mutually exclusive with fetch_all_post_score.
         self._sparse_prefill_dense_decode: bool = bool(
             extra.get("sparse_prefill_dense_decode", False))
+        # ICMS_SPARSE_PREFILL_DENSE_DECODE env-late path: some bench
+        # scripts set this via env without going through extra_config.
+        # Mutex matrix below must see it from EITHER source so the
+        # eviction-mode check cannot be bypassed by env-late writes
+        # (Reviewer 3 BLOCKER from PR1 review of the eviction refactor).
+        if os.environ.get("ICMS_SPARSE_PREFILL_DENSE_DECODE", "0") == "1":
+            self._sparse_prefill_dense_decode = True
+
+        # ──────────────────────────────────────────────────────────────
+        # ICMS_WRITE_MODE gate (PR1 of the eviction-mode refactor)
+        # ──────────────────────────────────────────────────────────────
+        # Selects between the legacy prefill-driven write path (default;
+        # writes fire from save_kv_layer during PREFILL) and the new
+        # eviction-driven write path (writes fire from
+        # block_pool.free_blocks via on_kv_blocks_evicted).
+        #
+        # Reads from extra_config first (matches fetch_all_post_score
+        # convention so spawn workers see it deterministically) then
+        # falls back to the env. INIT-TIME ONLY: changing the mode via
+        # env between iterations of the same LLM process has no effect.
+        # The bench harness enforces server restart on --write-mode
+        # change (per Reviewer 3 BLOCKER on init-time-only rollback).
+        #
+        # For PR1 BOTH modes resolve to the existing prefill behavior —
+        # the eviction-mode branches are stubs landed in PR2-PR10. This
+        # PR is a behavior-preserving scaffold; the only externally
+        # observable changes are (a) startup-time validation of the
+        # mutex matrix and (b) supports_eviction_writes returning True
+        # when write_mode=eviction so PR2's scheduler-side callback
+        # registration is correctly gated.
+        _write_mode_extra = extra.get("icms_write_mode")
+        _write_mode_env = os.environ.get("ICMS_WRITE_MODE")
+        self._write_mode: str = str(
+            _write_mode_extra or _write_mode_env or "prefill").lower()
+        if self._write_mode not in ("prefill", "eviction"):
+            raise ValueError(
+                f"ICMS_WRITE_MODE={self._write_mode!r} invalid; expected "
+                f"'prefill' (default) or 'eviction'.")
+
+        # Mutex matrix: combinations that are incoherent under
+        # eviction-mode. Validated at init-time so the failure surface
+        # is a clear ValueError, not a deferred runtime exception.
+        # FULL_FETCH semantics under eviction are INVERTED per Reviewer 2:
+        # the eviction-mode chain is full-KV by construction, so
+        # FULL_FETCH=1 is REQUIRED (auto-set if unset; raise if
+        # explicitly 0).
+        if self._write_mode == "eviction":
+            # (a) SPDD is incoherent with eviction-driven writes — SPDD
+            # discards prefill's K-page picks at the prefill→decode
+            # boundary, but eviction-mode has no per-layer Score reply
+            # at write-time to discard.
+            if self._sparse_prefill_dense_decode:
+                raise ValueError(
+                    "ICMS_WRITE_MODE=eviction is mutually exclusive "
+                    "with sparse_prefill_dense_decode=True. SPDD's "
+                    "write-time K-page semantics have no analog under "
+                    "eviction-driven writes.")
+            # (b) FAPS likewise discards Score at write-time.
+            if self._fetch_all_post_score:
+                raise ValueError(
+                    "ICMS_WRITE_MODE=eviction is mutually exclusive "
+                    "with fetch_all_post_score=True (FAPS).")
+            # (c) TRUST_PROMPT_LEN_N_GROUPS is a deterministic prompt-
+            # length bridge that assumes prefill-time chain creation.
+            # Under eviction-mode the chain is created LAZILY at
+            # eviction time, so the "prompt length == full chain"
+            # assumption no longer holds.
+            if os.environ.get("ICMS_TRUST_PROMPT_LEN_N_GROUPS",
+                              "0") == "1":
+                raise ValueError(
+                    "ICMS_WRITE_MODE=eviction is mutually exclusive "
+                    "with ICMS_TRUST_PROMPT_LEN_N_GROUPS=1. The latter "
+                    "assumes prefill-time chain creation which does "
+                    "not hold under eviction-driven writes.")
+            # (d) ICMS_FULL_FETCH semantics flipped: eviction-mode
+            # chains are full-KV; FULL_FETCH=1 is REQUIRED, not
+            # forbidden. Auto-set if unset; raise if explicitly 0.
+            _ff_env = os.environ.get("ICMS_FULL_FETCH")
+            if _ff_env is None:
+                os.environ["ICMS_FULL_FETCH"] = "1"
+                logger.info(
+                    "ICMS_WRITE_MODE=eviction auto-set "
+                    "ICMS_FULL_FETCH=1 (eviction-mode chains are "
+                    "full-KV by construction).")
+            elif _ff_env != "1":
+                raise ValueError(
+                    "ICMS_WRITE_MODE=eviction requires "
+                    "ICMS_FULL_FETCH=1; got "
+                    f"ICMS_FULL_FETCH={_ff_env!r}.")
+            # (e) Hybrid SWA models (gemma-3 with dense_layers_mask)
+            # are explicitly out of v1 eviction-mode scope (no
+            # SW-aware eviction integration yet). Detection requires
+            # model_geometry which is initialized later in the
+            # worker; defer that check to worker_base init.
+
+        logger.info(
+            "IcmsConnector: write_mode=%s (extra=%r env=%r)",
+            self._write_mode, _write_mode_extra, _write_mode_env)
         # B1 (2026-05-05): sink-size multiplier for concurrent in-flight
         # Score / FetchAll RPCs. Today the server allocates sink offsets
         # internally, so the connector's only job is to register a sink
@@ -177,11 +275,20 @@ class IcmsConnector(KVConnectorBase_V1):
         # connector), which means the ICMS fetch path never fires.
         cache_cfg = getattr(vllm_config, "cache_config", None)
         if cache_cfg is not None and getattr(cache_cfg, "enable_prefix_caching", False):
-            logger.warning(
-                "IcmsConnector: vLLM prefix caching is enabled. ICMS expects "
-                "drop-between-turns as the default; prefix caching will hide "
-                "cross-turn ICMS fetches. Pass enable_prefix_caching=False to "
-                "the LLM constructor when using ICMS.")
+            # Mode-aware: under eviction-mode, prefix_caching=True is the
+            # EXPECTED configuration — vLLM's prefix cache is L1, ICMS
+            # is L2. The warning would be a false-positive (Reviewer 3).
+            if self._write_mode == "eviction":
+                logger.info(
+                    "IcmsConnector (eviction-mode): vLLM prefix caching "
+                    "is enabled (L1); ICMS is the L2 tier and "
+                    "receives eviction callbacks from block_pool.")
+            else:
+                logger.warning(
+                    "IcmsConnector: vLLM prefix caching is enabled. ICMS expects "
+                    "drop-between-turns as the default; prefix caching will hide "
+                    "cross-turn ICMS fetches. Pass enable_prefix_caching=False to "
+                    "the LLM constructor when using ICMS.")
 
         self._sched: _Scheduler | None = None
         self._worker: _Worker | None = None
@@ -222,6 +329,7 @@ class IcmsConnector(KVConnectorBase_V1):
                 shmem_name=self._shmem_name,
                 sink_slots=self._sink_slots,
                 local_gpu_direct=self._local_gpu_direct,
+                write_mode=self._write_mode,
             )
             # Plumb max_num_seqs through to the worker for the
             # write-pipeline drain default in wait_for_pending_writes
@@ -231,6 +339,40 @@ class IcmsConnector(KVConnectorBase_V1):
             # follow-up that introduced the gate didn't propagate the
             # value — fixed here.
             self._worker._max_num_seqs = self._max_num_seqs
+
+    # ──────────────────────────────────────────────────────────────────
+    # Eviction-mode hooks (PR1 scaffold)
+    # ──────────────────────────────────────────────────────────────────
+
+    @property
+    def supports_eviction_writes(self) -> bool:
+        """Override of KVConnectorBase_V1.supports_eviction_writes.
+
+        Returns True only when this connector is configured for
+        eviction-driven writes via ICMS_WRITE_MODE=eviction. The
+        scheduler's block_pool callback registration (PR2) gates on
+        this property — under prefill mode no callback is registered
+        and the entire eviction-mode code path is dead.
+        """
+        return self._write_mode == "eviction"
+
+    def on_kv_blocks_evicted(self, block_ids: "set[int]") -> None:
+        """PR1 stub. Live wiring lands in PR3 (scheduler→worker bridge)
+        and PR5 (worker-side extract+flush).
+
+        In PR1, this hook is unreachable in practice because PR2's
+        callback registration is still a no-op (introduced in PR2).
+        Even if invoked, it falls through to the base no-op so the
+        contract is preserved.
+        """
+        # Explicit no-op — under prefill mode the property is False so
+        # this is never reached; under eviction mode the PR2-PR5 PRs
+        # land the actual wiring.
+        if self._write_mode == "eviction" and block_ids:
+            logger.debug(
+                "[icms-eviction] PR1 stub received %d block_ids; "
+                "ignored until PR3/PR5 land the bridge + writer.",
+                len(block_ids))
 
     # ══════════════════════════════════════════════════════════════════════
     #  Worker-side abstract methods

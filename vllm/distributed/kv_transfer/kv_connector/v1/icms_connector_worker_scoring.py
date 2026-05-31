@@ -3304,6 +3304,14 @@ class _WorkerScoringMixin:
         # Decode (q_len=1) is never sliced. Default off = existing path
         # byte-identical. The q.shape[0] > N guard means earlier pure-haystack
         # prefill chunks (q_len <= N) are left alone.
+        # 2026-05-31: drop NaN (TP>1 padding/uninit) rows from the FULL captured q
+        # BEFORE the question-tail trim, so the trim grabs the genuine question
+        # tokens even when the trailing rows are all padding (otherwise the last-N
+        # window can be entirely uninitialized → all-NaN → 0-pick prefill → gib).
+        if q.ndim == 3 and q.shape[0] > 1 and bool(torch.isnan(q).any()):
+            _ft_full = ~torch.isnan(q).any(dim=2).any(dim=1)
+            if 1 <= int(_ft_full.sum()) < int(q.shape[0]):
+                q = q[_ft_full]
         _q_tail = 0
         try:
             _qfile = os.environ.get("ICMS_Q_TAIL_FILE", "")
@@ -3315,6 +3323,40 @@ class _WorkerScoringMixin:
             _q_tail = 0
         if _q_tail > 0 and q.shape[0] > _q_tail:
             q = q[-_q_tail:]
+        # ── 2026-05-31 TP>1 prefill Q-capture NaN guard (root-cause fix for the
+        # mistral TP=2 gibberish) ──────────────────────────────────────────────
+        # At TP>1 the stop-world / real-Q capture intermittently leaves 1-2 of the
+        # PREFILL question-token rows uninitialized (NaN) — verified via
+        # ICMS_PER_LAYER_MAX_KV_DUMP: TP2 prefill q_shape=[7,16,128] had 2/7 tokens
+        # all-NaN while TP1 captured all 7 clean. With q_token_pool=max a single
+        # NaN token poisons EVERY per-page score → topk drops all → 0 picks at the
+        # prefill → empty page selection → the first decode token attends nothing →
+        # gibberish cascade (decode then re-does the selection one iteration late).
+        # The NaN lives in the SCORING Q only (not the model's KV/attention), so
+        # dropping the NaN token-rows is safe and strictly improves selection.
+        # No-op when no NaN (default path byte-identical). Decode (q_len=1) keeps
+        # its row unless it's the only one and NaN (then we leave it untouched).
+        if q.ndim == 3 and bool(torch.isnan(q).any()):
+            _finite_tok = ~torch.isnan(q).any(dim=2).any(dim=1)  # [q_len]
+            _nvalid = int(_finite_tok.sum())
+            if 1 <= _nvalid < int(q.shape[0]):
+                # Preferred: keep only the genuinely-captured question tokens.
+                q = q[_finite_tok]
+            # Residual NaN (ALL rows NaN — heavy trailing padding at TP>1 — or
+            # partial-channel NaN inside a kept row) → zero it so page scores stay
+            # finite. Worst case yields a uniform (non-empty) prefill selection,
+            # which decode then refines — strictly better than the 0-pick prefill
+            # that left the first decode token attending nothing → gibberish.
+            if bool(torch.isnan(q).any()):
+                q = torch.nan_to_num(q, nan=0.0)
+            if not getattr(self, "_nan_q_drop_logged", False):
+                self._nan_q_drop_logged = True
+                logger.warning(
+                    "[icms_per_layer_max_kv] NaN scoring-Q guard FIRED: "
+                    "%d/%d question-token rows valid at layer %d tp_rank=%d "
+                    "(TP>1 prefill Q-capture leaves uninit/NaN rows; was causing "
+                    "0-pick prefill → gibberish)",
+                    _nvalid, int(q.shape[0]), next_layer_idx, self._tp_rank)
         # ── DIAGNOSTIC (commented 2026-05-29; revive by uncommenting) ──
         # One-time Q-TAIL trim probe — used to prove the question-only-Q trim
         # fires at TP>1 (pre_qlen=32295→post_qlen=38). Confirmed working; muted

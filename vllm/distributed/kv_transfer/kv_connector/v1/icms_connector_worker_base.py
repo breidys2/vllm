@@ -56,7 +56,19 @@ class _WorkerBase:
                  sparse_prefill_dense_decode: bool = False,
                  shmem_name: str = "",
                  sink_slots: int = 1,
-                 local_gpu_direct: bool = False):
+                 local_gpu_direct: bool = False,
+                 write_mode: str = "prefill"):
+        # ICMS_WRITE_MODE plumb-through (PR1 of the eviction-mode
+        # refactor). Facade validates mutex + auto-sets FULL_FETCH
+        # before constructing the worker; the worker carries the
+        # resolved value through so PR2-PR10 dispatch sites can branch
+        # on it without re-reading the env. Default "prefill"
+        # preserves byte-identical behavior with pre-refactor builds.
+        if write_mode not in ("prefill", "eviction"):
+            raise ValueError(
+                f"_WorkerBase write_mode={write_mode!r} invalid; "
+                "expected 'prefill' or 'eviction'.")
+        self._write_mode: str = write_mode
         self._socket_path = socket_path
         self._use_rdma = use_rdma
         self._rdma_server_host = rdma_server_host
@@ -828,12 +840,29 @@ class _WorkerBase:
             os.environ.get("ICMS_FULL_FETCH", "0") == "1")
         if _full_fetch_mode:
             if self._geom.dense_layers_mask != 0:
+                # Mode-aware advice (PR1 eviction-mode refactor): under
+                # ICMS_WRITE_MODE=eviction, FULL_FETCH=1 is auto-set, so
+                # the "use FULL_FETCH=0" advice is wrong. Direct the
+                # operator to the underlying limitation instead.
+                if self._write_mode == "eviction":
+                    raise RuntimeError(
+                        "ICMS_WRITE_MODE=eviction is not supported "
+                        "for hybrid SWA models (dense_layers_mask != 0). "
+                        "Gemma-3's SW-layer eviction integration is "
+                        "out of v1 eviction-mode scope. Use "
+                        "ICMS_WRITE_MODE=prefill (default) for "
+                        "hybrid models.")
                 raise RuntimeError(
                     "ICMS_FULL_FETCH=1 is incompatible with hybrid "
                     "models (dense_layers_mask != 0). gemma-3 SW layer "
                     "apply path is undefined under full-fetch. "
                     "Use ICMS_FULL_FETCH=0 for hybrid models.")
-            if self._is_multi_rid_mode():
+            if self._is_multi_rid_mode() and self._write_mode != "eviction":
+                # Under WRITE_MODE=eviction the sink sizing semantics are
+                # different (writeback queue, not single in-flight slot)
+                # so the multi-rid prohibition does NOT apply. PR4 lands
+                # the writeback queue + correctly-sized depth; until
+                # then keep the prohibition active for prefill mode.
                 raise RuntimeError(
                     "ICMS_FULL_FETCH=1 requires single-rid mode "
                     "(max_num_seqs=1 AND ICMS_ALLOW_BATCH unset). "

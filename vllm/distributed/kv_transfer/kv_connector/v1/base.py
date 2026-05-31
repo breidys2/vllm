@@ -187,6 +187,41 @@ class KVConnectorBase_V1(ABC):
     def role(self) -> KVConnectorRole:
         return self._role
 
+    # ──────────────────────────────────────────────────────────────────
+    # Eviction-driven write hook (PR1 of the ICMS eviction-mode refactor)
+    # ──────────────────────────────────────────────────────────────────
+    # Connectors that opt into eviction-driven writes override
+    # supports_eviction_writes to return True and implement
+    # on_kv_blocks_evicted. The scheduler conditionally registers a
+    # callback into block_pool.free_blocks at startup (PR2) only when
+    # the property is True; under-equipped connectors (nixl, lmcache,
+    # multi, p2p, mooncake, moriio, ...) get the inherited no-op
+    # behavior and are not affected by the refactor.
+    @property
+    def supports_eviction_writes(self) -> bool:
+        """Whether this connector wants block_pool eviction callbacks.
+
+        Default False — opt-in. Returning True registers
+        on_kv_blocks_evicted at scheduler startup (PR2).
+        """
+        return False
+
+    def on_kv_blocks_evicted(self, block_ids: "set[int]") -> None:
+        """Called once per scheduler step with the set of block_ids
+        that vLLM's block_pool freed this step (LRU eviction path only;
+        error-recovery evict_blocks is NOT routed here per PR2 of the
+        ICMS eviction-mode refactor — would persist known-invalid KV).
+
+        Base implementation is a no-op. Connectors that override
+        supports_eviction_writes must override this method to do
+        useful work.
+
+        Args:
+            block_ids: the freed scheduler-side block IDs. Iteration
+                order is the insertion order vLLM enqueued them in.
+        """
+        return
+
     # ==============================
     # Worker-side methods
     # ==============================

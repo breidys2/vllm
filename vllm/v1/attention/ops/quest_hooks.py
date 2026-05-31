@@ -398,6 +398,24 @@ class QuestHookManager:
             H = q.shape[-1] // self._head_dim  # rank-local H_q
             self._captured_q[int(layer_idx)] = (
                 q.detach().view(-1, H, self._head_dim))
+            if (_os_q.environ.get("ICMS_DIAG_CAPTURE_NAN", "0") == "1"
+                    and self._captured_q[int(layer_idx)].shape[0] > 1):
+                # PREFILL capture. Is q ALREADY NaN here (model/forward produced
+                # it) or does it go NaN later (reused-buffer overwrite of this
+                # .view())? Log the first several prefill captures unconditionally
+                # so "clean at capture" is observable, not just inferred.
+                _n = getattr(self, "_capnan_diag_n", 0)
+                if _n < 12:
+                    self._capnan_diag_n = _n + 1
+                    _cap = self._captured_q[int(layer_idx)]
+                    logger.warning(
+                        "[diag-capture-nan] AT-CAPTURE#%d layer=%s "
+                        "raw_q_shape=%s raw_q_nan=%d cap_shape=%s "
+                        "nan_rows=%d/%d q_dtype=%s q_is_contig=%s",
+                        _n, layer_idx, tuple(q.shape), int(torch.isnan(q).sum()),
+                        tuple(_cap.shape),
+                        int(torch.isnan(_cap).any(dim=2).any(dim=1).sum()),
+                        int(_cap.shape[0]), q.dtype, q.is_contiguous())
         except Exception:
             logger.exception("quest capture-q stash failed at layer=%d",
                              layer_idx)
