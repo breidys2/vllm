@@ -469,13 +469,14 @@ class QuestHookManager:
         # only the stride-aligned scored layers reach here so the clone cost is
         # bounded (~num_layers/score_stride per prefill, not every layer).
         if query is not None:
-            # Tail-only snapshot: per_layer_max_kv scores at most the last
-            # `qtail` (question-only-Q) tokens, so cloning the last ~1024 rows is
-            # a ~16x-cheaper copy than the full [num_tokens, H, D] q (the full
-            # clone is 64 MB/layer and forced gmu down). 1024 >> any realistic
-            # qtail; decode (q_len=1) clones 1 row.
-            _keep = min(int(query.shape[0]), 1024)
-            query = query[-_keep:].detach().clone()
+            # FULL snapshot of the captured q. A tail-only clone (last 1024 rows)
+            # was tried to cut the 64 MB/layer copy but REGRESSED accuracy on
+            # identical examples (b=.1 0.287→0.150) — the connector's q handling
+            # depends on more than the last qtail rows, so truncating changes the
+            # selection. Keep the full clone (correctness > the ~64 MB/scored-layer
+            # cost; run mistral TP=2 at gmu<=0.80 for headroom). Tail-only
+            # optimization deferred until the dependency is understood.
+            query = query.detach().clone()
         budget = self.budget_computer.compute_budget(
             approximate_scores=torch.empty(0),
             layer_idx=target_idx,

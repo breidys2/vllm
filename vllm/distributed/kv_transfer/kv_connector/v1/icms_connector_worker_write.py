@@ -35,6 +35,137 @@ from icms_client.geometry import GROUP_PAGES  # noqa: E402
 _GROUP_BLOCKS = GROUP_PAGES
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# PR5 of ICMS eviction-mode refactor: per-rid/per-group page accumulator
+# that feeds the writeback queue (PR4).
+#
+# Receives ChainLocator tuples from the scheduler→worker bridge (PR3)
+# in on_step_start. For each tuple (rid, group_idx, page_in_group):
+#   1. Mark the page filled in the per-(rid, group) _GroupBuffer.
+#   2. When the buffer is complete (all GROUP_PAGES pages across all
+#      kv layers filled), enqueue a WriteGroup task to the writeback
+#      queue (PR4) and clear the buffer.
+#
+# PR5 STAGING NOTE: the actual GPU→CPU memcpy of KV bytes from vLLM's
+# pool + the WriteGroup RPC dispatch are STUBBED here (the task just
+# logs + counts). PR6 lands the real memcpy on the dedicated writeback
+# stream + the WriteGroup RPC dispatch. This staging lets PR5 prove
+# the wire (PR2 callback → PR3 bridge → PR4 queue) end-to-end without
+# changing the actual bytes-to-BF2 picture, so the closed-loop bench
+# remains byte-identical under prefill mode (the queue is never
+# allocated under prefill) and eviction mode produces no garbage KV
+# (no writes leave the worker process).
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class _EvictionExtractor:
+    """Per-(rid, group_idx) buffer accumulator for eviction-mode KV
+    writeback. Owned by _WorkerBase under WRITE_MODE=eviction.
+
+    Single-producer (engine thread, via on_step_start) +
+    single-consumer (the writeback queue's drain thread). The internal
+    state is mutated only from the engine thread; the drain thread
+    only reads the task closures we enqueued.
+    """
+
+    def __init__(self, worker):
+        self._worker = worker  # _WorkerBase ref
+        # Per-(rid, group_idx) → _GroupBuffer
+        self._buffers: dict[tuple[str, int], _GroupBuffer] = {}
+        # Telemetry — surfaces in PR12.
+        self.pages_received: int = 0
+        self.groups_completed: int = 0
+        self.groups_dropped_writeback_full: int = 0
+        self.orphan_locators_total: int = 0  # PR3 already counts these
+        self.pages_at_snapshot_step: int = 0
+        # Lazy: per-(rid, group) allocations only when the first page
+        # for that key arrives. We bound this with a per-rid prune in
+        # PR6's on_request_finished (clear remaining buffers).
+
+    def _new_buffer(self) -> _GroupBuffer:
+        geom = self._worker._geom
+        num_kv_layers = int(geom.num_kv_layers)
+        kv_page_bytes = int(geom.kv_page_bytes)
+        summary_page_bytes = int(geom.summary_page_bytes)
+        return _GroupBuffer(
+            summary_blob=bytearray(
+                num_kv_layers * GROUP_PAGES * summary_page_bytes),
+            kv_blob=bytearray(
+                num_kv_layers * GROUP_PAGES * kv_page_bytes),
+            filled=set(),
+            num_layers=num_kv_layers,
+            pages_in_group=GROUP_PAGES,
+        )
+
+    def process_locators(
+        self,
+        locators: list[tuple[str, int, int, int]],
+    ) -> int:
+        """Record this step's evicted ChainLocators into per-group
+        buffers; flush any group that becomes complete.
+
+        Returns the count of completed groups flushed this call.
+        """
+        if not locators:
+            return 0
+        flushed_this_call = 0
+        for (rid, group_idx, page_in_group, snapshot_step) in locators:
+            self.pages_received += 1
+            if snapshot_step != 0:
+                self.pages_at_snapshot_step += 1
+            key = (rid, group_idx)
+            buf = self._buffers.get(key)
+            if buf is None:
+                buf = self._new_buffer()
+                self._buffers[key] = buf
+            # PR5 stub: mark the page filled across all KV layers. In
+            # PR6 the loop body will GPU-to-CPU memcpy each layer's
+            # kv_page_bytes slice into buf.kv_blob using the dedicated
+            # writeback CUDA stream (self._worker._writeback_stream).
+            for layer_idx in range(buf.num_layers):
+                buf.filled.add((layer_idx, page_in_group))
+            if buf.is_complete():
+                self._flush_group(rid, group_idx, buf)
+                del self._buffers[key]
+                flushed_this_call += 1
+        return flushed_this_call
+
+    def _flush_group(self, rid: str, group_idx: int,
+                     buf: _GroupBuffer) -> None:
+        """Enqueue a writeback task for one complete group. PR5 task is
+        a stub; PR6 fires the WriteGroup RPC + bumps server-side
+        accounting."""
+        payload_bytes = len(buf.kv_blob) + len(buf.summary_blob)
+        rid_local = rid
+        group_local = group_idx
+        size_local = payload_bytes
+
+        def _task():
+            # PR5 stub. PR6 turns this into:
+            #   self._worker._client.write_group(
+            #       chain=chain, group_idx=group_local,
+            #       kv=buf.kv_blob, summary=buf.summary_blob,
+            #       partial=False)
+            # plus per-rid book-keeping (stored_groups update +
+            # stored_chain_queue push).
+            logger.debug(
+                "[icms-eviction] PR5 stub WriteGroup task: "
+                "rid=%s group=%d bytes=%d",
+                rid_local, group_local, size_local)
+
+        ok = self._worker._writeback_queue.put_or_drop(
+            rid, payload_bytes, _task)
+        if ok:
+            self.groups_completed += 1
+        else:
+            self.groups_dropped_writeback_full += 1
+            logger.warning(
+                "[icms-eviction] writeback queue FULL — dropping group "
+                "rid=%s group=%d size=%d B (drops_total=%d)",
+                rid, group_idx, payload_bytes,
+                self._worker._writeback_queue.drops_total)
+
+
 class _WorkerWritePipelineMixin:
     def _drain_pending_flush_queue(self):
         """Forward-thread drain of pipeline-thread WriteGroup ok-bits.

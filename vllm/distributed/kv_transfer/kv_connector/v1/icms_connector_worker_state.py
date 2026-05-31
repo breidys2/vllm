@@ -109,19 +109,34 @@ class _WorkerStateMixin:
         # gated on supports_eviction_writes=False), so the conditional
         # below is a free skip — no behavior change for prefill.
         #
-        # For PR3 the worker-side handling is a stub: log at DEBUG
-        # level + count. PR4 lands the writeback queue, PR5 lands the
-        # GPU-to-CPU extract + flush. Both consume this carrier.
+        # PR5 (2026-05-31): dispatch to _EvictionExtractor which
+        # accumulates per-(rid, group) buffers and enqueues complete
+        # groups to the writeback queue (PR4). The extractor is
+        # allocated only under eviction mode; absence under prefill
+        # mode short-circuits with the getattr-default-None check.
         if (getattr(self, "_write_mode", "prefill") == "eviction"
                 and getattr(meta, "evicted_chain_locators", None)):
             n = len(meta.evicted_chain_locators)
             # Cheap aggregate counter — surfaces in PR12 telemetry.
             self._eviction_locators_received_total = (
                 getattr(self, "_eviction_locators_received_total", 0) + n)
-            logger.debug(
-                "[icms-eviction] PR3 worker received %d ChainLocators "
-                "from scheduler bridge (total received this run: %d).",
-                n, self._eviction_locators_received_total)
+            extractor = getattr(self, "_eviction_extractor", None)
+            if extractor is not None:
+                flushed = extractor.process_locators(
+                    meta.evicted_chain_locators)
+                if flushed:
+                    logger.debug(
+                        "[icms-eviction] PR5 step: %d locators in, "
+                        "%d groups flushed to writeback queue "
+                        "(extractor totals: pages=%d groups=%d drops=%d).",
+                        n, flushed, extractor.pages_received,
+                        extractor.groups_completed,
+                        extractor.groups_dropped_writeback_full)
+            else:
+                logger.debug(
+                    "[icms-eviction] PR3 worker received %d "
+                    "ChainLocators (extractor not allocated — "
+                    "PR5 incomplete).", n)
         if (getattr(self, "_write_mode", "prefill") == "eviction"
                 and getattr(meta, "scavenger_rids", None)):
             n = len(meta.scavenger_rids)

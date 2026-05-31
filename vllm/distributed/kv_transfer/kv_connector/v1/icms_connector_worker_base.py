@@ -1028,6 +1028,18 @@ class _WorkerBase:
                 "dedicated" if self._writeback_stream is not None
                 else "default",
                 self._writeback_queue._t.name)
+            # PR5: extractor turns ChainLocators (from PR3 bridge) into
+            # writeback-queue tasks. Allocated only under eviction mode
+            # so prefill is untouched.
+            from vllm.distributed.kv_transfer.kv_connector.v1.icms_connector_worker_write import (  # noqa: E501
+                _EvictionExtractor,
+            )
+            self._eviction_extractor = _EvictionExtractor(self)
+            logger.info(
+                "[icms-eviction] PR5 extractor instantiated "
+                "(per-group buffer accumulator → writeback queue).")
+        else:
+            self._eviction_extractor = None
 
     def _rank_chain(self, chain):
         """Pass-through. Trie chains are rank-agnostic at every TP.

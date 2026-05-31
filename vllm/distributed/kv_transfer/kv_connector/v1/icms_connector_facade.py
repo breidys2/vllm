@@ -608,6 +608,22 @@ class IcmsConnector(KVConnectorBase_V1):
                     logger.debug(
                         "icms_provenance capture failed for rid=%s: %s",
                         request.request_id, _e)
+            # PR5 of ICMS eviction-mode refactor (2026-05-31):
+            # populate the scheduler-side BlockLocator inverse map so
+            # vLLM's block_pool eviction callback (PR2) can resolve
+            # block_ids back to (rid, group_idx, page_in_group). Gated
+            # on write_mode=eviction so prefill mode pays zero cost
+            # (no block_id extraction, no map mutation).
+            if self._write_mode == "eviction":
+                try:
+                    _groups = blocks.get_block_ids(allow_none=True)
+                    if _groups and _groups[0]:
+                        self._sched._block_locator.insert_request_blocks(
+                            request.request_id, list(_groups[0]))
+                except Exception as _e:
+                    logger.debug(
+                        "PR5 block_locator insert failed for rid=%s: "
+                        "%s", request.request_id, _e)
             self._sched.on_alloc(request, blocks)
 
     @_instr_timing("build_connector_meta")

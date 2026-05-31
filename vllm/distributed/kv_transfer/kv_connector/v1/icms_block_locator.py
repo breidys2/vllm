@@ -276,3 +276,33 @@ class BlockLocator:
 
     def peek_snapshot(self, block_id: int) -> Optional[ChainLocator]:
         return self._snapshot.get(block_id)
+
+    # ─────────────────── PR5 bulk-insert helper ───────────────────
+
+    def insert_request_blocks(self, rid: str,
+                              block_ids: list[int]) -> int:
+        """PR5 of ICMS eviction-mode refactor: bulk-insert a request's
+        block_ids in chain order.
+
+        vLLM allocates blocks to a request sequentially: the i-th
+        block_id covers logical page i of the request's prompt. Page i
+        belongs to group floor(i / GROUP_PAGES) at position
+        i % GROUP_PAGES inside that group. This helper applies that
+        mapping in one call so the scheduler doesn't have to compute
+        it at every allocation site.
+
+        Returns the count of blocks inserted (mirrors `insert` calls).
+        Idempotent re-insertion of the SAME (block_id, rid, group, page)
+        is a no-op semantically — the underlying `insert` is
+        last-writer-wins so calling this repeatedly with the same
+        sequence has no negative effect.
+        """
+        n = 0
+        for i, bid in enumerate(block_ids):
+            if bid < 0:
+                continue
+            group_idx = i // _GROUP_PAGES
+            page_in_group = i % _GROUP_PAGES
+            self.insert(bid, rid, group_idx, page_in_group)
+            n += 1
+        return n
