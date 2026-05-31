@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable, Sequence
-from typing import Any
+from typing import Any, Callable
 
 from vllm.distributed.kv_events import (
     MEDIUM_GPU,
@@ -178,6 +178,25 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+
+        # PR2 of ICMS eviction-mode refactor: end-of-step batched
+        # callback for KV connectors that opt into eviction-driven
+        # writes (supports_eviction_writes=True). Registered by the
+        # scheduler after KVCacheManager exists; drained once per
+        # schedule() boundary, with the set of block_ids that became
+        # eviction candidates this step (ref_cnt → 0 in free_blocks).
+        #
+        # Hook is on `free_blocks` (not `_maybe_evict_cached_block` —
+        # which fires inside `get_new_blocks` AFTER block reassignment,
+        # racing the next request's overwrite) and not on `evict_blocks`
+        # (error-recovery path, would persist known-invalid KV).
+        #
+        # When the callback list is empty the fast path bypasses the
+        # accumulator entirely so prefill-mode connectors pay zero
+        # overhead (mode-orthogonal — non-ICMS connectors and ICMS
+        # under WRITE_MODE=prefill never register).
+        self._eviction_callbacks: list[Callable[[set[int]], None]] = []
+        self._pending_evicted_block_ids: set[int] = set()
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -398,9 +417,82 @@ class BlockPool:
         blocks_list = list(ordered_blocks)
         for block in blocks_list:
             block.ref_cnt -= 1
-        self.free_block_queue.append_n(
-            [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
-        )
+        # Blocks whose ref_cnt has dropped to 0 are now eviction
+        # candidates: they go back into the free queue, and are eligible
+        # for reuse by a future get_new_blocks() call. For eviction-mode
+        # KV connectors (PR2 of the ICMS eviction-mode refactor) this is
+        # the moment to fire the demotion callback — the block's
+        # content is still valid HBM but the request that produced it
+        # is done, so we can copy it to L2 storage before reassignment.
+        #
+        # Fast path: when no eviction callbacks are registered (the
+        # default, ALL non-ICMS connectors, and ICMS under
+        # WRITE_MODE=prefill), the conditional is False and behavior is
+        # byte-identical to pre-PR2 code. PR0a-fixture invariant.
+        newly_freed = [
+            block for block in blocks_list
+            if block.ref_cnt == 0 and not block.is_null
+        ]
+        if self._eviction_callbacks:
+            # Only collect block_ids of newly-freed blocks that hold a
+            # valid cached hash (full blocks). Partial / hashless blocks
+            # never made it into the prefix cache and have no chain
+            # provenance, so the connector has nothing to write for them.
+            for block in newly_freed:
+                if block.block_hash is not None:
+                    self._pending_evicted_block_ids.add(block.block_id)
+        self.free_block_queue.append_n(newly_freed)
+
+    def register_eviction_callback(
+        self, callback: Callable[[set[int]], None]
+    ) -> None:
+        """Register an end-of-step batched eviction callback.
+
+        Called by the scheduler at startup for KV connectors whose
+        supports_eviction_writes property is True. The callback fires
+        ONCE per scheduler step via drain_eviction_callbacks(), with the
+        set of block_ids that became eviction candidates this step
+        (free_blocks transitioned them to ref_cnt=0 with a valid hash).
+
+        Multiple callbacks may be registered; they fire in registration
+        order. A callback that raises does NOT propagate — the exception
+        is logged and other callbacks still fire. This preserves
+        scheduler liveness under buggy connectors.
+
+        Per PR2 of the ICMS eviction-mode refactor: only the LRU
+        free_blocks path is hooked. The error-recovery
+        KVCacheManager.evict_blocks path (called from
+        _handle_invalid_blocks for kv-load failures) is explicitly NOT
+        hooked — persisting known-invalid KV to L2 would be a
+        correctness bug.
+        """
+        self._eviction_callbacks.append(callback)
+
+    def drain_eviction_callbacks(self) -> None:
+        """Fire all registered eviction callbacks with the pending set
+        of block_ids and clear the accumulator.
+
+        Called at the end of each scheduler step (Scheduler.schedule()
+        return-point). When no callbacks are registered, this is a
+        ~5ns dict.__bool__ check — the cost on the hot path is the
+        empty-list iteration in free_blocks above.
+        """
+        if not self._eviction_callbacks:
+            return
+        if not self._pending_evicted_block_ids:
+            return
+        # Snapshot + clear before invoking callbacks so a callback that
+        # itself triggers free_blocks (unusual but legal) accumulates a
+        # fresh batch for the next step.
+        batch = self._pending_evicted_block_ids
+        self._pending_evicted_block_ids = set()
+        for cb in self._eviction_callbacks:
+            try:
+                cb(batch)
+            except Exception:
+                logger.exception(
+                    "BlockPool eviction callback %r raised; "
+                    "continuing with remaining callbacks.", cb)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.

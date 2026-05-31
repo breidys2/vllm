@@ -398,7 +398,8 @@ class QuestHookManager:
             H = q.shape[-1] // self._head_dim  # rank-local H_q
             self._captured_q[int(layer_idx)] = (
                 q.detach().view(-1, H, self._head_dim))
-            if (_os_q.environ.get("ICMS_DIAG_CAPTURE_NAN", "0") == "1"
+            import os as _os_cap
+            if (_os_cap.environ.get("ICMS_DIAG_CAPTURE_NAN", "0") == "1"
                     and self._captured_q[int(layer_idx)].shape[0] > 1):
                 # PREFILL capture. Is q ALREADY NaN here (model/forward produced
                 # it) or does it go NaN later (reused-buffer overwrite of this
@@ -456,6 +457,25 @@ class QuestHookManager:
             or (_idx % self.score_stride) == 0)
         if not is_stride:
             return
+        # ── 2026-05-31 stale-captured-view fix (ROOT CAUSE of mistral TP=2 gib) ──
+        # _registry_capture_q_callback stashes q as a .view() into a vLLM
+        # activation buffer (intentionally cheap, no copy). But the connector's
+        # per_layer_max_kv scoring reads it DEFERRED — after vLLM has reused that
+        # buffer for later layers — so at TP>1 the tail (question) token rows come
+        # back NaN. Verified via ICMS_DIAG_CAPTURE_NAN: q is clean AT capture
+        # (raw_q_nan=0, q_is_contig=False) and corrupt by score-time → NaN poisons
+        # max-pool → 0-pick prefill → gibberish. Snapshot it NOW (here we're still
+        # synchronous inside the capture callback, before the buffer is reused);
+        # only the stride-aligned scored layers reach here so the clone cost is
+        # bounded (~num_layers/score_stride per prefill, not every layer).
+        if query is not None:
+            # Tail-only snapshot: per_layer_max_kv scores at most the last
+            # `qtail` (question-only-Q) tokens, so cloning the last ~1024 rows is
+            # a ~16x-cheaper copy than the full [num_tokens, H, D] q (the full
+            # clone is 64 MB/layer and forced gmu down). 1024 >> any realistic
+            # qtail; decode (q_len=1) clones 1 row.
+            _keep = min(int(query.shape[0]), 1024)
+            query = query[-_keep:].detach().clone()
         budget = self.budget_computer.compute_budget(
             approximate_scores=torch.empty(0),
             layer_idx=target_idx,

@@ -403,8 +403,37 @@ class KVCacheManager:
 
         Args:
             block_ids: Set of block IDs to evict from cache.
+
+        NOTE: This is the ERROR-RECOVERY path called from
+        Scheduler._handle_invalid_blocks when a KV connector reports
+        load failure. It deliberately does NOT fire the eviction
+        callbacks registered via register_eviction_callback —
+        persisting known-invalid KV to L2 storage would be a
+        correctness bug (per PR2 of the ICMS eviction-mode refactor,
+        Reviewer 3 BLOCKER). Only the LRU free_blocks path is hooked
+        for L2 demotion.
         """
         self.block_pool.evict_blocks(block_ids)
+
+    # ──────────────────────────────────────────────────────────────────
+    # Eviction-callback plumbing (PR2 of ICMS eviction-mode refactor)
+    # ──────────────────────────────────────────────────────────────────
+    # Thin proxies to the underlying BlockPool. The scheduler registers
+    # at startup AFTER kv_cache_manager construction (Reviewer 3
+    # init-order fix) and drains at the end of each schedule() call.
+
+    def register_eviction_callback(
+        self, callback: "Callable[[set[int]], None]"
+    ) -> None:
+        """Register an end-of-step batched eviction callback for KV
+        connectors that opt into eviction-driven writes."""
+        self.block_pool.register_eviction_callback(callback)
+
+    def drain_eviction_callbacks(self) -> None:
+        """Fire registered eviction callbacks with this step's batch
+        and clear the accumulator. Called once per Scheduler.schedule()
+        invocation."""
+        self.block_pool.drain_eviction_callbacks()
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF

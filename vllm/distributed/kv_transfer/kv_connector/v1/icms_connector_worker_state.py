@@ -100,6 +100,37 @@ class _WorkerStateMixin:
         """Called from start_load_kv. Drains scheduler metadata into caches."""
         t_step = time.perf_counter()
         self.stats.advance_step()
+
+        # PR3 of ICMS eviction-mode refactor (2026-05-31): receive
+        # ChainLocator tuples ferried from the scheduler's BlockLocator
+        # via IcmsConnectorMetadata. Under prefill mode this field is
+        # always empty (scheduler-side `_pending_evicted_locators` is
+        # never populated because the eviction callback registration is
+        # gated on supports_eviction_writes=False), so the conditional
+        # below is a free skip — no behavior change for prefill.
+        #
+        # For PR3 the worker-side handling is a stub: log at DEBUG
+        # level + count. PR4 lands the writeback queue, PR5 lands the
+        # GPU-to-CPU extract + flush. Both consume this carrier.
+        if (getattr(self, "_write_mode", "prefill") == "eviction"
+                and getattr(meta, "evicted_chain_locators", None)):
+            n = len(meta.evicted_chain_locators)
+            # Cheap aggregate counter — surfaces in PR12 telemetry.
+            self._eviction_locators_received_total = (
+                getattr(self, "_eviction_locators_received_total", 0) + n)
+            logger.debug(
+                "[icms-eviction] PR3 worker received %d ChainLocators "
+                "from scheduler bridge (total received this run: %d).",
+                n, self._eviction_locators_received_total)
+        if (getattr(self, "_write_mode", "prefill") == "eviction"
+                and getattr(meta, "scavenger_rids", None)):
+            n = len(meta.scavenger_rids)
+            self._scavenger_rids_received_total = (
+                getattr(self, "_scavenger_rids_received_total", 0) + n)
+            logger.debug(
+                "[icms-eviction] PR3 worker received %d scavenger "
+                "rids from scheduler bridge (total: %d).",
+                n, self._scavenger_rids_received_total)
         # Reset prefill_done when a new request arrives (new chain delivered).
         if meta.new_chains:
             self._prefill_done = False

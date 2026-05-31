@@ -71,6 +71,44 @@ class _Scheduler:
         # prefix length to the scheduler, so vLLM skips recomputing them.
         self._stored_chains: list[tuple[tuple[int, ...], int]] = []
 
+        # ── PR3 of ICMS eviction-mode refactor (2026-05-31) ──────────
+        # Block_id → ChainLocator inverse map (greenfield per PR0b).
+        # Populated by save_kv_layer / update_state_after_alloc once
+        # PR5 lands; for PR3 the map is empty in production and only
+        # exercised by unit tests via direct injection. Lives on the
+        # scheduler side because vLLM's block_pool eviction callback
+        # fires on the scheduler thread (same address space) and
+        # block_id assignment via KVCacheManager.allocate_slots also
+        # happens here.
+        #
+        # Import the locator module lazily inside __init__ to keep
+        # cold-import time of the connector family unchanged; the
+        # module has no icms_client deps so the bootstrap order trap
+        # ([Connector decomposition 2026-05-29]) does not bite.
+        from vllm.distributed.kv_transfer.kv_connector.v1.icms_block_locator import (  # noqa: E501
+            BlockLocator,
+        )
+        self._block_locator: BlockLocator = BlockLocator()
+        # End-of-step accumulator for ChainLocators resolved from this
+        # step's vLLM block_pool eviction batch. Drained once per
+        # build_meta() call into IcmsConnectorMetadata.
+        # Stored as a flat tuple (rid, group_idx, page_in_group,
+        # snapshot_step) to match the wire format declared in
+        # icms_connector_types.IcmsConnectorMetadata. Reviewer 2 MEDIUM:
+        # list (not set) to preserve insertion order across pickle —
+        # both TP ranks must process locators in the same order.
+        self._pending_evicted_locators: list[
+            tuple[str, int, int, int]
+        ] = []
+        # Per-step counter for snapshot retention (PR0b BlockLocator
+        # uses snapshot_step to age out finished-rid snapshots).
+        # Incremented in build_meta() — i.e., once per scheduler step.
+        self._eviction_step_counter: int = 0
+        # Scavenger ferry list: rids that finished this step (used by
+        # PR6 for low-priority writeback of remaining live blocks under
+        # demote-on-finish semantics). PR3 only transports them.
+        self._pending_scavenger_rids: list[str] = []
+
     def on_alloc(self, request: Request, blocks: KVCacheBlocks):
         rid = request.request_id
         if rid in self._chains:
@@ -146,6 +184,54 @@ class _Scheduler:
         self._chains[rid] = chain
         self._pending_chain_sends.add(rid)
 
+    # ──────────────────────────────────────────────────────────────────
+    # PR3 eviction bridge: receive batched block_ids from vLLM's
+    # block_pool callback, resolve via BlockLocator, accumulate
+    # ChainLocator tuples for the next build_meta() drain.
+    # ──────────────────────────────────────────────────────────────────
+
+    def on_kv_blocks_evicted(self, block_ids: "set[int]") -> None:
+        """Called by IcmsConnector facade once per scheduler step (under
+        WRITE_MODE=eviction) with the set of block_ids that vLLM's
+        block_pool freed this step.
+
+        Resolves each block_id via the PR0b BlockLocator and appends a
+        flat tuple (rid, group_idx, page_in_group, snapshot_step) to
+        the pending accumulator. The accumulator is drained into
+        IcmsConnectorMetadata.evicted_chain_locators in build_meta().
+
+        Misses (block_ids with no map entry) are recorded in the
+        locator's stats.eviction_orphan_block counter — they're not
+        an error, just an indication that the block was never tracked
+        by the connector (e.g., a partial block that never made it
+        into a chain group).
+        """
+        if not block_ids:
+            return
+        # Sort for deterministic iteration order — both TP ranks must
+        # see the same ChainLocator order in the worker's metadata
+        # processing (Reviewer 2 cross-rank symmetry).
+        for block_id in sorted(block_ids):
+            loc = self._block_locator.evict_lookup(block_id)
+            if loc is None:
+                continue
+            self._pending_evicted_locators.append(
+                (loc.rid, loc.group_idx, loc.page_in_group,
+                 loc.snapshot_step))
+
+    def record_finished_request_for_scavenger(self, rid: str) -> None:
+        """Called from on_request_finished (under WRITE_MODE=eviction)
+        to queue a demote-on-finish scavenger writeback for any of
+        rid's blocks still in vLLM's pool. PR3 only transports the rid;
+        PR6 implements the writeback worker that consumes it.
+        """
+        self._pending_scavenger_rids.append(rid)
+        # Snapshot rid's live block_ids in the BlockLocator so when they
+        # finally evict (some steps later) they still resolve back to
+        # this rid (Reviewer 2 lifecycle case: rid clears before evict).
+        # The snapshot_step is the current step counter.
+        self._block_locator.clear_request(rid, self._eviction_step_counter)
+
     def build_meta(self, scheduler_output: SchedulerOutput) -> IcmsConnectorMetadata:
         # Also drain worker notifications here (belt-and-suspenders with
         # the drain in get_num_new_matched_tokens) to catch pushes that
@@ -157,6 +243,21 @@ class _Scheduler:
             self.record_stored_chain(chain, n_groups)
 
         meta = IcmsConnectorMetadata()
+
+        # PR3 eviction bridge: drain ChainLocator accumulator into the
+        # metadata. The list is already in insertion order from
+        # on_kv_blocks_evicted (which iterates sorted(block_ids)) — both
+        # TP ranks deserialize the same order so processing is
+        # symmetric. PR3 also bumps the step counter used by
+        # BlockLocator snapshot retention.
+        self._eviction_step_counter += 1
+        if self._pending_evicted_locators:
+            meta.evicted_chain_locators = self._pending_evicted_locators
+            self._pending_evicted_locators = []
+        if self._pending_scavenger_rids:
+            meta.scavenger_rids = self._pending_scavenger_rids
+            self._pending_scavenger_rids = []
+
         # Per-step scheduled token counts (req_id → num_tokens this step).
         # 2026-05-07 BUG FIX: vLLM V2's canonical field is
         # `num_scheduled_tokens` (see vllm/v1/core/sched/output.py:194-196),

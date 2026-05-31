@@ -961,6 +961,74 @@ class _WorkerBase:
             sink_layers, per_layer_bytes, self._sink_slots, total_sink,
             self._score_stride, _allow_batch(),
         )
+
+        # ──────────────────────────────────────────────────────────────
+        # PR4 of ICMS eviction-mode refactor (2026-05-31): writeback
+        # queue + dedicated CUDA stream + background drain thread.
+        # ──────────────────────────────────────────────────────────────
+        # Allocated ONLY when write_mode=eviction; under prefill mode
+        # these attributes stay None so the legacy _WritePipeline path
+        # is unaffected (PR0a fixture invariant).
+        #
+        # Queue capacity is sized in CHAIN units per Reviewer 3 MEDIUM:
+        # per-page sizing (~1.25 MB) would drop every put under
+        # realistic eviction batches. Default = N inflight chains × the
+        # FULL-KV chain bytes derived from worker geometry.
+        #
+        # chain_bytes = icms_k × num_kv_layers × kv_page_bytes
+        # where icms_k = pages_per_ctx ≈ max_model_len / PAGE_TOKENS,
+        # which is the upper bound on a single chain's page count.
+        # Under eviction-mode FULL_FETCH=1 is auto-set so this is the
+        # right scale for the chain footprint.
+        self._writeback_queue = None
+        self._writeback_stream = None
+        if self._write_mode == "eviction":
+            from vllm.distributed.kv_transfer.kv_connector.v1.icms_connector_types import (  # noqa: E501
+                _WriteBackQueue,
+            )
+            kv_page_bytes = int(self._geom.kv_page_bytes)
+            chain_bytes = (int(self._k) *
+                           int(self._geom.num_kv_layers) *
+                           kv_page_bytes)
+            inflight_chains = int(os.environ.get(
+                "ICMS_WRITE_QUEUE_INFLIGHT_CHAINS", "4"))
+            inflight_chains = max(1, inflight_chains)
+            # Explicit override: ICMS_WRITE_QUEUE_DEPTH (bytes) wins
+            # over the derived default if set.
+            queue_bytes_env = os.environ.get("ICMS_WRITE_QUEUE_DEPTH")
+            if queue_bytes_env:
+                queue_capacity = int(queue_bytes_env)
+            else:
+                queue_capacity = inflight_chains * chain_bytes
+            self._writeback_queue = _WriteBackQueue(
+                capacity_bytes=queue_capacity,
+                name=f"icms-writeback-tp{self._tp_rank}")
+            # Dedicated CUDA stream for GPU→CPU eviction memcpy so the
+            # extract path (PR5) doesn't serialize behind the default
+            # stream's prefill ops. Stream is allocated on the same
+            # device as the sink (gpu_dev resolved above).
+            try:
+                _dev_idx = int(gpu_dev.split(":")[1]) if gpu_dev.startswith(
+                    "cuda:") else 0
+                self._writeback_stream = torch.cuda.Stream(
+                    device=_dev_idx)
+            except Exception as _e:
+                logger.warning(
+                    "[icms-eviction] PR4 failed to allocate dedicated "
+                    "CUDA stream: %s — falling back to default stream; "
+                    "extract path will serialize with prefill compute.",
+                    _e)
+                self._writeback_stream = None
+            logger.info(
+                "[icms-eviction] PR4 writeback queue allocated: "
+                "capacity=%.2f GiB (%d chains × %.2f GiB), "
+                "stream=%s, drain_thread=%s",
+                queue_capacity / (1 << 30),
+                inflight_chains, chain_bytes / (1 << 30),
+                "dedicated" if self._writeback_stream is not None
+                else "default",
+                self._writeback_queue._t.name)
+
     def _rank_chain(self, chain):
         """Pass-through. Trie chains are rank-agnostic at every TP.
 
@@ -979,6 +1047,17 @@ class _WorkerBase:
     def shutdown(self):
         if self._client is None:
             return
+        # PR4 of eviction-mode refactor: drain + shutdown the writeback
+        # queue (if it was allocated). Under prefill mode this is a
+        # no-op since the queue was never instantiated.
+        wbq = getattr(self, "_writeback_queue", None)
+        if wbq is not None:
+            try:
+                wbq.shutdown(timeout=5.0)
+            except Exception:
+                logger.exception(
+                    "[icms-eviction] writeback queue shutdown failed")
+            self._writeback_queue = None
         # Dump connector-side timing stats to a file before teardown.
         if self.stats.level > 0 or self.stats.log_selections:
             try:

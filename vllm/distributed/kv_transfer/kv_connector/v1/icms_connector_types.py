@@ -75,6 +75,35 @@ class IcmsConnectorMetadata(KVConnectorMetadata):
     # authoritative value here so the worker doesn't have to consult
     # its own potentially-stale cache.
     stored_groups_by_rid: dict[str, int] = field(default_factory=dict)
+    # PR3 of ICMS eviction-mode refactor (2026-05-31): scheduler→worker
+    # delivery of ChainLocator tuples from this step's block_pool
+    # eviction batch. Per Reviewer 1 BLOCKER, we ferry RESOLVED
+    # locators (rid, group_idx, page_in_group) NOT raw scheduler
+    # block_ids — under TP>1, worker ranks have rank-local KV
+    # partitions and scheduler block_ids do not map directly to the
+    # rank-local KV slot. Resolution happens scheduler-side via the
+    # PR0b BlockLocator inverse map, which sees the same block_id
+    # space that vLLM's block_pool uses.
+    #
+    # Insertion-ordered list (NOT set) per Reviewer 2 MEDIUM: pickle
+    # round-trip across the spawn boundary must be deterministic so
+    # both TP ranks process locators in the same order. The dedup
+    # against the same block_id firing twice in one step is done
+    # at insert time on the scheduler side.
+    #
+    # Format: list of (rid, group_idx, page_in_group, snapshot_step)
+    # tuples — flat tuples avoid the cross-module ChainLocator
+    # dataclass dependency in the metadata wire format. snapshot_step
+    # of 0 means "live block at eviction time"; non-zero is a
+    # finished-rid snapshot (Reviewer 2 lifecycle case).
+    evicted_chain_locators: list[
+        tuple[str, int, int, int]
+    ] = field(default_factory=list)
+    # PR3 scavenger ferry: rids that finished this step. Worker uses
+    # these to schedule low-priority writeback of remaining live blocks
+    # under demote-on-finish semantics (PR6). For PR3 this is just a
+    # transport carrier — worker-side processing lands in PR6.
+    scavenger_rids: list[str] = field(default_factory=list)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -564,6 +593,157 @@ class _WritePipeline:
                 return True
             deadline = time.monotonic() + timeout
             while self._rid_pending.get(rid, 0) > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cv.wait(timeout=remaining)
+            return True
+
+    def shutdown(self, timeout: float = 5.0):
+        self._stop = True
+        self._q.put(None)
+        self._t.join(timeout=timeout)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Eviction-mode write-back queue (PR4 of ICMS eviction-mode refactor)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class _WriteBackQueue:
+    """Bounded-by-bytes FIFO of completed-group WriteGroup tasks pending
+    RPC dispatch from eviction-mode worker.
+
+    Unlike `_WritePipeline` (prefill-mode, unbounded), this queue is
+    EXPLICITLY bounded by total pending bytes:
+      • `put_or_drop` returns True under cap, False over cap. The
+        connector's adaptive_bandwidth allocator (PR10) uses
+        `drops_total` to back-pressure the eviction source.
+      • `drain_rid(rid)` blocks until tasks tagged with that rid have
+        flushed — used by PR6's on_request_finished gating so a
+        finishing rid can wait for its writeback to land in BF2 before
+        the rid clears its state.
+      • Background drain thread is OFF the engine_step thread per
+        Reviewer 2 HIGH on PR6: scavenger drain must not block TTFT.
+
+    Capacity is in BYTES, sized at construction to
+    `ICMS_WRITE_QUEUE_INFLIGHT_CHAINS × chain_bytes(model, ctx)`. The
+    per-page sizing default (1.25 MB) flagged by Reviewer 3 MEDIUM
+    would drop every put under realistic workloads; chain-size units
+    give the right headroom.
+
+    Task payload is (rid, payload_bytes, task_fn). The task_fn is a
+    closure that performs the GPU→CPU memcpy (already done on the
+    dedicated CUDA stream by PR5) + WriteGroup RPC. payload_bytes is
+    the byte count carried by this task (used for capacity accounting,
+    not actually copied around).
+    """
+
+    def __init__(self,
+                 capacity_bytes: int,
+                 name: str = "icms-writeback"):
+        if capacity_bytes <= 0:
+            raise ValueError(
+                f"capacity_bytes must be > 0, got {capacity_bytes}")
+        self._capacity_bytes = capacity_bytes
+        self._pending_bytes = 0
+        self._q: "_queue.Queue" = _queue.Queue()
+        self._rid_pending: dict[str, int] = {}
+        self._cv = threading.Condition()
+        self._stop = False
+        # Stats — surfaces in PR12 telemetry (evict_dropped, etc.).
+        self.drops_total: int = 0
+        self.puts_total: int = 0
+        self.bytes_put_total: int = 0
+        self._t = threading.Thread(
+            target=self._loop, name=name, daemon=True)
+        self._t.start()
+
+    @property
+    def capacity_bytes(self) -> int:
+        return self._capacity_bytes
+
+    @property
+    def pending_bytes(self) -> int:
+        with self._cv:
+            return self._pending_bytes
+
+    @property
+    def pending_count(self) -> int:
+        return self._q.qsize()
+
+    def put_or_drop(self, rid: str, payload_bytes: int,
+                    task_fn) -> bool:
+        """Enqueue a writeback task. Returns True on success, False if
+        the queue would overflow (in which case `drops_total` is bumped
+        and the caller must handle back-pressure)."""
+        if payload_bytes < 0:
+            raise ValueError(
+                f"payload_bytes must be >= 0, got {payload_bytes}")
+        with self._cv:
+            if self._pending_bytes + payload_bytes > self._capacity_bytes:
+                self.drops_total += 1
+                return False
+            self._pending_bytes += payload_bytes
+            self._rid_pending[rid] = self._rid_pending.get(rid, 0) + 1
+            self.puts_total += 1
+            self.bytes_put_total += payload_bytes
+        # Enqueue OUTSIDE the lock — _queue.Queue.put has its own
+        # internal lock; double-locking would deadlock the drain loop.
+        self._q.put((rid, payload_bytes, task_fn))
+        return True
+
+    def _loop(self):
+        while True:
+            item = self._q.get()
+            if item is None:  # poison
+                return
+            rid, sz, fn = item
+            try:
+                fn()
+            except Exception:
+                logger.exception(
+                    "_WriteBackQueue: task for rid=%s failed", rid)
+            with self._cv:
+                self._pending_bytes -= sz
+                n = self._rid_pending.get(rid, 0) - 1
+                if n <= 0:
+                    self._rid_pending.pop(rid, None)
+                else:
+                    self._rid_pending[rid] = n
+                self._cv.notify_all()
+
+    def drain_rid(self, rid: str,
+                  timeout: float | None = None) -> bool:
+        """Block until tasks tagged with `rid` have completed.
+
+        Returns True on drain complete, False on timeout. Tasks for
+        unrelated rids are NOT awaited — under multi-rid workloads
+        this prevents a finishing rid from being head-of-line blocked
+        by an unrelated rid's slow WriteGroup RPC.
+        """
+        with self._cv:
+            if rid not in self._rid_pending:
+                return True
+            if timeout is None:
+                while self._rid_pending.get(rid, 0) > 0:
+                    self._cv.wait()
+                return True
+            deadline = time.monotonic() + timeout
+            while self._rid_pending.get(rid, 0) > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cv.wait(timeout=remaining)
+            return True
+
+    def drain_all(self, timeout: float | None = None) -> bool:
+        with self._cv:
+            if timeout is None:
+                while self._pending_bytes > 0:
+                    self._cv.wait()
+                return True
+            deadline = time.monotonic() + timeout
+            while self._pending_bytes > 0:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return False

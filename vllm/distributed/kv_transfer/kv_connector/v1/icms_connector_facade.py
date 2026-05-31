@@ -357,22 +357,26 @@ class IcmsConnector(KVConnectorBase_V1):
         return self._write_mode == "eviction"
 
     def on_kv_blocks_evicted(self, block_ids: "set[int]") -> None:
-        """PR1 stub. Live wiring lands in PR3 (scheduler→worker bridge)
-        and PR5 (worker-side extract+flush).
+        """Routed from vLLM block_pool eviction batch (PR2) into the
+        scheduler-side connector's ChainLocator accumulator (PR3).
 
-        In PR1, this hook is unreachable in practice because PR2's
-        callback registration is still a no-op (introduced in PR2).
-        Even if invoked, it falls through to the base no-op so the
-        contract is preserved.
+        Under prefill mode the supports_eviction_writes property is
+        False so this is never invoked — the PR2 scheduler registration
+        is gated on it. Under eviction mode (scheduler role) we route
+        to _Scheduler.on_kv_blocks_evicted which resolves each block_id
+        via the PR0b BlockLocator inverse map and accumulates the
+        resulting ChainLocator tuples for build_meta() to ferry to the
+        worker.
+
+        The worker role is never the destination — this method is
+        called by vLLM's scheduler, which holds the connector with
+        role=SCHEDULER. The connector with role=WORKER receives the
+        resolved locators via bind_connector_metadata in PR3+.
         """
-        # Explicit no-op — under prefill mode the property is False so
-        # this is never reached; under eviction mode the PR2-PR5 PRs
-        # land the actual wiring.
-        if self._write_mode == "eviction" and block_ids:
-            logger.debug(
-                "[icms-eviction] PR1 stub received %d block_ids; "
-                "ignored until PR3/PR5 land the bridge + writer.",
-                len(block_ids))
+        if self._write_mode != "eviction":
+            return
+        if self._sched is not None and block_ids:
+            self._sched.on_kv_blocks_evicted(block_ids)
 
     # ══════════════════════════════════════════════════════════════════════
     #  Worker-side abstract methods

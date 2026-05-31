@@ -226,6 +226,22 @@ class Scheduler(SchedulerInterface):
             hash_block_size=self.block_size,
             metrics_collector=self.kv_metrics_collector,
         )
+
+        # PR2 of ICMS eviction-mode refactor: register the connector's
+        # eviction callback now that kv_cache_manager exists (Reviewer 3
+        # init-order fix — was originally proposed for the connector's
+        # __init__, but kv_cache_manager doesn't exist until here).
+        # Gated on the supports_eviction_writes property so non-ICMS
+        # connectors and ICMS under WRITE_MODE=prefill never register
+        # — the BlockPool free_blocks fast path stays empty.
+        if (self.connector is not None
+                and getattr(self.connector, "supports_eviction_writes", False)):
+            self.kv_cache_manager.register_eviction_callback(
+                self.connector.on_kv_blocks_evicted)
+            logger.info(
+                "Scheduler: registered eviction callback for connector "
+                "%s (supports_eviction_writes=True).",
+                type(self.connector).__name__)
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
 
@@ -903,6 +919,12 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+
+        # PR2 of ICMS eviction-mode refactor: drain end-of-step
+        # eviction callbacks. When no callback is registered (the
+        # default and non-ICMS connectors) this is a single
+        # `if not self._eviction_callbacks: return` — ~5 ns overhead.
+        self.kv_cache_manager.drain_eviction_callbacks()
         return scheduler_output
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
