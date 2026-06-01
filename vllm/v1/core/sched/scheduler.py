@@ -900,6 +900,21 @@ class Scheduler(SchedulerInterface):
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
         )
 
+        # PR7a of ICMS eviction-mode refactor: drain MUST run BEFORE
+        # build_connector_meta. Otherwise evictions queued during this
+        # step's allocate/free phases ferry to the worker one step late,
+        # by which time this step's forward pass may have overwritten
+        # the freed GPU page with a newly-reassigned rid's KV. The fix:
+        # drain now → callback populates pending locators → build_meta
+        # drains pending locators into THIS step's metadata → worker's
+        # on_step_start reads the GPU page BEFORE this step's forward
+        # writes to it. _update_after_schedule below is read-only on
+        # KV state (only touches num_computed_tokens + encoder caches),
+        # so nothing freed between this drain and step-end is lost
+        # (next step's drain catches it). Fast path: no callbacks
+        # registered ⇒ ~5 ns dict.__bool__ check.
+        self.kv_cache_manager.drain_eviction_callbacks()
+
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
         # 2. Wrap up all the KV cache load / save ops into an opaque object
@@ -920,11 +935,6 @@ class Scheduler(SchedulerInterface):
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
 
-        # PR2 of ICMS eviction-mode refactor: drain end-of-step
-        # eviction callbacks. When no callback is registered (the
-        # default and non-ICMS connectors) this is a single
-        # `if not self._eviction_callbacks: return` — ~5 ns overhead.
-        self.kv_cache_manager.drain_eviction_callbacks()
         return scheduler_output
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:

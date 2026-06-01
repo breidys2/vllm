@@ -91,19 +91,45 @@ class IcmsConnectorMetadata(KVConnectorMetadata):
     # against the same block_id firing twice in one step is done
     # at insert time on the scheduler side.
     #
-    # Format: list of (rid, group_idx, page_in_group, snapshot_step)
-    # tuples — flat tuples avoid the cross-module ChainLocator
-    # dataclass dependency in the metadata wire format. snapshot_step
-    # of 0 means "live block at eviction time"; non-zero is a
-    # finished-rid snapshot (Reviewer 2 lifecycle case).
+    # Format: list of (block_id, rid, group_idx, page_in_group,
+    # snapshot_step) tuples — flat tuples avoid the cross-module
+    # ChainLocator dataclass dependency in the metadata wire format.
+    # snapshot_step of 0 means "live block at eviction time"; non-zero
+    # is a finished-rid snapshot (Reviewer 2 lifecycle case).
+    #
+    # PR7a of ICMS eviction-mode refactor (2026-05-31): added
+    # block_id as the first element. The worker needs it to index
+    # self._gpu_kv_caches[layer][block_id] for the GPU→CPU memcpy
+    # in process_locators. Pre-PR7a's 4-tuple lacked this — PR5
+    # stub didn't actually read GPU bytes so the gap wasn't visible.
+    # Pickle size impact: +8 B per locator (one int), ~80 KB extra
+    # for 10k-eviction steps. Already well under the <1 MB <50 ms
+    # PR3 pickle budget verified by tests/test_eviction_bridge.py.
     evicted_chain_locators: list[
-        tuple[str, int, int, int]
+        tuple[int, str, int, int, int]
     ] = field(default_factory=list)
     # PR3 scavenger ferry: rids that finished this step. Worker uses
     # these to schedule low-priority writeback of remaining live blocks
     # under demote-on-finish semantics (PR6). For PR3 this is just a
     # transport carrier — worker-side processing lands in PR6.
     scavenger_rids: list[str] = field(default_factory=list)
+    # PR7b of ICMS eviction-mode refactor (2026-05-31): chain → waiter
+    # rids ferried from the scheduler to the worker. Each entry is a
+    # (chain_tuple, [waiter_rids]) pair: each waiter is a request that
+    # the scheduler put in WAITING_FOR_REMOTE_KVS state because its
+    # NMT matched a chain whose writeback was still in flight at NMT
+    # time. The worker stashes these waiters in _waiters_by_chain;
+    # when the daemon thread completes the chain's last group (RPC
+    # success on gidx == len(chain)-1) it drains the waiter set into
+    # _pending_finished_recving, which the worker's get_finished
+    # returns as finished_recving so vLLM unblocks the waiter rids.
+    #
+    # Insertion-ordered list-of-tuples (NOT dict) for pickle determinism
+    # across the spawn boundary — same TP-symmetric reasoning as
+    # evicted_chain_locators (Reviewer 2 MEDIUM lifecycle case).
+    # Format: list[ (chain_tuple, [waiter_rid_1, waiter_rid_2, ...]) ]
+    chain_waiters: list[tuple[tuple[int, ...], list[str]]] = field(
+        default_factory=list)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -654,6 +680,12 @@ class _WriteBackQueue:
         self.drops_total: int = 0
         self.puts_total: int = 0
         self.bytes_put_total: int = 0
+        # PR6 of ICMS eviction-mode refactor (2026-05-31): observational
+        # priority counters. NO per-rid priority dict (Reviewer 2 HIGH #4
+        # / Reviewer 1 LOW: avoid the lifecycle-leak class a per-rid map
+        # would carry). FIFO drain order is UNCHANGED.
+        self.puts_high_total: int = 0
+        self.puts_low_total: int = 0
         self._t = threading.Thread(
             target=self._loop, name=name, daemon=True)
         self._t.start()
@@ -672,10 +704,20 @@ class _WriteBackQueue:
         return self._q.qsize()
 
     def put_or_drop(self, rid: str, payload_bytes: int,
-                    task_fn) -> bool:
+                    task_fn,
+                    priority: str = 'high') -> bool:
         """Enqueue a writeback task. Returns True on success, False if
         the queue would overflow (in which case `drops_total` is bumped
-        and the caller must handle back-pressure)."""
+        and the caller must handle back-pressure).
+
+        PR6 of ICMS eviction-mode refactor (2026-05-31):
+        `priority` is OBSERVATIONAL only — increments
+        puts_high_total/puts_low_total aggregate counters. FIFO drain
+        order is UNCHANGED. Default 'high' preserves the existing
+        3-arg call shape. Reviewer 2 HIGH #4 + Reviewer 1 LOW: NO
+        per-rid priority dict (avoids lifecycle leak / state
+        duality).
+        """
         if payload_bytes < 0:
             raise ValueError(
                 f"payload_bytes must be >= 0, got {payload_bytes}")
@@ -687,6 +729,11 @@ class _WriteBackQueue:
             self._rid_pending[rid] = self._rid_pending.get(rid, 0) + 1
             self.puts_total += 1
             self.bytes_put_total += payload_bytes
+            # PR6: observational priority counters; no per-rid dict.
+            if priority == 'high':
+                self.puts_high_total += 1
+            else:
+                self.puts_low_total += 1
         # Enqueue OUTSIDE the lock — _queue.Queue.put has its own
         # internal lock; double-locking would deadlock the drain loop.
         self._q.put((rid, payload_bytes, task_fn))

@@ -45,11 +45,20 @@ class _WorkerStateMixin:
         Returns the number of groups written for that prefix (0 if none).
         This allows a new request to know how many context pages were
         stored by a prior request with the same prefix.
+
+        PR7a: read-side acquires self._stored_chain_groups_lock to
+        snapshot the list, then iterates the snapshot lock-free. Under
+        prefill mode there's no writeback daemon thread — the lock is
+        uncontended and adds ~50 ns. Under eviction mode the daemon
+        thread mutates the list from _flush_group's task closure, so
+        the snapshot pattern avoids a torn read.
         """
+        with self._stored_chain_groups_lock:
+            snapshot = list(self._stored_chain_groups)
         best = 0
         best_src_len = 0
         best_src_n = 0
-        for stored_chain, n_groups in self._stored_chain_groups:
+        for stored_chain, n_groups in snapshot:
             match_len = 0
             for a, b in zip(chain, stored_chain):
                 if a == b:
@@ -68,7 +77,7 @@ class _WorkerStateMixin:
             logger.debug(
                 "[diag-match] chain_len=%d stored_entries=%d match_best=%d "
                 "(from entry len=%d n_groups=%d)",
-                len(chain), len(self._stored_chain_groups),
+                len(chain), len(snapshot),
                 best, best_src_len, best_src_n,
             )
             self._diag_get_stored_count += 1
@@ -84,22 +93,55 @@ class _WorkerStateMixin:
         to diagnose. Assert loudly here so any future contract violation
         surfaces at record time, not buried inside a downstream query
         cap. See project_apply_path_helper_tests_2026-05-09.md.
+
+        PR7a: write-side holds self._stored_chain_groups_lock for the
+        scan + mutate (also the append fallback). The daemon thread
+        (eviction-mode WriteGroup completion callback) calls this; the
+        forward thread also calls this from the legacy prefill path
+        and from _drain_pending_flush_queue. Without the lock, a torn
+        write between max() and assignment could lose updates.
         """
         assert n_groups <= len(chain), (
             f"_record_stored_groups: n_groups={n_groups} > len(chain)="
             f"{len(chain)}; query side will silently cap at match_len. "
             f"Caller is recording more groups than chain elements — "
             f"likely a stale-chain or wrong-counter bug.")
-        for i, (sc, _) in enumerate(self._stored_chain_groups):
-            if sc == chain:
-                self._stored_chain_groups[i] = (chain, max(_, n_groups))
-                return
-        self._stored_chain_groups.append((list(chain), n_groups))
+        with self._stored_chain_groups_lock:
+            for i, (sc, _) in enumerate(self._stored_chain_groups):
+                if sc == chain:
+                    self._stored_chain_groups[i] = (
+                        chain, max(_, n_groups))
+                    return
+            self._stored_chain_groups.append((list(chain), n_groups))
     @_instr_timing("on_step_start")
     def on_step_start(self, meta: IcmsConnectorMetadata):
         """Called from start_load_kv. Drains scheduler metadata into caches."""
         t_step = time.perf_counter()
         self.stats.advance_step()
+
+        # PR7a of ICMS eviction-mode refactor: bump step counter, prune
+        # stale chain snapshots. Prune cadence: every
+        # max_age_steps // 4 steps (at most). For default max_age=200
+        # this is every 50 steps; for small max_age (tests), every
+        # max(1, max_age // 4) steps. Effectively bounds the snapshot
+        # dict memory to the rids whose chains finished within the
+        # last max_age_steps. Prefill mode walks an empty dict ⇒ no-op.
+        self._step_counter += 1
+        _max_age = getattr(self, "_chain_snapshot_max_age_steps", 200)
+        if (self._step_counter - self._last_chain_snapshot_prune_step
+                >= max(1, _max_age // 4)
+                and self._chain_snapshots):
+            cutoff = self._step_counter - _max_age
+            stale = [rid for rid, (_chain, fin_step)
+                     in self._chain_snapshots.items()
+                     if fin_step < cutoff]
+            for rid in stale:
+                del self._chain_snapshots[rid]
+            if stale:
+                self._chain_snapshots_pruned_total = (
+                    getattr(self, "_chain_snapshots_pruned_total", 0)
+                    + len(stale))
+            self._last_chain_snapshot_prune_step = self._step_counter
 
         # PR3 of ICMS eviction-mode refactor (2026-05-31): receive
         # ChainLocator tuples ferried from the scheduler's BlockLocator
@@ -137,6 +179,25 @@ class _WorkerStateMixin:
                     "[icms-eviction] PR3 worker received %d "
                     "ChainLocators (extractor not allocated — "
                     "PR5 incomplete).", n)
+        # PR7b of ICMS eviction-mode refactor (2026-05-31): process new
+        # waiters ferried from the scheduler. MUST run AFTER
+        # process_locators above so any chain that completed THIS step
+        # has already landed in _completed_chains_lru via the daemon
+        # signal — waiters arriving in the SAME step as completion
+        # then get routed immediately. Reverse order risks a stranded
+        # waiter (chain completes between metadata-ferry-arrival and
+        # this call, waiter sees no completed entry → registers in
+        # _waiters_by_chain, daemon already drained → orphan).
+        if (getattr(self, "_write_mode", "prefill") == "eviction"
+                and getattr(meta, "chain_waiters", None)):
+            try:
+                self.pr7b_ingest_chain_waiters(meta.chain_waiters)
+            except Exception:
+                logger.exception(
+                    "[icms-pr7b] ingest_chain_waiters failed for %d "
+                    "entries — waiters may be stranded; vLLM will "
+                    "timeout WAITING_FOR_REMOTE_KVS",
+                    len(meta.chain_waiters))
         if (getattr(self, "_write_mode", "prefill") == "eviction"
                 and getattr(meta, "scavenger_rids", None)):
             n = len(meta.scavenger_rids)
@@ -616,6 +677,66 @@ class _WorkerStateMixin:
                         "(NOT pushed — chain empty or no groups)",
                         request_id, len(rs.chain) if rs.chain else 0,
                         rs.flushed_local)
+
+        # ──────────────────────────────────────────────────────────────
+        # PR6 of ICMS eviction-mode refactor (2026-05-31): scavenger
+        # fire-and-forget under WRITE_MODE=eviction. Reviewer 3 Option a
+        # (round-DOWN): complete groups still buffered in
+        # _EvictionExtractor get enqueued via the writeback queue with
+        # priority='low'; incomplete groups get DROPPED. Reviewer 1
+        # HIGH #4: capture rs.chain EAGERLY here (engine thread)
+        # because the writeback queue's daemon thread fires the task
+        # closure later, AFTER self._requests.pop has run. Reviewer 1
+        # HIGH #5: pop ALL (rid, *) buffer keys so dead-rid late-
+        # eviction callbacks (which can fire seconds after rid finishes
+        # via BlockLocator snapshot retention) cannot orphan bytes.
+        # Reviewer 1 MEDIUM #7: one-shot guard via
+        # self._scavenger_fired_rids neutralizes the facade.request_finished
+        # + facade.get_finished double-call.
+        #
+        # Reviewer 2 BLOCKER #1: NO _inflight_chains mark, NO is_async
+        # path, NO finished_recving return — those all deferred to PR7
+        # when the real WriteGroup RPC + proper completion mechanism
+        # (KVConnectorOutput.finished_recving keyed on WAITING rids,
+        # NOT FINISHING rids per Reviewer 1 BLOCKER #3) land together.
+        # See docs/icms_env_precedence_matrix_v2.md (PR7 TODO).
+        if (getattr(self, "_write_mode", "prefill") == "eviction"
+                and getattr(self, "_eviction_extractor", None) is not None):
+            _scav_set = self._scavenger_fired_rids
+            if request_id in _scav_set:
+                logger.debug(
+                    "[icms-eviction] scavenger already fired for "
+                    "rid=%s; skipping duplicate (facade get_finished "
+                    "double-call)", request_id)
+            else:
+                _scav_set.add(request_id)
+                _eager_chain = list(rs.chain) if rs.chain else None
+                t_evf = time.perf_counter()
+                try:
+                    n_flushed, n_dropped = (
+                        self._eviction_extractor
+                            .flush_remaining_for_rid(
+                                request_id, _eager_chain))
+                except Exception:
+                    logger.exception(
+                        "[icms-eviction] scavenger flush_remaining_"
+                        "for_rid failed for rid=%s", request_id)
+                    n_flushed, n_dropped = 0, 0
+                ev_us = (time.perf_counter() - t_evf) * 1e6
+                logger.debug(
+                    "[icms-eviction] scavenger flush rid=%s "
+                    "flushed=%d dropped=%d (%.1f us)",
+                    request_id, n_flushed, n_dropped, ev_us)
+                # Soft-assert <10ms wall-time invariant (Reviewer 2
+                # BLOCKER #1). Warning is operator-visible without
+                # log scrape; CI can grep this as a regression canary.
+                if ev_us > 10000.0:
+                    logger.warning(
+                        "[icms-eviction] scavenger flush slow: "
+                        "%.1f us (target <10ms) — investigate "
+                        "writeback queue put_or_drop contention.",
+                        ev_us)
+
         # BUG-N8: sweep _pending_scores and _pending_reuse for this rid.
         # Both maps are {layer_name: {rid: tuple}}, drained per-layer-name.
         # If a layer never fires (request finished mid-stride, layer
@@ -731,6 +852,18 @@ class _WorkerStateMixin:
                 logger.warning(
                     "[icms_diag_score_dump] summaries save failed "
                     "for rid=%s: %s", request_id, _e)
+
+        # PR7a of ICMS eviction-mode refactor (2026-05-31): snapshot
+        # rs.chain into self._chain_snapshots BEFORE we pop the request
+        # state, so eviction callbacks that fire many steps later can
+        # still resolve rid → chain in process_locators. Snapshot is
+        # pruned by age via _maybe_prune_chain_snapshots in on_step_start.
+        # Allocated under both modes; in prefill the snapshot is never
+        # consulted (no eviction extractor). Branch is the same one-line
+        # write either way, so the prefill cost is constant.
+        if rs.chain:
+            self._chain_snapshots[request_id] = (
+                list(rs.chain), int(self._step_counter))
 
         # Now pop the request state and reset prefill_done.
         self._requests.pop(request_id, None)

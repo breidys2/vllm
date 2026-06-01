@@ -78,20 +78,102 @@ class _EvictionExtractor:
         self.groups_dropped_writeback_full: int = 0
         self.orphan_locators_total: int = 0  # PR3 already counts these
         self.pages_at_snapshot_step: int = 0
-        # Lazy: per-(rid, group) allocations only when the first page
-        # for that key arrives. We bound this with a per-rid prune in
-        # PR6's on_request_finished (clear remaining buffers).
+        # PR6 of ICMS eviction-mode refactor (2026-05-31): scavenger
+        # lifecycle counters. NO _rid_priority dict — both reviewers
+        # demanded counter-only telemetry to avoid the lifecycle
+        # duality / leak class that a per-rid priority map would carry.
+        self.groups_flushed_on_finish: int = 0
+        self.groups_dropped_partial_on_finish: int = 0
+        self.scavenger_calls_total: int = 0
+        self.puts_high_total: int = 0
+        self.puts_low_total: int = 0
+        # PR7a: monotonic-gidx push gate. Per-chain (tuple of trie node
+        # ids) → max gidx already pushed. Server's trie.extend requires
+        # the parent chain to exist; pushing gidx=K without 0..K-1 first
+        # would either fail (if extend can't find parent) or fall back
+        # to insert(full_chain) which advertises chain[0..K-1] in the
+        # ledger without their KV → cross-turn fetches return garbage.
+        # Out-of-order group flushes are DROPPED + counted, not
+        # buffered, for PR7a simplicity. A future PR can add buffering
+        # if the dropped rate is non-trivial under eviction pressure.
+        self._chain_max_pushed: dict[tuple, int] = {}
+        self.out_of_order_drops_total: int = 0
+        self.orphan_chain_drops_total: int = 0
+        self.write_group_rpc_failures_total: int = 0
+        self.write_group_rpc_successes_total: int = 0
+
+    def flush_remaining_for_rid(self, rid: str,
+                                chain: "list[int] | None"
+                                ) -> tuple[int, int]:
+        """PR6 scavenger fire-and-forget: Reviewer 3 Option a (round-DOWN).
+
+        Enqueue all COMPLETE buffered groups for `rid` via the writeback
+        queue with priority='low'; DROP any incomplete groups. Also pop
+        every (rid, *) key so dead-rid late-eviction callbacks (which
+        could fire seconds after rid finishes via BlockLocator snapshot
+        retention) cannot orphan bytes in self._buffers (Reviewer 1
+        HIGH #5 fix). Non-blocking: every put_or_drop call goes through
+        the bounded queue's lock for ~microseconds; the heavy work runs
+        on the daemon thread (icms-writeback-tp{N}).
+
+        `chain` is captured by the engine-thread caller BEFORE the
+        worker pops self._requests[rid]; passing it in means the daemon
+        thread never reads-back state that may have already been GC'd
+        (Reviewer 1 HIGH #4 fix).
+
+        Returns (n_flushed, n_dropped).
+        """
+        self.scavenger_calls_total += 1
+        flushed = 0
+        dropped = 0
+        # Capture keys first; we'll mutate _buffers inside the loop.
+        keys = [k for k in self._buffers.keys() if k[0] == rid]
+        for key in keys:
+            buf = self._buffers.pop(key, None)
+            if buf is None:
+                continue
+            _, group_idx = key
+            if buf.is_complete():
+                self._flush_group(rid, group_idx, buf,
+                                  chain=chain, priority='low')
+                flushed += 1
+            else:
+                dropped += 1
+                self.groups_dropped_partial_on_finish += 1
+        self.groups_flushed_on_finish += flushed
+        return flushed, dropped
 
     def _new_buffer(self) -> _GroupBuffer:
         geom = self._worker._geom
         num_kv_layers = int(geom.num_kv_layers)
+        # PR7a fix (2026-05-31): summary_blob is sized by
+        # num_scored_layers, NOT num_kv_layers. The server's
+        # handle_write_group reads `K * num_scored * summary_group_bytes`
+        # bytes of summary then `K * num_kv * kv_group_bytes` bytes of
+        # KV at known offsets (handlers.cc:1241-1247). PR5 stub never
+        # wrote real summary bytes so the wrong sizing was invisible;
+        # PR7a's real RPC ships the over-sized summary, which pushes
+        # the kv_blob_base offset on the server side INTO our summary
+        # region → server reads garbage as KV → kError "WriteGroup
+        # failed" on every flush.
+        #
+        # Matches prefill mode's record_page buffer sizing
+        # (worker_write.py:1458-1462) byte-for-byte.
+        num_scored_layers = int(
+            getattr(geom, "num_scored_layers", num_kv_layers))
         kv_page_bytes = int(geom.kv_page_bytes)
+        kv_group_bytes = int(getattr(
+            geom, "kv_group_bytes",
+            kv_page_bytes * GROUP_PAGES))
         summary_page_bytes = int(geom.summary_page_bytes)
+        summary_group_bytes = int(getattr(
+            geom, "summary_group_bytes",
+            summary_page_bytes * GROUP_PAGES))
         return _GroupBuffer(
             summary_blob=bytearray(
-                num_kv_layers * GROUP_PAGES * summary_page_bytes),
+                num_scored_layers * summary_group_bytes),
             kv_blob=bytearray(
-                num_kv_layers * GROUP_PAGES * kv_page_bytes),
+                num_kv_layers * kv_group_bytes),
             filled=set(),
             num_layers=num_kv_layers,
             pages_in_group=GROUP_PAGES,
@@ -99,70 +181,420 @@ class _EvictionExtractor:
 
     def process_locators(
         self,
-        locators: list[tuple[str, int, int, int]],
+        locators: list[tuple[int, str, int, int, int]],
     ) -> int:
         """Record this step's evicted ChainLocators into per-group
-        buffers; flush any group that becomes complete.
+        buffers; do batched per-layer GPU→CPU memcpy + summary
+        computation; flush any group that becomes complete.
+
+        Tuple shape (PR7a 5-tuple):
+          (block_id, rid, group_idx, page_in_group, snapshot_step)
 
         Returns the count of completed groups flushed this call.
+
+        PR7a of ICMS eviction-mode refactor (2026-05-31):
+        replaces PR5/PR6 stub. The flow:
+
+        1. Stage locators into per-(rid, group) buffers, building a
+           reverse map block_id → list of (buffer, page_in_group)
+           targets so multiple locators sharing a block_id (rare —
+           PR0b's evict_lookup pops, so duplicates only arise if the
+           same block_id appears for different rids in one step) are
+           handled by one gather.
+
+        2. For each KV layer L:
+             a. Gather K and V slices via tensor indexing —
+                `k_cache[block_id_tensor]` produces one batched
+                [N, block_size, num_kv_heads_local, head_dim] tensor.
+                ONE indexed gather per layer per step (replaces the
+                per-page loop that was 10k × 48 = 480k tiny memcpys
+                in plan-review BLOCKER #3).
+             b. TP>1 AllGather to recombine per-rank head shards into
+                full-head bytes — same shape the prefill path writes
+                so eviction-written chains read back correctly via
+                the existing apply path. Routed through the ICMS
+                sep-NCCL group when enabled to avoid colliding with
+                vLLM's forward-pass NCCL on the main TP group.
+             c. .to('cpu') on the writeback CUDA stream (PR4); sync
+                once after the gather so the bytes are safely on host.
+             d. For scored layers: compute per-page (kmin, kmax)
+                summary over the block_size axis, fp16-cast.
+             e. Scatter K||V bytes + summary bytes into each target
+                buffer's blob at the correct offset (matches
+                record_page's offset math).
+
+        3. After all layers, flush any groups that became complete.
+
+        Timing window invariant (Plan-review BLOCKER #1 fix in
+        scheduler.py): drain_eviction_callbacks runs BEFORE
+        build_connector_meta, so locators for blocks freed this step
+        ferry in THIS step's metadata. on_step_start (and thus
+        process_locators) runs in start_load_kv BEFORE the forward
+        pass writes new KV — so reading `kv_cache[block_id]` here
+        returns the OLD owner's K/V bytes, even if vLLM has already
+        reassigned the block to a new rid in this step's allocate.
         """
         if not locators:
             return 0
-        flushed_this_call = 0
-        for (rid, group_idx, page_in_group, snapshot_step) in locators:
+        worker = self._worker
+        # Worker may not be fully ready (geom registered after first
+        # bind_connector_metadata call). Defer until ready.
+        if (not getattr(worker, "_gpu_kv_caches", None)
+                or getattr(worker, "_geom", None) is None):
+            return 0
+
+        geom = worker._geom
+
+        # ── Pass 1: stage locators into buffers + build reverse map. ──
+        # per_buffer_targets[(rid, gidx)] = list of (block_id, page_in_group).
+        # block_id_to_targets[block_id] = list of (buf_key, page_in_group)
+        # so we can scatter one gathered K/V row into multiple buffers
+        # if the same block_id were referenced twice (defensive — the
+        # scheduler's sorted iteration normally guarantees uniqueness).
+        per_buffer_targets: dict[
+            tuple[str, int], list[tuple[int, int]]] = {}
+        block_id_to_targets: dict[
+            int, list[tuple[tuple[str, int], int]]] = {}
+        for (block_id, rid, group_idx, page_in_group, snapshot_step
+             ) in locators:
             self.pages_received += 1
             if snapshot_step != 0:
                 self.pages_at_snapshot_step += 1
             key = (rid, group_idx)
-            buf = self._buffers.get(key)
-            if buf is None:
-                buf = self._new_buffer()
-                self._buffers[key] = buf
-            # PR5 stub: mark the page filled across all KV layers. In
-            # PR6 the loop body will GPU-to-CPU memcpy each layer's
-            # kv_page_bytes slice into buf.kv_blob using the dedicated
-            # writeback CUDA stream (self._worker._writeback_stream).
-            for layer_idx in range(buf.num_layers):
-                buf.filled.add((layer_idx, page_in_group))
+            if key not in self._buffers:
+                self._buffers[key] = self._new_buffer()
+            per_buffer_targets.setdefault(key, []).append(
+                (int(block_id), int(page_in_group)))
+            block_id_to_targets.setdefault(int(block_id), []).append(
+                (key, int(page_in_group)))
+
+        block_id_list = sorted(block_id_to_targets.keys())
+        if not block_id_list:
+            return 0
+
+        # Index tensor for the gather. CPU-side; pytorch handles the
+        # device transfer at the indexing site.
+        block_id_tensor = torch.tensor(block_id_list, dtype=torch.long)
+        bid_to_pos = {bid: i for i, bid in enumerate(block_id_list)}
+
+        tp_size = int(getattr(worker, "_tp_size", 1) or 1)
+        writeback_stream = getattr(worker, "_writeback_stream", None)
+        spb = geom.summary_page_bytes
+        kpb = geom.kv_page_bytes
+        kv_group_bytes = geom.kv_group_bytes
+        summary_group_bytes = geom.summary_group_bytes
+        kv_layout = geom.kv_layout
+        num_kv_layers_total = geom.num_kv_layers
+
+        # ── Pass 2: per-layer gather → memcpy → summary → scatter. ──
+        for layer_name, kv_layer in list(worker._gpu_kv_caches.items()):
+            if kv_layer is None or kv_layer.ndim != 5:
+                continue
+            layer_idx = worker._parse_layer_idx(layer_name)
+            if layer_idx is None or layer_idx >= geom.num_layers:
+                continue
+            if geom.is_sw(layer_idx):
+                # SW layers carry no on-disk KV in the chain.
+                continue
+
+            # K/V layout dispatch (matches prefill extract_and_record).
+            if kv_layer.shape[0] == 2:
+                k_cache = kv_layer[0]
+                v_cache = kv_layer[1]
+            elif kv_layer.shape[1] == 2:
+                k_cache = kv_layer[:, 0]
+                v_cache = kv_layer[:, 1]
+            else:
+                continue
+
+            # Move the index tensor to the same device as kv_cache.
+            bidx = block_id_tensor.to(k_cache.device, non_blocking=True)
+            # Gather: shape [N, block_size, num_kv_heads_local, head_dim].
+            try:
+                if writeback_stream is not None:
+                    with torch.cuda.stream(writeback_stream):
+                        k_gathered = k_cache.index_select(0, bidx).contiguous()
+                        v_gathered = v_cache.index_select(0, bidx).contiguous()
+                else:
+                    k_gathered = k_cache.index_select(0, bidx).contiguous()
+                    v_gathered = v_cache.index_select(0, bidx).contiguous()
+            except Exception:
+                logger.exception(
+                    "[icms-eviction] PR7a per-layer gather failed for "
+                    "layer=%s — skipping; orphan blocks counted",
+                    layer_name)
+                self.orphan_locators_total += len(block_id_list)
+                continue
+
+            # ── TP>1 AllGather to reconstruct full-head bytes. ──
+            # Without this, eviction-mode writes per-rank head shards
+            # while the apply path reads full-head bytes from disk →
+            # incompatible chain bytes → corrupted apply (plan-review
+            # Sharpening A). Routed through the ICMS sep-NCCL group
+            # when enabled to avoid forward-thread NCCL collisions
+            # (mirrors the prefill path's choice).
+            if tp_size > 1:
+                try:
+                    import torch.distributed as dist  # noqa: E402
+                    from vllm.distributed.parallel_state import get_tp_group
+                    tp_group = get_tp_group()
+                    dev_group = (_get_icms_nccl_group()
+                                  or tp_group.device_group)
+                    gk = [torch.empty_like(k_gathered)
+                          for _ in range(tp_size)]
+                    gv = [torch.empty_like(v_gathered)
+                          for _ in range(tp_size)]
+                    if writeback_stream is not None:
+                        with torch.cuda.stream(writeback_stream):
+                            dist.all_gather(gk, k_gathered,
+                                            group=dev_group)
+                            dist.all_gather(gv, v_gathered,
+                                            group=dev_group)
+                            # Concatenate along the head axis (axis 2).
+                            k_full = torch.cat(gk, dim=2)
+                            v_full = torch.cat(gv, dim=2)
+                    else:
+                        dist.all_gather(gk, k_gathered, group=dev_group)
+                        dist.all_gather(gv, v_gathered, group=dev_group)
+                        k_full = torch.cat(gk, dim=2)
+                        v_full = torch.cat(gv, dim=2)
+                except Exception:
+                    logger.exception(
+                        "[icms-eviction] PR7a AllGather failed for "
+                        "layer=%s tp_size=%d — skipping",
+                        layer_name, tp_size)
+                    continue
+            else:
+                k_full = k_gathered
+                v_full = v_gathered
+
+            # ── GPU → CPU async copy + single sync per layer. ──
+            if writeback_stream is not None:
+                with torch.cuda.stream(writeback_stream):
+                    k_cpu = k_full.to('cpu', non_blocking=True)
+                    v_cpu = v_full.to('cpu', non_blocking=True)
+                writeback_stream.synchronize()
+            else:
+                k_cpu = k_full.cpu()
+                v_cpu = v_full.cpu()
+
+            # ── Summary computation for scored layers. ──
+            is_scored = geom.is_scored(layer_idx)
+            if is_scored:
+                keys = k_cpu.to(dtype=torch.float32)
+                # Reshape so reduce-axis is block_size: [N, block_size, key_dim].
+                keys = keys.reshape(keys.shape[0], keys.shape[1], -1)
+                kmins = keys.min(dim=1).values.to(torch.float16)
+                kmaxs = keys.max(dim=1).values.to(torch.float16)
+                scored_rank = geom.scored_rank(layer_idx)
+
+            kv_rank = geom.kv_layer_rank(layer_idx)
+
+            # ── Scatter per-page bytes into each target buffer. ──
+            # k_cpu[pos]: [block_size, num_kv_heads_total, head_dim]
+            # k_bytes_per_page should equal kpb / 2 (since kv = k || v).
+            for block_id, targets in block_id_to_targets.items():
+                pos = bid_to_pos[block_id]
+                k_bytes = (k_cpu[pos].contiguous().view(torch.uint8)
+                            .numpy().tobytes())
+                v_bytes = (v_cpu[pos].contiguous().view(torch.uint8)
+                            .numpy().tobytes())
+                kv_bytes = k_bytes + v_bytes
+                if is_scored:
+                    summary_bytes = (
+                        kmins[pos].numpy().tobytes()
+                        + kmaxs[pos].numpy().tobytes())
+                for (buf_key, page_in_group) in targets:
+                    buf = self._buffers[buf_key]
+                    if kv_layout == KvLayout.LAYER_MAJOR:
+                        k_off = (kv_rank * kv_group_bytes
+                                  + page_in_group * kpb)
+                    else:
+                        k_off = (page_in_group * num_kv_layers_total * kpb
+                                  + kv_rank * kpb)
+                    buf.kv_blob[k_off:k_off + len(kv_bytes)] = kv_bytes
+                    if is_scored:
+                        s_off = (scored_rank * summary_group_bytes
+                                  + page_in_group * spb)
+                        buf.summary_blob[
+                            s_off:s_off + len(summary_bytes)] = summary_bytes
+                    # Mark this (layer_idx, page_in_group) slot filled.
+                    buf.filled.add((int(layer_idx), int(page_in_group)))
+
+        # ── Pass 3: flush any buffers that became complete. ──
+        flushed_this_call = 0
+        for key in list(self._buffers.keys()):
+            buf = self._buffers[key]
             if buf.is_complete():
+                rid, group_idx = key
                 self._flush_group(rid, group_idx, buf)
                 del self._buffers[key]
                 flushed_this_call += 1
         return flushed_this_call
 
     def _flush_group(self, rid: str, group_idx: int,
-                     buf: _GroupBuffer) -> None:
-        """Enqueue a writeback task for one complete group. PR5 task is
-        a stub; PR6 fires the WriteGroup RPC + bumps server-side
-        accounting."""
-        payload_bytes = len(buf.kv_blob) + len(buf.summary_blob)
+                     buf: _GroupBuffer,
+                     chain: "list[int] | None" = None,
+                     priority: str = 'high') -> None:
+        """Enqueue a writeback task for one complete group.
+
+        PR7a of ICMS eviction-mode refactor (2026-05-31): dispatches
+        a real `self._worker._client.write_group(...)` RPC via the
+        writeback queue. Replaces the PR5/PR6 stub closure that only
+        logged.
+
+        Monotonic-gidx gate: only group_idx == _chain_max_pushed + 1
+        is dispatched. Out-of-order groups are dropped + counted (no
+        buffering in PR7a). Already-pushed groups (group_idx <=
+        max_pushed) are idempotent skips. The gate prevents
+        advertising chain[0..K-1] as stored when only chain[K] has
+        the actual bytes on disk (which would corrupt cross-turn
+        fetches).
+
+        Chain resolution priority: explicit `chain` argument (eager
+        capture from scavenger), then `self._worker._chain_for_rid`
+        (live _requests[rid].chain or _chain_snapshots[rid]). None
+        on both → orphan, dropped + counted.
+
+        TP>1: all ranks update _stored_chain_groups symmetrically;
+        only rank 0 dispatches the RPC. Failure asymmetry (rank 0
+        RPC fails, rank>0 still bumps) is a small known risk;
+        production BF2 is reliable enough this hasn't shown up in
+        prefill mode's identical pattern.
+
+        `priority` is observational only — counter increment, no FIFO
+        order change (per PR6 / Reviewer 1 LOW).
+        """
+        # Resolve chain: explicit param wins, else worker lookup.
+        if chain is None or len(chain) == 0:
+            chain = self._worker._chain_for_rid(rid)
+        if chain is None or group_idx >= len(chain):
+            self.orphan_chain_drops_total += 1
+            logger.debug(
+                "[icms-eviction] PR7a orphan chain rid=%s gidx=%d "
+                "(chain=%s)", rid, group_idx,
+                "None" if chain is None else f"len={len(chain)}")
+            return
+
+        # Monotonic-gidx gate.
+        chain_tuple = tuple(chain)
+        cur_max = self._chain_max_pushed.get(chain_tuple, -1)
+        if group_idx <= cur_max:
+            # Already pushed (idempotent skip — e.g., the same chain
+            # is shared across rids and another rid pushed it first).
+            logger.debug(
+                "[icms-eviction] PR7a idempotent-skip rid=%s gidx=%d "
+                "max=%d", rid, group_idx, cur_max)
+            return
+        if group_idx > cur_max + 1:
+            # Out-of-order: drop + count.
+            self.out_of_order_drops_total += 1
+            logger.debug(
+                "[icms-eviction] PR7a out-of-order rid=%s gidx=%d "
+                "expected=%d", rid, group_idx, cur_max + 1)
+            return
+
+        # Capture closure locals BEFORE handing off to daemon thread.
+        # Tuple-of-int for chain; bytes for blobs (frozen copies).
+        worker = self._worker
         rid_local = rid
-        group_local = group_idx
-        size_local = payload_bytes
+        group_local = int(group_idx)
+        parent_chain_local = list(chain[:group_local])
+        new_tail_local = [chain[group_local]]
+        chain_prefix_local = list(chain[:group_local + 1])
+        n_groups_stored_local = int(group_local + 1)
+        # bytes() copy detaches from the bytearray that lives in
+        # self._buffers — important because the buffer dict pops the
+        # entry after _flush_group returns (in process_locators) but
+        # the daemon thread may still be holding the bytes.
+        summary_blob_bytes = bytes(buf.summary_blob)
+        kv_blob_bytes = bytes(buf.kv_blob)
+        payload_bytes = len(kv_blob_bytes) + len(summary_blob_bytes)
+        tp_rank = int(getattr(worker, "_tp_rank", 0) or 0)
+        tp_size = int(getattr(worker, "_tp_size", 1) or 1)
+
+        # Reserve max_pushed slot eagerly so a concurrent flush for
+        # the next gidx sees cur_max=group_local (not the prior
+        # value). The daemon thread completion will keep this as-is.
+        self._chain_max_pushed[chain_tuple] = group_local
 
         def _task():
-            # PR5 stub. PR6 turns this into:
-            #   self._worker._client.write_group(
-            #       chain=chain, group_idx=group_local,
-            #       kv=buf.kv_blob, summary=buf.summary_blob,
-            #       partial=False)
-            # plus per-rid book-keeping (stored_groups update +
-            # stored_chain_queue push).
-            logger.debug(
-                "[icms-eviction] PR5 stub WriteGroup task: "
-                "rid=%s group=%d bytes=%d",
-                rid_local, group_local, size_local)
+            rpc_ok = True
+            if tp_size <= 1 or tp_rank == 0:
+                try:
+                    with worker._rpc_lock:
+                        worker._client.write_group(
+                            parent_chain_local, new_tail_local,
+                            summary_blob_bytes, kv_blob_bytes,
+                            pages_in_group=GROUP_PAGES,
+                        )
+                except Exception:
+                    rpc_ok = False
+                    self.write_group_rpc_failures_total += 1
+                    logger.warning(
+                        "[icms-eviction] PR7a WriteGroup RPC failed "
+                        "for rid=%s gidx=%d (chain_head=%s)",
+                        rid_local, group_local,
+                        parent_chain_local[
+                            :min(4, len(parent_chain_local))],
+                        exc_info=True)
+            if rpc_ok:
+                self.write_group_rpc_successes_total += 1
+                # Advertise stored prefix so NMT can find the chain on
+                # the next request. Both ranks update their per-rank
+                # ledger; rank>0 didn't dispatch but the ledger still
+                # needs to be symmetric for NMT determinism.
+                try:
+                    worker._record_stored_groups(
+                        chain_prefix_local, n_groups_stored_local)
+                    _append_stored_chain_queue(
+                        chain_prefix_local, n_groups_stored_local)
+                except Exception:
+                    logger.exception(
+                        "[icms-eviction] PR7a stored-chain ledger "
+                        "update failed rid=%s gidx=%d",
+                        rid_local, group_local)
+                # PR7b of ICMS eviction-mode refactor (2026-05-31):
+                # if this push completes the chain (gidx is the last
+                # group index), signal the worker so any waiters
+                # registered for this chain get drained into
+                # _pending_finished_recving. get_finished returns
+                # them as finished_recving → vLLM unblocks the
+                # waiter rids from WAITING_FOR_REMOTE_KVS.
+                #
+                # `chain_tuple` here is the FULL producer chain, NOT
+                # the prefix up to gidx — waiters were registered
+                # against the full producer chain in NMT (matched as
+                # a prefix of the waiter's own chain). Signal the
+                # producer chain so waiter set lookup succeeds.
+                if group_local == len(chain_tuple) - 1:
+                    try:
+                        worker.pr7b_signal_chain_completed(chain_tuple)
+                    except Exception:
+                        logger.exception(
+                            "[icms-pr7b] signal_chain_completed "
+                            "failed for chain head=%s",
+                            chain_tuple[:min(4, len(chain_tuple))])
 
-        ok = self._worker._writeback_queue.put_or_drop(
-            rid, payload_bytes, _task)
+        ok = worker._writeback_queue.put_or_drop(
+            rid, payload_bytes, _task, priority=priority)
         if ok:
             self.groups_completed += 1
+            if priority == 'high':
+                self.puts_high_total += 1
+            else:
+                self.puts_low_total += 1
         else:
+            # Queue full — back out the reservation since we won't
+            # actually push this group.
+            if self._chain_max_pushed.get(chain_tuple) == group_local:
+                self._chain_max_pushed[chain_tuple] = cur_max
             self.groups_dropped_writeback_full += 1
             logger.warning(
                 "[icms-eviction] writeback queue FULL — dropping group "
-                "rid=%s group=%d size=%d B (drops_total=%d)",
-                rid, group_idx, payload_bytes,
+                "rid=%s group=%d size=%d B priority=%s "
+                "(drops_total=%d)",
+                rid, group_idx, payload_bytes, priority,
                 self._worker._writeback_queue.drops_total)
 
 
@@ -442,8 +874,33 @@ class _WorkerWritePipelineMixin:
                 snap_caches, snap_meta, snap_rids,
                 memcpy_done_event=memcpy_done)
 
-        self._write_pipeline.submit(_task, tag="wait_for_save",
-                                     rids=snap_rids)
+        # PR6 of ICMS eviction-mode refactor (2026-05-31): under
+        # eviction mode the prefill-style deferred-extract pipeline
+        # must NOT be submitted. Eviction writes are exclusively driven
+        # by the block_pool eviction callback (PR2) → ChainLocator
+        # (PR3) → _EvictionExtractor (PR5) → writeback queue (PR4).
+        # If we also submit the legacy _task here, the partial-flush
+        # loop in on_request_finished
+        # (icms_connector_worker_state.py:553-568) will see
+        # rs.active_group_buffers populated and fire legacy
+        # _flush_group (which performs NCCL allgather + flushed_local
+        # accounting), racing with the eviction extractor and
+        # producing dual-write paths. Reviewer 1 MEDIUM #8 + Reviewer
+        # 2 HIGH #3 + HIGH #13 all demand this gate in PR6 (not PR7).
+        # The prefill branch is BYTE-IDENTICAL — same submit call.
+        if getattr(self, "_write_mode", "prefill") != "eviction":
+            self._write_pipeline.submit(_task, tag="wait_for_save",
+                                         rids=snap_rids)
+        else:
+            # No-op: eviction mode delegates writes to the eviction
+            # extractor. The memcpy_done gate below is also irrelevant
+            # under eviction (no GPU→CPU staging happens here), but
+            # leaving it lets the wait_for_save signature stay
+            # mode-independent — the event is never set under eviction
+            # which is fine because no PR5 code waits on it.
+            logger.debug(
+                "[icms-eviction] wait_for_save: legacy submit skipped "
+                "(eviction mode); writes via _EvictionExtractor.")
 
         # Block the forward thread until the memcpy stage of the task
         # completes. This is the page-safety gate: vLLM cannot free the
@@ -453,7 +910,20 @@ class _WorkerWritePipelineMixin:
         # timeout so a stuck pipeline never permanently hangs the
         # forward thread (the timeout falls back to the legacy "free
         # eagerly" behavior, accepting the corruption risk over a hang).
-        if memcpy_done is not None:
+        #
+        # PR6 of ICMS eviction-mode refactor (2026-05-31): skip the
+        # memcpy_done.wait() under eviction mode too — the event would
+        # NEVER be set because the legacy _task that calls
+        # memcpy_done.set() was gated out above. Under eviction mode,
+        # GPU page safety is enforced differently: vLLM's block_pool
+        # only fires the eviction callback (PR2) AFTER ref_cnt drops
+        # to 0, by which time the request that owned the page is done
+        # with prefill — so the page-safety contract is preserved by
+        # the eviction-source choice in PR2, not by a synchronous
+        # gate here. Without this gate-skip, wait_for_save deadlocks
+        # the engine for ICMS_GATE_MEMCPY_TIMEOUT_S=120s per forward.
+        if memcpy_done is not None and (
+                getattr(self, "_write_mode", "prefill") != "eviction"):
             try:
                 _memcpy_timeout_s = float(os.environ.get(
                     "ICMS_GATE_MEMCPY_TIMEOUT_S", "120.0"))

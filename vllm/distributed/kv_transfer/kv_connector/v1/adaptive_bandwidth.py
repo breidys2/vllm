@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -123,6 +124,11 @@ class AdaptiveBandwidthAllocator:
         # from the slack table so the ratio is well-defined. Default 1 is
         # backward-compat for callers that haven't wired model geometry.
         self._num_layers = max(1, int(num_layers))
+        # Budget floor, env-overridable (default _MIN_BUDGET=0.1). Lets the
+        # bench sweep a different accuracy floor (e.g. 0.2) without a code
+        # fork. Read once at construction.
+        self._min_budget = float(
+            os.environ.get("ICMS_ADAPTIVE_MIN_BUDGET", self._MIN_BUDGET))
         self._active: dict[str, RequestDemand] = {}
         self._lock = threading.Lock()
 
@@ -256,8 +262,8 @@ class AdaptiveBandwidthAllocator:
         # savings (≤5% pages skipped).
         if budget >= self._CEILING_SNAP:
             return 1.0
-        if budget < self._MIN_BUDGET:
-            return self._MIN_BUDGET
+        if budget < self._min_budget:
+            return self._min_budget
         return budget
 
     # ── Storage-side hookup ─────────────────────────────────────────────

@@ -201,6 +201,72 @@ class IcmsConnector(KVConnectorBase_V1):
             # model_geometry which is initialized later in the
             # worker; defer that check to worker_base init.
 
+        # PR7a of ICMS eviction-mode refactor (2026-05-31): drain
+        # timeout is now PER-CHAIN-SIZE derived at shutdown time, not
+        # statically set here. Reviewer 2 HIGH #6: 30s default was too
+        # aggressive for h128k multi-GB writes. The derivation:
+        #
+        #     timeout_s = max(
+        #         floor,
+        #         min(ceiling,
+        #             base + pending_bytes / link_bandwidth_bytes_per_s))
+        #
+        # Where:
+        #   ICMS_EVICTION_DRAIN_TIMEOUT_BASE_S  (default  5.0) — RPC
+        #     overhead floor irrespective of bytes
+        #   ICMS_EVICTION_DRAIN_BW_GB_PER_S     (default 12.0) — assumed
+        #     BF2 RDMA throughput (12 GB/s ≈ NVMe-oF saturation)
+        #   ICMS_EVICTION_DRAIN_TIMEOUT_FLOOR_S (default 10.0)
+        #   ICMS_EVICTION_DRAIN_TIMEOUT_CEILING_S (default 600.0)
+        #
+        # Computed live by _Worker.compute_eviction_drain_timeout_s at
+        # shutdown so the timeout adapts to actual pending bytes.
+        #
+        # The DEPRECATED ICMS_EVICTION_DRAIN_TIMEOUT_S env is still
+        # accepted as a hard override (any value sets timeout exactly)
+        # for backward compat + emergency knob. None means "use the
+        # derived formula." Logs a deprecation warning when set.
+        #
+        # Independent of ICMS_DRAIN_TIMEOUT_S=600s (UNCHANGED) which
+        # still governs the prefill _write_pipeline.drain_rid call in
+        # BOTH modes.
+        _legacy_override = os.environ.get("ICMS_EVICTION_DRAIN_TIMEOUT_S")
+        if _legacy_override is not None:
+            logger.warning(
+                "ICMS_EVICTION_DRAIN_TIMEOUT_S=%s is DEPRECATED (PR7a) — "
+                "the eviction drain timeout is now derived per-chain-size "
+                "at shutdown. Use ICMS_EVICTION_DRAIN_TIMEOUT_BASE_S + "
+                "ICMS_EVICTION_DRAIN_BW_GB_PER_S to tune the formula "
+                "instead. This env still works as a hard override.",
+                _legacy_override)
+            try:
+                self._eviction_drain_timeout_s_override = float(_legacy_override)
+            except ValueError:
+                self._eviction_drain_timeout_s_override = None
+        else:
+            self._eviction_drain_timeout_s_override = None
+        # Cache the derivation-formula parameters at construction.
+        try:
+            self._eviction_drain_timeout_base_s = float(
+                os.environ.get("ICMS_EVICTION_DRAIN_TIMEOUT_BASE_S", "5.0"))
+        except ValueError:
+            self._eviction_drain_timeout_base_s = 5.0
+        try:
+            self._eviction_drain_bw_gb_per_s = float(
+                os.environ.get("ICMS_EVICTION_DRAIN_BW_GB_PER_S", "12.0"))
+        except ValueError:
+            self._eviction_drain_bw_gb_per_s = 12.0
+        try:
+            self._eviction_drain_timeout_floor_s = float(
+                os.environ.get("ICMS_EVICTION_DRAIN_TIMEOUT_FLOOR_S", "10.0"))
+        except ValueError:
+            self._eviction_drain_timeout_floor_s = 10.0
+        try:
+            self._eviction_drain_timeout_ceiling_s = float(
+                os.environ.get("ICMS_EVICTION_DRAIN_TIMEOUT_CEILING_S", "600.0"))
+        except ValueError:
+            self._eviction_drain_timeout_ceiling_s = 600.0
+
         logger.info(
             "IcmsConnector: write_mode=%s (extra=%r env=%r)",
             self._write_mode, _write_mode_extra, _write_mode_env)
@@ -339,6 +405,15 @@ class IcmsConnector(KVConnectorBase_V1):
             # follow-up that introduced the gate didn't propagate the
             # value — fixed here.
             self._worker._max_num_seqs = self._max_num_seqs
+            # PR7a: plumb a back-ref to the facade so the worker can
+            # read the per-chain-size derivation params at shutdown
+            # (avoid duplicating the env-read in two places). Stored
+            # as a private attribute and ONLY read by
+            # _WorkerBase.shutdown's drain-timeout computation. Under
+            # tests that construct _Worker directly without a facade,
+            # the attribute is absent and the worker falls back to a
+            # 30s conservative default.
+            self._worker._facade = self
 
     # ──────────────────────────────────────────────────────────────────
     # Eviction-mode hooks (PR1 scaffold)
@@ -559,7 +634,20 @@ class IcmsConnector(KVConnectorBase_V1):
         if self._worker is not None and finished_req_ids:
             for rid in finished_req_ids:
                 self._worker.on_request_finished(rid)
-        return None, None
+        # PR7b of ICMS eviction-mode refactor (2026-05-31): drain the
+        # worker's _pending_finished_recving set into the returned
+        # finished_recving tuple element. vLLM core's
+        # _update_from_kv_xfer_finished sees these rids in
+        # KVConnectorOutput.finished_recving and moves them out of
+        # WAITING_FOR_REMOTE_KVS (scheduler.py:2052-2060).
+        #
+        # Under prefill mode the set is never populated → returns None.
+        finished_recving: set[str] | None = None
+        if self._worker is not None:
+            drained = self._worker.drain_pending_finished_recving()
+            if drained:
+                finished_recving = drained
+        return None, finished_recving
 
     def shutdown(self):
         if self._worker is not None:
@@ -666,9 +754,55 @@ class IcmsConnector(KVConnectorBase_V1):
             self._sched.on_finished(request.request_id)
             # Drop any undelivered prov alloc snapshot.
             self._sched._prov_alloc.pop(request.request_id, None)
+            # PR7b of ICMS eviction-mode refactor (2026-05-31): clean up
+            # any stale waiter entries for this rid. Critical fix for
+            # Plan-review BLOCKER C: without this, a rid that aborts
+            # while in WAITING_FOR_REMOTE_KVS leaves its waiter entry
+            # in _chain_waiters; a later worker completion signal
+            # would push the aborted rid back into finished_recving,
+            # tripping scheduler.py:2054's `assert req_id in self.requests`
+            # (engine crash). Idempotent on non-waiter rids.
+            self._sched.on_request_finished_pr7b_cleanup(
+                request.request_id)
         # KV-provenance: drop tracker state for this rid (no-op if env off).
         icms_provenance.tracker().clear_request(request.request_id)
         return False, None
+
+    @_instr_timing("update_connector_output")
+    def update_connector_output(self, connector_output) -> None:
+        """PR7b of ICMS eviction-mode refactor (2026-05-31): scheduler-
+        side cleanup of resolved waiters.
+
+        vLLM v1 calls this on the SCHEDULER-role connector with the
+        worker's KVConnectorOutput. We extract `finished_recving` —
+        the set of waiter rids the worker resolved this step — and
+        ack them in _Scheduler so the chain/rid bookkeeping is updated.
+
+        The rids themselves are then processed by vLLM core's
+        `_update_from_kv_xfer_finished` at scheduler.py:2052+: each
+        rid is moved out of WAITING_FOR_REMOTE_KVS for the next
+        scheduling tick.
+
+        Idempotent on missing fields / empty sets / non-eviction mode.
+        Under prefill mode the inflight state is never populated, so
+        this is effectively a no-op.
+        """
+        if self._sched is None:
+            return
+        if connector_output is None:
+            return
+        fr = getattr(connector_output, "finished_recving", None)
+        if not fr:
+            return
+        # `finished_recving` may be a set or list; coerce to set for the
+        # ack helper's signature.
+        rids = set(fr) if not isinstance(fr, set) else fr
+        try:
+            self._sched.on_finished_recving_ack(rids)
+        except Exception:
+            logger.exception(
+                "[icms-pr7b] on_finished_recving_ack failed for "
+                "%d rids", len(rids))
 
     # ══════════════════════════════════════════════════════════════════════
     #  Direct helper API (used by smoke tests, compatible with the old

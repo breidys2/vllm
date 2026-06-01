@@ -319,6 +319,16 @@ class _WorkerBase:
         # (read) know how many context pages were stored by Phase 1 (write),
         # even though they're different vLLM requests.
         self._stored_chain_groups: list[tuple[list[int], int]] = []
+        # PR7a of ICMS eviction-mode refactor (2026-05-31): cross-thread
+        # lock for _stored_chain_groups. Under eviction mode the
+        # writeback daemon thread mutates this list from the WriteGroup
+        # completion callback; the forward thread reads it from
+        # _get_stored_context_groups (NMT match path) and writes from
+        # _drain_pending_flush_queue + legacy prefill paths. Without the
+        # lock, concurrent append + scan in _record_stored_groups loses
+        # updates (Plan-review BLOCKER #2). Under prefill, the lock is
+        # only held by the forward thread → uncontended ~50 ns / call.
+        self._stored_chain_groups_lock: threading.RLock = threading.RLock()
 
         # Timing / debug stats.
         self.stats = IcmsTimingStats(level=stats_level, log_selections=log_selections)
@@ -1041,6 +1051,229 @@ class _WorkerBase:
         else:
             self._eviction_extractor = None
 
+        # PR6 of ICMS eviction-mode refactor (2026-05-31): one-shot
+        # guard set so the facade.request_finished + facade.get_finished
+        # double-call doesn't fire the scavenger flush twice for the
+        # same rid. Allocated under BOTH modes (~56 bytes empty set —
+        # eliminates a None-check branch in on_request_finished); under
+        # prefill the set is allocated but never written.
+        # See icms_connector_worker_state.py:on_request_finished for
+        # the consumer site (Reviewer 1 MEDIUM #7).
+        self._scavenger_fired_rids: set[str] = set()
+
+        # PR7a of ICMS eviction-mode refactor (2026-05-31): chain
+        # snapshots for finished-before-evict resolution. Eviction
+        # callbacks for a rid can fire many steps after the rid
+        # finishes (BlockLocator's snapshot retention bounds this to
+        # max_age_steps). When the worker's process_locators needs
+        # rid → chain for the WriteGroup RPC, self._requests[rid] may
+        # already be gone — so we snapshot rs.chain at
+        # on_request_finished time, keyed by rid, with the finish step.
+        # Pruned by _maybe_prune_chain_snapshots once per step against
+        # ICMS_EVICTION_CHAIN_SNAPSHOT_MAX_AGE_STEPS (default 200,
+        # matching BlockLocator's snapshot prune cadence).
+        #
+        # Allocated under BOTH modes (empty dict ≈ 64 B) so the
+        # eviction-only-write branch in on_request_finished doesn't
+        # need a None-check. Under prefill the dict is never written.
+        self._chain_snapshots: dict[str, tuple[list[int], int]] = {}
+
+        # PR7b of ICMS eviction-mode refactor (2026-05-31): async cross-
+        # turn signal state. All three structures are LOCK-PROTECTED by
+        # self._pr7b_lock because the writeback daemon thread mutates
+        # _completed_chains_lru + _pending_finished_recving on RPC
+        # completion, while the engine/forward thread reads them in
+        # on_step_start and drains _pending_finished_recving in
+        # get_finished. RLock for re-entrant safety (logging callbacks
+        # may take the lock while a logger format string evaluates).
+        #
+        # _waiters_by_chain: chain_tuple → set of waiter rids the
+        #   scheduler ferried via metadata.chain_waiters. Drained by
+        #   the daemon thread when the chain's last group RPC
+        #   succeeds. NOT consulted by get_finished — completed-chain
+        #   waiters are pushed to _pending_finished_recving immediately.
+        #
+        # _completed_chains_lru: OrderedDict of chain_tuple → None,
+        #   tracking chains whose writeback has fully completed (last
+        #   group RPC succeeded). LRU-bounded to ICMS_PR7B_COMPLETED_LRU
+        #   entries (default 4096); when full, the oldest entry is
+        #   evicted via popitem(last=False). Consulted by on_step_start
+        #   when new waiters arrive via metadata — a waiter whose
+        #   chain is already completed gets immediately routed to
+        #   _pending_finished_recving (closes the race where worker
+        #   completes BEFORE scheduler-side waiter ferry arrives).
+        #
+        # _pending_finished_recving: set of rids to return in the next
+        #   get_finished call's finished_recving slot.
+        from collections import OrderedDict
+        self._waiters_by_chain: dict[tuple[int, ...], set[str]] = {}
+        self._completed_chains_lru: OrderedDict[
+            tuple[int, ...], None] = OrderedDict()
+        self._pending_finished_recving: set[str] = set()
+        self._pr7b_lock: threading.RLock = threading.RLock()
+        try:
+            self._pr7b_completed_lru_cap: int = int(
+                os.environ.get("ICMS_PR7B_COMPLETED_LRU", "4096"))
+        except ValueError:
+            self._pr7b_completed_lru_cap = 4096
+        # Telemetry — surfaced in shutdown stats dump.
+        self._pr7b_stats = {
+            "waiters_received_total": 0,
+            "waiters_resolved_immediate_total": 0,  # arrived after completion
+            "waiters_resolved_on_completion_total": 0,  # arrived before
+            "chains_completed_total": 0,
+            "completed_lru_evictions_total": 0,
+        }
+        # Step counter, bumped once per on_step_start. Used by
+        # chain-snapshot prune-by-age. Increment is harmless under
+        # prefill (counter just walks forward, no consumer).
+        self._step_counter: int = 0
+        # Last prune step (so prune fires at most once per K steps).
+        self._last_chain_snapshot_prune_step: int = 0
+        try:
+            self._chain_snapshot_max_age_steps: int = int(
+                os.environ.get(
+                    "ICMS_EVICTION_CHAIN_SNAPSHOT_MAX_AGE_STEPS", "200"))
+        except ValueError:
+            self._chain_snapshot_max_age_steps = 200
+
+    def compute_eviction_drain_timeout_s(self, pending_bytes: int,
+                                          override: "float | None",
+                                          base_s: float,
+                                          bw_gb_per_s: float,
+                                          floor_s: float,
+                                          ceiling_s: float) -> float:
+        """PR7a per-chain-size derivation of drain timeout.
+
+        timeout = max(floor, min(ceiling,
+                                  base + pending_bytes / link_bw_bytes_per_s))
+        with override hard-clamping to a fixed value if set.
+        Returns seconds.
+
+        Reviewer 2 HIGH #6: 30s default was too aggressive for h128k
+        multi-GB writes (e.g., 24 GiB pending @ 12 GB/s = 2s; +5s base
+        = 7s minimum but if h128k unlocks 48 GiB then 9s/etc., still
+        well within ceiling). Floor ensures we don't drop below 10s
+        even for tiny pending.
+        """
+        if override is not None and override > 0.0:
+            return float(override)
+        if bw_gb_per_s <= 0.0:
+            bw_gb_per_s = 12.0
+        bw_bytes_per_s = bw_gb_per_s * (1024.0 ** 3)
+        derived = base_s + float(pending_bytes) / bw_bytes_per_s
+        return max(floor_s, min(ceiling_s, derived))
+
+    def pr7b_ingest_chain_waiters(
+        self, chain_waiters: "list[tuple[tuple[int, ...], list[str]]]"
+    ) -> None:
+        """PR7b: process new waiters ferried from the scheduler.
+
+        Called from worker's on_step_start AFTER process_locators (so
+        chains completed THIS step have already been added to the LRU).
+
+        For each (chain, [waiter_rids]) entry:
+          - If the chain is already in _completed_chains_lru, route the
+            waiter_rids straight to _pending_finished_recving (race
+            window where worker completed BEFORE the scheduler ferried
+            the waiter). Get_finished returns them next call.
+          - Else stash in _waiters_by_chain — the daemon thread will
+            drain on chain completion.
+
+        Lock-protected: contends with the daemon thread's completion
+        handler that mutates the same structures.
+        """
+        if not chain_waiters:
+            return
+        with self._pr7b_lock:
+            for chain_tuple, waiter_rids in chain_waiters:
+                if not chain_tuple or not waiter_rids:
+                    continue
+                self._pr7b_stats[
+                    "waiters_received_total"] += len(waiter_rids)
+                if chain_tuple in self._completed_chains_lru:
+                    # Race: chain completed before this waiter arrived.
+                    # Mark waiter_rids as ready immediately.
+                    self._pending_finished_recving.update(waiter_rids)
+                    self._pr7b_stats[
+                        "waiters_resolved_immediate_total"] += len(
+                            waiter_rids)
+                else:
+                    self._waiters_by_chain.setdefault(
+                        chain_tuple, set()).update(waiter_rids)
+
+    def pr7b_signal_chain_completed(
+        self, chain_tuple: tuple[int, ...]
+    ) -> None:
+        """PR7b: called from the daemon thread's _flush_group task
+        closure on RPC success of the LAST group in the chain
+        (gidx == len(chain) - 1).
+
+        Updates _completed_chains_lru (with bounded eviction) and
+        drains _waiters_by_chain[chain_tuple] into
+        _pending_finished_recving so get_finished returns them.
+
+        Idempotent on re-signaling for the same chain (LRU touch).
+        Lock-protected.
+        """
+        with self._pr7b_lock:
+            # LRU touch / insert.
+            if chain_tuple in self._completed_chains_lru:
+                self._completed_chains_lru.move_to_end(chain_tuple)
+            else:
+                self._completed_chains_lru[chain_tuple] = None
+                self._pr7b_stats["chains_completed_total"] += 1
+                # Bound the LRU.
+                while (len(self._completed_chains_lru)
+                        > self._pr7b_completed_lru_cap):
+                    self._completed_chains_lru.popitem(last=False)
+                    self._pr7b_stats[
+                        "completed_lru_evictions_total"] += 1
+            # Drain any waiters that were already registered.
+            waiters = self._waiters_by_chain.pop(chain_tuple, None)
+            if waiters:
+                self._pending_finished_recving.update(waiters)
+                self._pr7b_stats[
+                    "waiters_resolved_on_completion_total"] += len(
+                        waiters)
+
+    def drain_pending_finished_recving(self) -> "set[str]":
+        """PR7b: called from facade.get_finished on the worker side.
+
+        Snapshots and clears _pending_finished_recving under the lock.
+        The returned set is passed as the second element of
+        get_finished's tuple → KVConnectorOutput.finished_recving →
+        consumed by vLLM core's _update_from_kv_xfer_finished.
+
+        Returns an empty set under prefill mode (set never populated).
+        """
+        with self._pr7b_lock:
+            if not self._pending_finished_recving:
+                return set()
+            drained = self._pending_finished_recving
+            self._pending_finished_recving = set()
+            return drained
+
+    def _chain_for_rid(self, request_id: str):
+        """PR7a: resolve rid → trie chain for the WriteGroup RPC.
+
+        Eviction-mode locators may arrive for a rid whose request state
+        was popped many steps ago. Lookup priority:
+        1. self._requests[rid].chain — live rid still in flight.
+        2. self._chain_snapshots[rid] — finished but within max_age.
+
+        Returns None if neither is available (orphan locator). The
+        caller (extractor _flush_group) MUST handle None by dropping
+        the locator and incrementing a counter — it's the contract.
+        """
+        rs = self._requests.get(request_id)
+        if rs is not None and rs.chain:
+            return rs.chain
+        snap = self._chain_snapshots.get(request_id)
+        if snap is not None:
+            return snap[0]
+        return None
+
     def _rank_chain(self, chain):
         """Pass-through. Trie chains are rank-agnostic at every TP.
 
@@ -1059,25 +1292,157 @@ class _WorkerBase:
     def shutdown(self):
         if self._client is None:
             return
+        # PR6 of ICMS eviction-mode refactor (2026-05-31): bound memory
+        # at long-run-end by clearing the one-shot scavenger guard set.
+        try:
+            getattr(self, "_scavenger_fired_rids", set()).clear()
+        except Exception:
+            pass
+        # PR7a: clear chain snapshots at shutdown.
+        try:
+            getattr(self, "_chain_snapshots", {}).clear()
+        except Exception:
+            pass
+        # PR7b: clear async-signal state at shutdown.
+        try:
+            with self._pr7b_lock:
+                self._waiters_by_chain.clear()
+                self._completed_chains_lru.clear()
+                self._pending_finished_recving.clear()
+        except Exception:
+            pass
         # PR4 of eviction-mode refactor: drain + shutdown the writeback
         # queue (if it was allocated). Under prefill mode this is a
-        # no-op since the queue was never instantiated.
+        # no-op since the queue was never instantiated. Snapshot the
+        # queue's stats BEFORE shutdown so the stats dump below (PR6
+        # telemetry surface) sees the final state — drops_total +
+        # pending_bytes at shutdown are the operator's stuck-BF2
+        # canary per Reviewer 2 HIGH #5.
         wbq = getattr(self, "_writeback_queue", None)
+        _wbq_stats: dict | None = None
         if wbq is not None:
             try:
-                wbq.shutdown(timeout=5.0)
+                _wbq_stats = {
+                    "capacity_bytes": wbq.capacity_bytes,
+                    "pending_bytes_at_shutdown": wbq.pending_bytes,
+                    "puts_total": wbq.puts_total,
+                    "drops_total": wbq.drops_total,
+                    "bytes_put_total": wbq.bytes_put_total,
+                    "puts_high_total": wbq.puts_high_total,
+                    "puts_low_total": wbq.puts_low_total,
+                }
+            except Exception:
+                _wbq_stats = None
+            # PR7a per-chain-size drain timeout. Pulls parameters from
+            # the facade attributes set in __init__ (defaults wired
+            # in icms_connector_facade.py:208ish). Falls back to a
+            # conservative 30s if the facade attributes aren't reachable
+            # (only happens in unit tests that mock worker_base.shutdown).
+            try:
+                _facade_obj = getattr(self, "_facade", None) or self
+                _override = getattr(
+                    _facade_obj,
+                    "_eviction_drain_timeout_s_override", None)
+                _base = getattr(
+                    _facade_obj,
+                    "_eviction_drain_timeout_base_s", 5.0)
+                _bw = getattr(
+                    _facade_obj,
+                    "_eviction_drain_bw_gb_per_s", 12.0)
+                _floor = getattr(
+                    _facade_obj,
+                    "_eviction_drain_timeout_floor_s", 10.0)
+                _ceiling = getattr(
+                    _facade_obj,
+                    "_eviction_drain_timeout_ceiling_s", 600.0)
+                _pending = int(getattr(wbq, "pending_bytes", 0))
+                _timeout_s = self.compute_eviction_drain_timeout_s(
+                    pending_bytes=_pending,
+                    override=_override,
+                    base_s=_base,
+                    bw_gb_per_s=_bw,
+                    floor_s=_floor,
+                    ceiling_s=_ceiling)
+                logger.info(
+                    "[icms-eviction] PR7a derived drain timeout: "
+                    "%.1f s (pending=%d B, base=%.1f, bw=%.1f GB/s, "
+                    "floor=%.1f, ceiling=%.1f, override=%s)",
+                    _timeout_s, _pending, _base, _bw, _floor, _ceiling,
+                    "None" if _override is None else f"{_override:.1f}")
+            except Exception:
+                _timeout_s = 30.0
+                logger.warning(
+                    "[icms-eviction] PR7a drain timeout derivation "
+                    "failed; falling back to 30.0 s",
+                    exc_info=True)
+            try:
+                wbq.shutdown(timeout=_timeout_s)
             except Exception:
                 logger.exception(
                     "[icms-eviction] writeback queue shutdown failed")
             self._writeback_queue = None
+        # PR6: snapshot extractor stats too (for the stats dump below).
+        _evx_stats: dict | None = None
+        evx = getattr(self, "_eviction_extractor", None)
+        if evx is not None:
+            try:
+                _evx_stats = {
+                    "pages_received": evx.pages_received,
+                    "groups_completed": evx.groups_completed,
+                    "groups_dropped_writeback_full": (
+                        evx.groups_dropped_writeback_full),
+                    "scavenger_calls_total": evx.scavenger_calls_total,
+                    "groups_flushed_on_finish": evx.groups_flushed_on_finish,
+                    "groups_dropped_partial_on_finish": (
+                        evx.groups_dropped_partial_on_finish),
+                    "puts_high_total": evx.puts_high_total,
+                    "puts_low_total": evx.puts_low_total,
+                    "pages_at_snapshot_step": evx.pages_at_snapshot_step,
+                    # PR7a counters — monotonic-gidx gate + RPC outcomes.
+                    "out_of_order_drops_total": getattr(
+                        evx, "out_of_order_drops_total", 0),
+                    "orphan_chain_drops_total": getattr(
+                        evx, "orphan_chain_drops_total", 0),
+                    "write_group_rpc_successes_total": getattr(
+                        evx, "write_group_rpc_successes_total", 0),
+                    "write_group_rpc_failures_total": getattr(
+                        evx, "write_group_rpc_failures_total", 0),
+                }
+            except Exception:
+                _evx_stats = None
+        # PR7b worker counters (live on _WorkerBase, not the extractor).
+        _pr7b_worker_stats: dict | None = None
+        try:
+            _pr7b_worker_stats = {
+                **getattr(self, "_pr7b_stats", {}),
+                "waiters_by_chain_live": len(
+                    getattr(self, "_waiters_by_chain", {})),
+                "completed_chains_lru_size": len(
+                    getattr(self, "_completed_chains_lru", {})),
+                "pending_finished_recving_at_shutdown": len(
+                    getattr(self, "_pending_finished_recving", set())),
+            }
+        except Exception:
+            _pr7b_worker_stats = None
         # Dump connector-side timing stats to a file before teardown.
         if self.stats.level > 0 or self.stats.log_selections:
             try:
                 import json
                 pid = os.getpid()
                 stats_path = f"/tmp/icms_connector_stats_{pid}.json"
+                _payload = self.stats.to_dict()
+                # PR6 telemetry surface (PR12 prerequisite per Reviewer
+                # 2 MEDIUM #11). Always present even if extractor/queue
+                # were never allocated (None → omitted via if-guard).
+                if _evx_stats is not None:
+                    _payload["eviction_extractor"] = _evx_stats
+                if _wbq_stats is not None:
+                    _payload["writeback_queue"] = _wbq_stats
+                # PR7b telemetry surface.
+                if _pr7b_worker_stats is not None:
+                    _payload["pr7b_worker"] = _pr7b_worker_stats
                 with open(stats_path, "w") as f:
-                    json.dump(self.stats.to_dict(), f, indent=2)
+                    json.dump(_payload, f, indent=2)
                 logger.info("Connector stats dumped to %s", stats_path)
                 if self.stats.log_selections and self.stats.selections:
                     sel_path = f"/tmp/icms_selections_{pid}.jsonl"

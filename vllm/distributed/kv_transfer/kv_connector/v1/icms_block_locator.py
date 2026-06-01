@@ -157,27 +157,47 @@ class BlockLocator:
 
         prior = self._live.get(block_id)
         if prior is not None and prior.rid != rid:
-            # Block_id reused without going through eviction. This is
-            # legal when the prior rid has finished (its snapshot is in
-            # self._snapshot under this block_id or under a different
-            # key). Increment a stat — alive-rid overlap would be a bug,
-            # but we cannot tell here without external rid-liveness
-            # info, so we just track and let the caller assert.
+            # Block_id reused without going through eviction.
+            #
+            # PR7a of ICMS eviction-mode refactor: move the OLD owner's
+            # entry to snapshot. The reuse case happens when vLLM
+            # LRU-evicts a cached block belonging to rid A and
+            # immediately reassigns it to rid B inside the same
+            # schedule() call (allocate path). The GPU page at this
+            # block_id still holds A's KV bytes — B's forward pass
+            # will overwrite them only LATER in this same step. Until
+            # the eviction callback drains, the inverse map MUST be
+            # able to resolve block_id → A's ChainLocator so the
+            # worker can copy A's KV to BF2 before B's forward
+            # clobbers it. Pre-PR7a this entry was lost (live
+            # overwritten, snapshot dropped), so eviction-mode would
+            # ferry incorrect (B's) provenance + corrupt cross-turn
+            # cache reads for A's chain.
             self.stats["alive_rid_overlap"] += 1
-            # Drop the corresponding rid bookkeeping for the prior rid.
             blocks = self._rid_blocks.get(prior.rid)
             if blocks is not None:
                 blocks.discard(block_id)
                 if not blocks:
                     del self._rid_blocks[prior.rid]
-
-        # Drop snapshot for this block_id — the block now belongs to a
-        # new owner. The snapshot was meaningful only until the block
-        # could be re-evicted-then-resolved; once reassigned, the prior
-        # rid's chain is no longer addressable via this block_id.
-        if block_id in self._snapshot:
-            del self._snapshot[block_id]
-            self.stats["snapshots_dropped_by_reuse"] += 1
+            # snapshot_step=0 distinguishes "live-from-reuse" from
+            # clear_request snapshots (which carry the step number).
+            # Either kind is acceptable to evict_lookup, but tooling
+            # can differentiate via the field.
+            self._snapshot[block_id] = ChainLocator(
+                prior.rid, prior.group_idx, prior.page_in_group, 0)
+            self.stats["snapshots_created_by_reuse"] = (
+                self.stats.get("snapshots_created_by_reuse", 0) + 1)
+        elif block_id in self._snapshot:
+            # Same-rid re-insertion: a no-op semantically. Drop any
+            # stale snapshot entry from a PRIOR (older) reuse cycle
+            # under this same rid (snapshot for rid B becomes stale
+            # if rid B re-inserts; only the most recent live entry
+            # matters going forward, and same-rid implies no chain
+            # mismatch).
+            existing_snap = self._snapshot[block_id]
+            if existing_snap.rid == rid:
+                del self._snapshot[block_id]
+                self.stats["snapshots_dropped_by_reuse"] += 1
 
         self._live[block_id] = ChainLocator(rid, group_idx, page_in_group, 0)
         self._rid_blocks.setdefault(rid, set()).add(block_id)
@@ -186,11 +206,26 @@ class BlockLocator:
     def evict_lookup(self, block_id: int) -> Optional[ChainLocator]:
         """Pop and return the ChainLocator for block_id, or None.
 
-        Consults live map first, then snapshot map. Called by the
-        connector when vLLM's block_pool.free_blocks signals a freed
-        block — the locator is what the connector ferries to BF2 (via
-        the worker bridge in PR3).
+        PR7a of ICMS eviction-mode refactor: consult **snapshot first**.
+
+        When block_id was freed in this same schedule() step and is in
+        the eviction pipeline, the live entry may have been overwritten
+        by a same-step reuse (rid B's allocate claimed the block before
+        drain ran). The OLD owner's locator was moved to snapshot by
+        insert(). The GPU page still holds A's KV until B's forward
+        writes, so the worker needs A's chain — that's what's in
+        snapshot. Returning live's B-entry would ferry B's locator
+        under A's KV bytes (cross-contaminated chain), which would
+        leak B's KV under A's chain on cache hit.
+
+        After draining the snapshot entry, leave any live entry intact
+        — future evictions of this block_id (B's normal eviction lifecycle)
+        will resolve via the standard live → snapshot path.
         """
+        loc = self._snapshot.pop(block_id, None)
+        if loc is not None:
+            self.stats["evict_hits_snapshot"] += 1
+            return loc
         loc = self._live.pop(block_id, None)
         if loc is not None:
             self.stats["evict_hits_live"] += 1
@@ -199,10 +234,6 @@ class BlockLocator:
                 blocks.discard(block_id)
                 if not blocks:
                     del self._rid_blocks[loc.rid]
-            return loc
-        loc = self._snapshot.pop(block_id, None)
-        if loc is not None:
-            self.stats["evict_hits_snapshot"] += 1
             return loc
         self.stats["evict_misses"] += 1
         return None

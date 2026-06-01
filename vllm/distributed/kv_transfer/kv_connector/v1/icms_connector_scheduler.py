@@ -109,6 +109,57 @@ class _Scheduler:
         # demote-on-finish semantics). PR3 only transports them.
         self._pending_scavenger_rids: list[str] = []
 
+        # PR7b of ICMS eviction-mode refactor (2026-05-31): async cross-
+        # turn signal. Sched-side state for the async path.
+        #
+        # _inflight_chains:
+        #   set of chain_tuples currently being written by the worker.
+        #   A chain enters this set at on_kv_blocks_evicted time (first
+        #   eviction locator for the chain ferries → chain is being
+        #   written). It exits when the worker signals completion via
+        #   KVConnectorOutput.finished_recving + update_connector_output.
+        #
+        # _chain_waiters:
+        #   chain_tuple → set of WAITING rids whose NMT matched this
+        #   inflight chain. Populated in get_num_new_matched_tokens
+        #   when a request's prefix lands on an inflight prefix.
+        #   Cleaned up: on completion ack (waiters resolved + chain
+        #   removed); on request_finished (per-rid removal); on
+        #   request abort/cancel (per-rid removal via same hook).
+        #
+        # _rid_chain_map:
+        #   Per-rid reverse index of "which chain is this rid waiting
+        #   on". Maintained alongside _chain_waiters so request_finished
+        #   cleanup is O(1) instead of O(num_chains). NOT keyed by
+        #   chain_tuple — a single waiter waits on AT MOST one chain
+        #   (the longest inflight prefix match found in NMT).
+        #
+        # _new_waiters_this_step:
+        #   Per-step accumulator of (chain_tuple, [waiter_rids])
+        #   drained into IcmsConnectorMetadata.chain_waiters in
+        #   build_meta. Only new waiters this step ferry; the worker
+        #   maintains the persistent _waiters_by_chain.
+        #
+        # _rid_chain_target_cache:
+        #   Per-rid cached target chain tuple — set in NMT when the
+        #   request is registered as a waiter; consulted in
+        #   request_finished cleanup so we don't re-walk inflight
+        #   chains to find which one to remove the rid from.
+        self._inflight_chains: set[tuple[int, ...]] = set()
+        self._chain_waiters: dict[tuple[int, ...], set[str]] = {}
+        self._rid_chain_map: dict[str, tuple[int, ...]] = {}
+        self._new_waiters_this_step: list[
+            tuple[tuple[int, ...], list[str]]] = []
+        # Telemetry counters (PR12 surface).
+        self.pr7b_stats: dict[str, int] = {
+            "inflight_chains_added_total": 0,
+            "inflight_chains_completed_total": 0,
+            "waiters_registered_total": 0,
+            "waiters_aborted_cleanup_total": 0,
+            "nmt_inflight_hits_total": 0,
+            "nmt_inflight_miss_no_prefix_total": 0,
+        }
+
     def on_alloc(self, request: Request, blocks: KVCacheBlocks):
         rid = request.request_id
         if rid in self._chains:
@@ -196,9 +247,16 @@ class _Scheduler:
         block_pool freed this step.
 
         Resolves each block_id via the PR0b BlockLocator and appends a
-        flat tuple (rid, group_idx, page_in_group, snapshot_step) to
-        the pending accumulator. The accumulator is drained into
-        IcmsConnectorMetadata.evicted_chain_locators in build_meta().
+        flat tuple (block_id, rid, group_idx, page_in_group,
+        snapshot_step) to the pending accumulator. The accumulator is
+        drained into IcmsConnectorMetadata.evicted_chain_locators in
+        build_meta().
+
+        PR7a of ICMS eviction-mode refactor (2026-05-31): block_id is
+        now the first element of the tuple so the worker can address
+        self._gpu_kv_caches[layer][block_id] for the actual GPU→CPU
+        memcpy. Pre-PR7a 4-tuple had no block_id (PR5 stub didn't read
+        GPU bytes).
 
         Misses (block_ids with no map entry) are recorded in the
         locator's stats.eviction_orphan_block counter — they're not
@@ -216,8 +274,78 @@ class _Scheduler:
             if loc is None:
                 continue
             self._pending_evicted_locators.append(
-                (loc.rid, loc.group_idx, loc.page_in_group,
-                 loc.snapshot_step))
+                (int(block_id), loc.rid, loc.group_idx,
+                 loc.page_in_group, loc.snapshot_step))
+            # PR7b: mark this rid's chain inflight. First eviction
+            # event for the chain triggers add; subsequent events for
+            # the same chain are no-ops (set semantics). Removed
+            # when worker signals completion via finished_recving →
+            # update_connector_output cleanup.
+            #
+            # Skips when the producer rid's chain isn't on the
+            # scheduler (e.g., rid was preempted+cleared). The chain
+            # was already in flight conceptually, but if we can't
+            # resolve the tuple, we can't honor waiter-based
+            # unblocking — fall through to the existing sync path.
+            producer_chain = self._chains.get(loc.rid)
+            if producer_chain is not None and producer_chain:
+                chain_tuple = tuple(producer_chain)
+                if chain_tuple not in self._inflight_chains:
+                    self._inflight_chains.add(chain_tuple)
+                    self.pr7b_stats[
+                        "inflight_chains_added_total"] += 1
+
+    def on_finished_recving_ack(self, rids: "set[str]") -> None:
+        """PR7b of ICMS eviction-mode refactor (2026-05-31): called from
+        facade.update_connector_output with the set of rids the worker
+        signaled as finished_recving. These rids were waiting on inflight
+        chains; once acknowledged we clean up their entries in
+        _chain_waiters and remove the chain from _inflight_chains if
+        all its waiters drained.
+
+        Idempotent on unknown rids (a rid in finished_recving that
+        wasn't a waiter is a no-op).
+        """
+        if not rids:
+            return
+        for rid in rids:
+            chain = self._rid_chain_map.pop(rid, None)
+            if chain is None:
+                continue
+            waiters = self._chain_waiters.get(chain)
+            if waiters is None:
+                continue
+            waiters.discard(rid)
+            if not waiters:
+                # All waiters drained for this chain; the chain is
+                # fully stored (worker won't signal again for it).
+                self._chain_waiters.pop(chain, None)
+                self._inflight_chains.discard(chain)
+                self.pr7b_stats[
+                    "inflight_chains_completed_total"] += 1
+
+    def on_request_finished_pr7b_cleanup(self, rid: str) -> None:
+        """PR7b cleanup hook (BLOCKER C fix): called from facade
+        request_finished + cancel_request paths. Removes rid from any
+        chain_waiters set so a later worker completion signal can't
+        push a stale rid into finished_recving (which would crash
+        scheduler.py:2054's `assert req_id in self.requests`).
+
+        Idempotent on rids that were never waiters.
+        """
+        chain = self._rid_chain_map.pop(rid, None)
+        if chain is None:
+            return
+        waiters = self._chain_waiters.get(chain)
+        if waiters is not None:
+            waiters.discard(rid)
+            if not waiters:
+                # Don't remove chain from _inflight_chains here — the
+                # producer's chain is still being written; the waiter
+                # just abandoned. Removing would let a future waiter
+                # miss the inflight signal.
+                self._chain_waiters.pop(chain, None)
+            self.pr7b_stats["waiters_aborted_cleanup_total"] += 1
 
     def record_finished_request_for_scavenger(self, rid: str) -> None:
         """Called from on_request_finished (under WRITE_MODE=eviction)
@@ -257,6 +385,13 @@ class _Scheduler:
         if self._pending_scavenger_rids:
             meta.scavenger_rids = self._pending_scavenger_rids
             self._pending_scavenger_rids = []
+        # PR7b: ferry new waiters (registered this step in NMT) to the
+        # worker. Worker stashes them in _waiters_by_chain; daemon
+        # completion drains the waiter set into _pending_finished_recving
+        # which get_finished returns as finished_recving.
+        if self._new_waiters_this_step:
+            meta.chain_waiters = self._new_waiters_this_step
+            self._new_waiters_this_step = []
 
         # Per-step scheduled token counts (req_id → num_tokens this step).
         # 2026-05-07 BUG FIX: vLLM V2's canonical field is
@@ -657,6 +792,73 @@ class _Scheduler:
                 "matched_groups=%d num_computed=%d",
                 rid, len(chain), len(self._stored_chains),
                 matched_groups, num_computed_tokens)
+
+        # PR7b of ICMS eviction-mode refactor (2026-05-31): async cross-
+        # turn signal. If matched_groups==0 but a chain is currently
+        # being written by the worker that B's prefix would match,
+        # register B as a waiter on the longest such inflight prefix
+        # and return is_async=True. vLLM puts B into WAITING_FOR_REMOTE_KVS
+        # until the worker signals completion via finished_recving.
+        #
+        # Walks _inflight_chains in O(|inflight| × |B_chain|) — bounded
+        # by 16-32 inflight chains × ~hundred ints typical, so <1ms.
+        # Larger workloads can switch to a trie if this dominates.
+        #
+        # Reviewer 2 BLOCKER #1 (one scheduler step of latency) is the
+        # accepted residual race window: ~10-50ms vs the 250ms+ of a
+        # 32k-token re-prefill we'd otherwise eat on a miss.
+        # See [[project_pr7b_async_inflight_2026-05-31]] for the design.
+        #
+        # is_async defaults to False (sync load) — the standard
+        # eviction-mode + prefill-mode path. Only flips to True when
+        # PR7b registers B as a waiter on an inflight chain.
+        is_async = False
+        if (matched_groups == 0
+                and self._write_mode == "eviction"
+                and self._inflight_chains):
+            best_match_groups = 0
+            best_inflight_chain: tuple[int, ...] | None = None
+            chain_tuple_B = tuple(chain)
+            for inflight_chain in self._inflight_chains:
+                match_len = 0
+                end = min(len(chain_tuple_B), len(inflight_chain))
+                for i in range(end):
+                    if chain_tuple_B[i] == inflight_chain[i]:
+                        match_len += 1
+                    else:
+                        break
+                if match_len > best_match_groups:
+                    best_match_groups = match_len
+                    best_inflight_chain = inflight_chain
+            if best_match_groups > 0 and best_inflight_chain is not None:
+                # Detach B from any prior chain registration (defensive;
+                # rid normally NMT-evaluated once per lifetime).
+                prev_chain = self._rid_chain_map.get(rid)
+                if (prev_chain is not None
+                        and prev_chain != best_inflight_chain):
+                    prev_set = self._chain_waiters.get(prev_chain)
+                    if prev_set is not None:
+                        prev_set.discard(rid)
+                        if not prev_set:
+                            self._chain_waiters.pop(prev_chain, None)
+                # Register the new waiter mapping.
+                self._chain_waiters.setdefault(
+                    best_inflight_chain, set()).add(rid)
+                self._rid_chain_map[rid] = best_inflight_chain
+                # Stage for ferry to worker via build_meta.
+                self._new_waiters_this_step.append(
+                    (best_inflight_chain, [rid]))
+                matched_groups = best_match_groups
+                is_async = True
+                self.pr7b_stats["waiters_registered_total"] += 1
+                self.pr7b_stats["nmt_inflight_hits_total"] += 1
+                logger.debug(
+                    "[icms-pr7b] async waiter registered: rid=%s "
+                    "matched_groups=%d inflight_chain_len=%d",
+                    rid, best_match_groups, len(best_inflight_chain))
+            else:
+                self.pr7b_stats["nmt_inflight_miss_no_prefix_total"] += 1
+
         if matched_groups == 0:
             return 0, False
 
@@ -693,9 +895,11 @@ class _Scheduler:
                 returned=(int(ext_tokens), False),
                 prompt_len=int(total_prompt),
             )
-        # Synchronous loading (False): the worker fills blocks during
-        # the forward pass via wait_for_layer_load.
-        return ext_tokens, False
+        # PR7b: pass through is_async — True only when the request is
+        # waiting on an inflight chain that needs to complete. False
+        # for the normal synchronous load (worker fills blocks during
+        # the forward pass via wait_for_layer_load).
+        return ext_tokens, is_async
 
     def on_finished_record_stored(self, request: Request) -> None:
         """Record this request's chain into the scheduler-side prefix
