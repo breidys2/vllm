@@ -361,6 +361,7 @@ class IcmsConnector(KVConnectorBase_V1):
 
         if role == KVConnectorRole.SCHEDULER:
             self._sched = _Scheduler(vllm_config)
+            self._sched._write_mode = self._write_mode
         elif role == KVConnectorRole.WORKER:
             # Extract num_q_heads from model config for FA3 scheduling.
             num_q_heads = getattr(

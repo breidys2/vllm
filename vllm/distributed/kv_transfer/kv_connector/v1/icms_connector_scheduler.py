@@ -43,6 +43,11 @@ class _Scheduler:
 
     def __init__(self, vllm_config):
         self._vllm_config = vllm_config
+        # Facade overrides this after construction (single source of truth
+        # for write_mode parsing lives in IcmsConnector.__init__). Default
+        # keeps PR7b inflight-walk dormant when facade-less unit tests
+        # instantiate _Scheduler directly.
+        self._write_mode: str = "prefill"
         # 2026-05-26: snapshot vLLM's prefix-cache flag so
         # get_num_new_matched_tokens can short-circuit when prefix
         # caching is OFF and the model has unscored (SW) layers — see
