@@ -388,6 +388,47 @@ class _WorkerStateMixin:
             rs = self._requests.setdefault(rid, _RequestState(request_id=rid))
             rs.block_ids = bids
 
+        # 2026-05-31 prefill-time local_mask seed (ICMS_LOCAL_MASK_FROM_L1=1).
+        # vLLM's prefix cache returns block IDs for a contiguous head of the
+        # prompt (`prov_local_cached_tokens`). Those head pages already hold
+        # real KV on the GPU; scored-layer Score doesn't need to pick them
+        # in its top-K. Seeding rs.fetched_pages[layer]={0..k-1} for every
+        # scored layer makes the existing _pack_fetch_bitmap path emit the
+        # kScoreFlagDecodeFilter bitmap during prefill, so BF2 masks those
+        # pages to -INF and the K picks come from the cold tail (which is
+        # what bucket-B-style workloads need to exercise). Empty unless the
+        # env opts in, so prefill behavior stays byte-identical by default.
+        if os.environ.get("ICMS_LOCAL_MASK_FROM_L1", "0") == "1":
+            geom = getattr(self, "_geom", None)
+            for rid, n_local in meta.prov_local_cached_tokens.items():
+                if not n_local:
+                    continue
+                rs = self._requests.setdefault(rid,
+                                               _RequestState(request_id=rid))
+                k_local = int(n_local) // int(PAGE_TOKENS)
+                if k_local <= 0:
+                    continue
+                seed = set(range(k_local))
+                if geom is not None and geom.scored_layers_mask != 0:
+                    for L in range(geom.num_layers):
+                        if not geom.is_scored(L):
+                            continue
+                        existing = rs.fetched_pages.setdefault(L, set())
+                        existing |= seed
+                else:
+                    # Uniform model (every layer scored). Seed all layers.
+                    n_layers = (int(getattr(geom, "num_layers", 0))
+                                if geom is not None else 0)
+                    for L in range(n_layers):
+                        existing = rs.fetched_pages.setdefault(L, set())
+                        existing |= seed
+                if os.environ.get("ICMS_DIAG_BITMAP_GROWTH", "0") == "1":
+                    logger.info(
+                        "[local-mask-seed] rid=%s n_local_tokens=%d "
+                        "k_local_pages=%d layers_seeded=%d",
+                        rid, int(n_local), k_local,
+                        len(rs.fetched_pages))
+
         # 2026-05-28 v2: once-per-step TP-allreduce-MAX of
         # effective_groups, cached on rs.eff_groups_synced. Iterates
         # meta.new_chains (scheduler-symmetric set; same dict-insertion

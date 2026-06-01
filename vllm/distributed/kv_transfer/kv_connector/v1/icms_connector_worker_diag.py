@@ -73,7 +73,7 @@ class _WorkerDiagMixin:
             first_to_fetch_ms = (t_fetch - t_first) * 1e3
             fetch_to_save_ms = (t_save_enter - t_fetch) * 1e3
             total_ms = (t_save_enter - t_step) * 1e3
-            logger.debug(
+            logger.info(
                 "[ttft-breakdown] rid=%s total=%.1fms "
                 "step_to_first_layer=%.1fms first_to_fetch_done=%.1fms "
                 "fetch_to_wait_for_save=%.1fms | "

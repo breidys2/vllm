@@ -1357,9 +1357,18 @@ class _WorkerScoringMixin:
             # Empty bytes preserves prefill behavior (server's flag bit
             # stays 0). During decode this masks already-fetched page
             # IDs so they fall out of top-k server-side.
+            # 2026-05-31 (ICMS_LOCAL_MASK_FROM_L1=1): also emit the
+            # bitmap during prefill when worker_state.on_step_start
+            # seeded `already_fetched` from `prov_local_cached_tokens`.
+            # Lets BF2 mask the vLLM-L1-cached head pages to -INF so
+            # the K picks land in the cold tail (bucket-B scenarios).
+            _allow_prefill_bitmap = (
+                os.environ.get("ICMS_LOCAL_MASK_FROM_L1", "0") == "1"
+            )
             fetch_bitmap = (
                 _pack_fetch_bitmap(already_fetched, total_pages)
-                if is_decode and already_fetched else b""
+                if ((is_decode or _allow_prefill_bitmap) and already_fetched)
+                else b""
             )
             # 2026-05-19 BITMAP-WIRE DIAG: verify bitmap is actually being sent
             # to server (non-empty bytes + popcount == len(already_fetched)).
