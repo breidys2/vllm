@@ -130,6 +130,15 @@ class IcmsConnectorMetadata(KVConnectorMetadata):
     # Format: list[ (chain_tuple, [waiter_rid_1, waiter_rid_2, ...]) ]
     chain_waiters: list[tuple[tuple[int, ...], list[str]]] = field(
         default_factory=list)
+    # PR7c (2026-06-01 hard fix for sched.py:2059): rids the scheduler
+    # detached from a previous chain registration in get_num_new_matched_tokens
+    # (e.g., re-NMT moved a rid to a different inflight chain). The
+    # worker must drop these rids from `_waiters_by_chain` so the OLD
+    # chain's eventual completion doesn't drag the (now non-waiter)
+    # rid into _pending_finished_recving — which would trigger the
+    # scheduler.py:2059 assert (rid's status != WAITING_FOR_REMOTE_KVS
+    # and != is_finished).
+    detached_waiter_rids: list[str] = field(default_factory=list)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

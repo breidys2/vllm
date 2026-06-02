@@ -1360,6 +1360,62 @@ class _WorkerBase:
                     "waiters_resolved_on_completion_total"] += len(
                         waiters)
 
+    def pr7b_drop_waiters(self, rids) -> int:
+        """PR7c (2026-06-01 hard fix for sched.py:2059): remove `rids`
+        from both `_pending_finished_recving` and from every entry in
+        `_waiters_by_chain`. Returns the count of (rid, chain) waiter
+        entries dropped.
+
+        Called from TWO lifecycle paths:
+          1. handle_preemptions(preempted_req_ids) — vLLM's v1 worker
+             invokes this every step that preempts requests
+             (gpu/kv_connector.py:67). Without this hook, preempted
+             rids stay in _waiters_by_chain; when the chain later
+             completes, the daemon drains them into
+             _pending_finished_recving; get_finished emits them;
+             vLLM scheduler asserts (sched.py:2059) because the rid's
+             status is PREEMPTED, not WAITING_FOR_REMOTE_KVS and not
+             is_finished. Crash class observed at 32K-ctx + sustained
+             eviction load on 2026-06-01.
+          2. on_request_finished(rid) — if a request finishes (truly
+             done or aborted) while still registered as a waiter on
+             an unfinished producer chain, the chain's eventual
+             completion would re-signal it after the rid is gone from
+             self._requests → vLLM crashes.
+
+        Idempotent: unknown rids are a no-op. Empty chain sets are
+        pruned to keep the dict bounded.
+        """
+        rid_set = set(rids) if rids else set()
+        if not rid_set:
+            return 0
+        dropped = 0
+        with self._pr7b_lock:
+            # From _pending_finished_recving (already-resolved waiters).
+            for r in list(rid_set):
+                if r in self._pending_finished_recving:
+                    self._pending_finished_recving.discard(r)
+                    dropped += 1
+            # From _waiters_by_chain (pending waiters). Iterate by chain
+            # so we can prune empty entries without rebuilding dict.
+            for chain_tuple in list(self._waiters_by_chain.keys()):
+                waiter_set = self._waiters_by_chain[chain_tuple]
+                hit = waiter_set & rid_set
+                if hit:
+                    waiter_set -= hit
+                    dropped += len(hit)
+                    if not waiter_set:
+                        del self._waiters_by_chain[chain_tuple]
+            # Telemetry.
+            self._pr7b_stats["waiters_dropped_total"] = (
+                self._pr7b_stats.get("waiters_dropped_total", 0) + dropped)
+        if dropped:
+            logger.debug(
+                "[pr7c] dropped %d waiter entries for %d rids "
+                "(preempt/finished cleanup)",
+                dropped, len(rid_set))
+        return dropped
+
     def drain_pending_finished_recving(self) -> "set[str]":
         """PR7b: called from facade.get_finished on the worker side.
 

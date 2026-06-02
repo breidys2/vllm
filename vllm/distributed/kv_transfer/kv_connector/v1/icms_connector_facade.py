@@ -475,6 +475,35 @@ class IcmsConnector(KVConnectorBase_V1):
         if self._worker is not None:
             self._worker.set_input_batch_req_ids(req_ids)
 
+    def handle_preemptions(self, preempted_req_ids):
+        """PR7c (2026-06-01 hard fix for sched.py:2059).
+
+        vLLM v1's gpu/kv_connector.py:67 calls this on the worker side
+        every step that preempted at least one request (the set is
+        passed in scheduler_output.preempted_req_ids). The fix: drop
+        the preempted rids from our waiter structures so a chain
+        completion that fires AFTER preemption doesn't push the
+        preempted rid into _pending_finished_recving (which would
+        trigger the scheduler assert at sched.py:2059 — the rid's
+        status is PREEMPTED, not WAITING_FOR_REMOTE_KVS and not
+        is_finished, so the assert at line 2059 fires + EngineCore
+        dies).
+
+        Observed at 32K-ctx + qps=0.5 (system saturation) on
+        2026-06-01: 24/32 measurement requests cancelled mid-fetch;
+        vLLM EngineCore died with AssertionError on the second batch.
+        """
+        if self._worker is None or not preempted_req_ids:
+            return
+        try:
+            self._worker.pr7b_drop_waiters(preempted_req_ids)
+        except Exception:
+            logger.exception(
+                "[pr7c] handle_preemptions: pr7b_drop_waiters failed "
+                "(rids=%s); continuing — next chain completion may "
+                "signal a stale waiter and crash the scheduler",
+                list(preempted_req_ids)[:5])
+
     @_instr_timing("start_load_kv")
     def start_load_kv(self, forward_context: ForwardContext, **kwargs) -> None:
         """Stash attn_metadata from the forward context and drain metadata."""

@@ -198,6 +198,32 @@ class _WorkerStateMixin:
                     "entries — waiters may be stranded; vLLM will "
                     "timeout WAITING_FOR_REMOTE_KVS",
                     len(meta.chain_waiters))
+        # PR7c (2026-06-01 hard fix for sched.py:2059): drain detachments.
+        # The scheduler signals when a rid was re-NMT'd onto a different
+        # inflight chain. The OLD chain's _waiters_by_chain still has
+        # the rid, and without this drop, the OLD chain's completion
+        # would push the rid into _pending_finished_recving even though
+        # the rid is now waiting on a DIFFERENT chain (status either
+        # WAITING_FOR_REMOTE_KVS via the new chain, or already
+        # advanced). The vLLM scheduler assert at sched.py:2059 then
+        # fires on the misrouted signal. MUST run AFTER
+        # pr7b_ingest_chain_waiters above so the NEW chain registration
+        # is in place before the OLD one is detached.
+        if (getattr(self, "_write_mode", "prefill") == "eviction"
+                and getattr(meta, "detached_waiter_rids", None)):
+            try:
+                n = self.pr7b_drop_waiters(meta.detached_waiter_rids)
+                if n > 0:
+                    logger.debug(
+                        "[icms-pr7c] dropped %d stale waiter entries "
+                        "for %d detached rids",
+                        n, len(meta.detached_waiter_rids))
+            except Exception:
+                logger.exception(
+                    "[icms-pr7c] drop_waiters failed for %d detached "
+                    "rids — old-chain completion may still emit stale "
+                    "finished_recving",
+                    len(meta.detached_waiter_rids))
         if (getattr(self, "_write_mode", "prefill") == "eviction"
                 and getattr(meta, "scavenger_rids", None)):
             n = len(meta.scavenger_rids)
@@ -629,6 +655,21 @@ class _WorkerStateMixin:
             logger.info(
                 "on_request_finished: write-pipeline drain_rid(%s) took %.1f ms",
                 request_id, drain_us / 1000.0)
+
+        # PR7c (2026-06-01 hard fix for sched.py:2059): drop this rid
+        # from waiter structures so a chain that completes AFTER the
+        # request has finished doesn't push the dead rid into
+        # _pending_finished_recving (which would cascade to the vLLM
+        # scheduler assert). Idempotent on unknown rids — safe to call
+        # unconditionally before the rs lookup below.
+        try:
+            self.pr7b_drop_waiters({request_id})
+        except Exception:
+            # Defensive: never let waiter cleanup fail the finish path.
+            logger.exception(
+                "[pr7c] pr7b_drop_waiters failed for rid=%s "
+                "(continuing); next chain completion may signal a "
+                "stale waiter", request_id)
 
         rs = self._requests.get(request_id)
         if rs is None:

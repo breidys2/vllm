@@ -153,6 +153,11 @@ class _Scheduler:
         self._inflight_chains: set[tuple[int, ...]] = set()
         self._chain_waiters: dict[tuple[int, ...], set[str]] = {}
         self._rid_chain_map: dict[str, tuple[int, ...]] = {}
+        # PR7c (2026-06-01): rids detached from prev_chain in NMT.
+        # Cleared each step in build_meta after the ferry. Kept as a
+        # list (not set) for consistency with chain_waiters' pickling
+        # contract — workers receive insertion order.
+        self._new_detached_waiter_rids_this_step: list[str] = []
         self._new_waiters_this_step: list[
             tuple[tuple[int, ...], list[str]]] = []
         # Telemetry counters (PR12 surface).
@@ -397,6 +402,14 @@ class _Scheduler:
         if self._new_waiters_this_step:
             meta.chain_waiters = self._new_waiters_this_step
             self._new_waiters_this_step = []
+        # PR7c (2026-06-01): ferry detachments — rids that the scheduler
+        # re-registered on a different chain this step. Worker drops
+        # them from its `_waiters_by_chain` so the prev chain's
+        # eventual completion doesn't drag them in.
+        if self._new_detached_waiter_rids_this_step:
+            meta.detached_waiter_rids = (
+                self._new_detached_waiter_rids_this_step)
+            self._new_detached_waiter_rids_this_step = []
 
         # Per-step scheduled token counts (req_id → num_tokens this step).
         # 2026-05-07 BUG FIX: vLLM V2's canonical field is
@@ -846,6 +859,14 @@ class _Scheduler:
                         prev_set.discard(rid)
                         if not prev_set:
                             self._chain_waiters.pop(prev_chain, None)
+                    # PR7c (2026-06-01 hard fix for sched.py:2059):
+                    # ferry the detachment to the worker so it can drop
+                    # the rid from its `_waiters_by_chain[prev_chain]`.
+                    # Without this, prev_chain's eventual completion
+                    # would drag the rid (now waiting on a DIFFERENT
+                    # chain) into _pending_finished_recving and crash
+                    # the vLLM scheduler. Idempotent on the worker side.
+                    self._new_detached_waiter_rids_this_step.append(rid)
                 # Register the new waiter mapping.
                 self._chain_waiters.setdefault(
                     best_inflight_chain, set()).add(rid)
