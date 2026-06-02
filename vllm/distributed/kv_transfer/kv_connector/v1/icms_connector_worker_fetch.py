@@ -776,6 +776,22 @@ class _WorkerFetchApplyMixin:
                 and os.environ.get("ICMS_DECODE_APPLY") == "0"
                 and self._prefill_done):
             return
+        # 2026-06-01 true post-flip bypass for mode (c) (DECODE_APPLY=1).
+        # Once every active rs is dense_mode, the ONLY work the slow path
+        # below does for this layer is `icms_fetch_state.clear()` to flush a
+        # possibly-stale set_active(trimmed bt) — see the all-dense block at
+        # ~L1000. That clear is a global dict .clear() (~µs) and idempotent,
+        # so we do exactly it and early-return, skipping the per-layer
+        # lock + _pending_scores pop + INSTR/diag traversal that otherwise
+        # ran ×48 layers × every decode iter post-flip. That traversal was
+        # the ~1.3 ms/token connector-hook tax leaving mode (c) decode
+        # slower than the connector-free FR baseline. DECODE_APPLY=0 (mode d)
+        # is handled by the fast path above; this targets DECODE_APPLY=1.
+        if (self._cached_all_dense and self._prefill_done
+                and os.environ.get("ICMS_DECODE_APPLY") != "0"):
+            from vllm.v1.attention import icms_fetch_state
+            icms_fetch_state.clear()
+            return
         # 2026-05-09: with a non-zero scored_layers_mask, non-scored layers
         # never had Score fired (gated in on_layer_score) so _pending_scores
         # has nothing for them. But the prior scored layer's set_active()

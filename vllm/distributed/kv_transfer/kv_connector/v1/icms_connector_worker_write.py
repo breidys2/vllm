@@ -101,6 +101,17 @@ class _EvictionExtractor:
         self.orphan_chain_drops_total: int = 0
         self.write_group_rpc_failures_total: int = 0
         self.write_group_rpc_successes_total: int = 0
+        # Landmine #2 fix (2026-06-01): protect `self._buffers` against
+        # the cross-thread access that DEFER_CPU mode introduces.
+        # Forward thread does pass-1 staging (write); writeback daemon
+        # does pass-2 CPU finalize (write) + pass-3 flush (read+pop).
+        # RLock because _flush_group → _record_stored_groups can
+        # re-enter via the same code path.
+        self._buffers_lock = threading.RLock()
+        # Counters for the new code paths (surface in shutdown dump):
+        self.finalize_inline_count: int = 0      # legacy + SINGLE_SYNC
+        self.finalize_deferred_count: int = 0    # DEFER_CPU submitted
+        self.finalize_submit_failures_total: int = 0  # queue overflow
 
     def flush_remaining_for_rid(self, rid: str,
                                 chain: "list[int] | None"
@@ -233,6 +244,20 @@ class _EvictionExtractor:
         pass writes new KV — so reading `kv_cache[block_id]` here
         returns the OLD owner's K/V bytes, even if vLLM has already
         reassigned the block to a new rid in this step's allocate.
+
+        Landmine #2 fix (2026-06-01): two independent optimizations,
+        gated and default-OFF (byte-identical):
+          • ICMS_EVICTION_SINGLE_SYNC=1 — schedule all per-layer GPU
+            ops first, sync the writeback stream ONCE at the end
+            instead of N times. Still on forward thread but layers
+            can overlap on the stream → ~Nx fewer sync points.
+          • ICMS_EVICTION_DEFER_CPU=1 — implies SINGLE_SYNC; also
+            moves the CPU summary + scatter + flush to the writeback
+            daemon. Forward thread schedules GPU work, records a
+            CUDA event, queues `main_stream.wait_event(event)` (no
+            CPU sync), submits a daemon closure, returns. Cross-
+            stream safety: main stream's NEXT kernel waits for our
+            gather to complete before vLLM can reassign blocks.
         """
         if not locators:
             return 0
@@ -243,14 +268,56 @@ class _EvictionExtractor:
                 or getattr(worker, "_geom", None) is None):
             return 0
 
-        geom = worker._geom
+        defer_cpu = (
+            os.environ.get("ICMS_EVICTION_DEFER_CPU", "0") == "1")
+        single_sync = (
+            defer_cpu
+            or os.environ.get("ICMS_EVICTION_SINGLE_SYNC", "0") == "1")
 
-        # ── Pass 1: stage locators into buffers + build reverse map. ──
-        # per_buffer_targets[(rid, gidx)] = list of (block_id, page_in_group).
-        # block_id_to_targets[block_id] = list of (buf_key, page_in_group)
-        # so we can scatter one gathered K/V row into multiple buffers
-        # if the same block_id were referenced twice (defensive — the
-        # scheduler's sorted iteration normally guarantees uniqueness).
+        # Pass 1: forward thread, CPU bookkeeping (cheap).
+        staged = self._stage_buffers(locators)
+        if staged is None:
+            return 0
+
+        # Pass 2 GPU: per-layer gather + AllGather + .to('cpu').
+        # In legacy mode each layer syncs the writeback stream before
+        # the next iteration so the CPU summary below sees fresh bytes.
+        # In SINGLE_SYNC / DEFER_CPU modes the per-layer sync is
+        # skipped; the caller handles the final sync (or wait_event).
+        per_layer = self._schedule_gpu_per_layer(
+            staged, per_layer_sync=not single_sync)
+
+        if defer_cpu:
+            # Off the forward thread entirely.
+            self._submit_finalize_to_daemon(per_layer, staged)
+            self.finalize_deferred_count += 1
+            return 0  # daemon flushes asynchronously; caller doesn't see it
+
+        if single_sync:
+            # Replace N per-layer syncs with one at the end.
+            ws = getattr(worker, "_writeback_stream", None)
+            if ws is not None:
+                ws.synchronize()
+
+        # Inline finalize (legacy and SINGLE_SYNC paths).
+        with self._buffers_lock:
+            self._finalize_cpu_per_layer(per_layer, staged)
+            self.finalize_inline_count += 1
+            return self._flush_completed_buffers()
+
+    # ──────────────────── helpers (landmine #2 refactor) ──────────
+
+    def _stage_buffers(self, locators):
+        """Pass 1: stage locators → per-(rid, gidx) buffers + reverse
+        map. Returns a dict-of-dicts shaped staged record, or None
+        when no work to do.
+
+        Forward thread only (cheap CPU bookkeeping). Mutates
+        self._buffers — caller takes `_buffers_lock` if running
+        from a thread other than the forward thread (DEFER_CPU
+        daemon path takes the lock only at finalize time; this
+        method is always called from the forward thread).
+        """
         per_buffer_targets: dict[
             tuple[str, int], list[tuple[int, int]]] = {}
         block_id_to_targets: dict[
@@ -261,8 +328,9 @@ class _EvictionExtractor:
             if snapshot_step != 0:
                 self.pages_at_snapshot_step += 1
             key = (rid, group_idx)
-            if key not in self._buffers:
-                self._buffers[key] = self._new_buffer()
+            with self._buffers_lock:
+                if key not in self._buffers:
+                    self._buffers[key] = self._new_buffer()
             per_buffer_targets.setdefault(key, []).append(
                 (int(block_id), int(page_in_group)))
             block_id_to_targets.setdefault(int(block_id), []).append(
@@ -270,23 +338,40 @@ class _EvictionExtractor:
 
         block_id_list = sorted(block_id_to_targets.keys())
         if not block_id_list:
-            return 0
+            return None
 
-        # Index tensor for the gather. CPU-side; pytorch handles the
-        # device transfer at the indexing site.
+        return {
+            "per_buffer_targets": per_buffer_targets,
+            "block_id_to_targets": block_id_to_targets,
+            "block_id_list": block_id_list,
+            "bid_to_pos": {bid: i for i, bid in enumerate(block_id_list)},
+        }
+
+    def _schedule_gpu_per_layer(self, staged, *, per_layer_sync: bool):
+        """Pass 2 GPU: per-layer index_select + (TP>1 AllGather) +
+        .to('cpu'). Returns a list of per-layer state tuples that the
+        CPU finalize step consumes.
+
+        When `per_layer_sync=False` the writeback stream is NOT
+        synchronized between layers — caller must either synchronize
+        once at the end (SINGLE_SYNC mode) or rely on a CUDA event +
+        wait_event for cross-stream coherence (DEFER_CPU mode).
+
+        Tuple shape: (layer_idx, k_cpu, v_cpu, is_scored, kv_rank,
+                      scored_rank_or_None)
+        k_cpu/v_cpu are CPU tensors (host memory). When the stream is
+        a real CUDA stream and per_layer_sync=False, the host memory
+        is NOT valid until the corresponding event fires — caller
+        must enforce ordering.
+        """
+        worker = self._worker
+        geom = worker._geom
+        block_id_list = staged["block_id_list"]
         block_id_tensor = torch.tensor(block_id_list, dtype=torch.long)
-        bid_to_pos = {bid: i for i, bid in enumerate(block_id_list)}
-
         tp_size = int(getattr(worker, "_tp_size", 1) or 1)
         writeback_stream = getattr(worker, "_writeback_stream", None)
-        spb = geom.summary_page_bytes
-        kpb = geom.kv_page_bytes
-        kv_group_bytes = geom.kv_group_bytes
-        summary_group_bytes = geom.summary_group_bytes
-        kv_layout = geom.kv_layout
-        num_kv_layers_total = geom.num_kv_layers
 
-        # ── Pass 2: per-layer gather → memcpy → summary → scatter. ──
+        per_layer_state: list[tuple] = []
         for layer_name, kv_layer in list(worker._gpu_kv_caches.items()):
             if kv_layer is None or kv_layer.ndim != 5:
                 continue
@@ -307,9 +392,7 @@ class _EvictionExtractor:
             else:
                 continue
 
-            # Move the index tensor to the same device as kv_cache.
             bidx = block_id_tensor.to(k_cache.device, non_blocking=True)
-            # Gather: shape [N, block_size, num_kv_heads_local, head_dim].
             try:
                 if writeback_stream is not None:
                     with torch.cuda.stream(writeback_stream):
@@ -327,12 +410,6 @@ class _EvictionExtractor:
                 continue
 
             # ── TP>1 AllGather to reconstruct full-head bytes. ──
-            # Without this, eviction-mode writes per-rank head shards
-            # while the apply path reads full-head bytes from disk →
-            # incompatible chain bytes → corrupted apply (plan-review
-            # Sharpening A). Routed through the ICMS sep-NCCL group
-            # when enabled to avoid forward-thread NCCL collisions
-            # (mirrors the prefill path's choice).
             if tp_size > 1:
                 try:
                     import torch.distributed as dist  # noqa: E402
@@ -350,7 +427,6 @@ class _EvictionExtractor:
                                             group=dev_group)
                             dist.all_gather(gv, v_gathered,
                                             group=dev_group)
-                            # Concatenate along the head axis (axis 2).
                             k_full = torch.cat(gk, dim=2)
                             v_full = torch.cat(gv, dim=2)
                     else:
@@ -368,31 +444,53 @@ class _EvictionExtractor:
                 k_full = k_gathered
                 v_full = v_gathered
 
-            # ── GPU → CPU async copy + single sync per layer. ──
             if writeback_stream is not None:
                 with torch.cuda.stream(writeback_stream):
                     k_cpu = k_full.to('cpu', non_blocking=True)
                     v_cpu = v_full.to('cpu', non_blocking=True)
-                writeback_stream.synchronize()
+                if per_layer_sync:
+                    writeback_stream.synchronize()
             else:
                 k_cpu = k_full.cpu()
                 v_cpu = v_full.cpu()
 
-            # ── Summary computation for scored layers. ──
             is_scored = geom.is_scored(layer_idx)
+            scored_rank = geom.scored_rank(layer_idx) if is_scored else None
+            kv_rank = geom.kv_layer_rank(layer_idx)
+            per_layer_state.append(
+                (int(layer_idx), k_cpu, v_cpu, is_scored,
+                 int(kv_rank),
+                 int(scored_rank) if scored_rank is not None else None))
+        return per_layer_state
+
+    def _finalize_cpu_per_layer(self, per_layer_state, staged):
+        """Pass 2 CPU: summary computation + scatter into per-(rid,
+        group) buffers. Caller MUST hold self._buffers_lock.
+
+        When called from the writeback daemon (DEFER_CPU mode) the
+        host memory backing k_cpu / v_cpu becomes valid only after
+        the corresponding CUDA event fires — caller must have
+        event.synchronize()'d before invoking this.
+        """
+        worker = self._worker
+        geom = worker._geom
+        spb = geom.summary_page_bytes
+        kpb = geom.kv_page_bytes
+        kv_group_bytes = geom.kv_group_bytes
+        summary_group_bytes = geom.summary_group_bytes
+        kv_layout = geom.kv_layout
+        num_kv_layers_total = geom.num_kv_layers
+        block_id_to_targets = staged["block_id_to_targets"]
+        bid_to_pos = staged["bid_to_pos"]
+
+        for (layer_idx, k_cpu, v_cpu, is_scored, kv_rank, scored_rank
+             ) in per_layer_state:
             if is_scored:
                 keys = k_cpu.to(dtype=torch.float32)
-                # Reshape so reduce-axis is block_size: [N, block_size, key_dim].
                 keys = keys.reshape(keys.shape[0], keys.shape[1], -1)
                 kmins = keys.min(dim=1).values.to(torch.float16)
                 kmaxs = keys.max(dim=1).values.to(torch.float16)
-                scored_rank = geom.scored_rank(layer_idx)
 
-            kv_rank = geom.kv_layer_rank(layer_idx)
-
-            # ── Scatter per-page bytes into each target buffer. ──
-            # k_cpu[pos]: [block_size, num_kv_heads_total, head_dim]
-            # k_bytes_per_page should equal kpb / 2 (since kv = k || v).
             for block_id, targets in block_id_to_targets.items():
                 pos = bid_to_pos[block_id]
                 k_bytes = (k_cpu[pos].contiguous().view(torch.uint8)
@@ -418,19 +516,86 @@ class _EvictionExtractor:
                                   + page_in_group * spb)
                         buf.summary_blob[
                             s_off:s_off + len(summary_bytes)] = summary_bytes
-                    # Mark this (layer_idx, page_in_group) slot filled.
                     buf.filled.add((int(layer_idx), int(page_in_group)))
 
-        # ── Pass 3: flush any buffers that became complete. ──
-        flushed_this_call = 0
+    def _flush_completed_buffers(self) -> int:
+        """Pass 3: flush every buffer that has reached completeness.
+        Caller MUST hold self._buffers_lock."""
+        flushed = 0
         for key in list(self._buffers.keys()):
             buf = self._buffers[key]
             if buf.is_complete():
                 rid, group_idx = key
                 self._flush_group(rid, group_idx, buf)
                 del self._buffers[key]
-                flushed_this_call += 1
-        return flushed_this_call
+                flushed += 1
+        return flushed
+
+    def _submit_finalize_to_daemon(self, per_layer_state, staged):
+        """DEFER_CPU path: record a CUDA event on the writeback stream,
+        instruct main stream to wait on it (CUDA-side, no CPU sync),
+        and submit a daemon closure that waits + finalizes + flushes.
+
+        Falls back to inline execution on submission failure so
+        correctness is preserved even when the writeback queue is
+        full or unavailable.
+        """
+        worker = self._worker
+        writeback_stream = getattr(worker, "_writeback_stream", None)
+        event = None
+        if writeback_stream is not None:
+            try:
+                event = torch.cuda.Event()
+                with torch.cuda.stream(writeback_stream):
+                    event.record()
+                # Tell the model-forward stream to wait on writeback
+                # before its next kernel runs — prevents vLLM from
+                # reassigning the freed blocks before our gather lands.
+                # No CPU sync.
+                try:
+                    torch.cuda.current_stream().wait_event(event)
+                except Exception:
+                    logger.exception(
+                        "[icms-eviction] landmine #2 main_stream "
+                        "wait_event failed — relying on event.sync "
+                        "in daemon")
+            except Exception:
+                logger.exception(
+                    "[icms-eviction] landmine #2 event setup failed "
+                    "— defer-cpu degraded to inline")
+                event = None
+
+        extractor = self
+
+        def _finalize_task():
+            try:
+                if event is not None:
+                    event.synchronize()
+                with extractor._buffers_lock:
+                    extractor._finalize_cpu_per_layer(
+                        per_layer_state, staged)
+                    extractor._flush_completed_buffers()
+            except Exception:
+                logger.exception(
+                    "[icms-eviction] landmine #2 deferred finalize "
+                    "failed; data for this step's evicted locators "
+                    "may be lost")
+
+        # payload_bytes=1 so `_writeback_queue.drain_all()` actually
+        # waits for this closure to run (it's bytes-bounded; a 0-byte
+        # task would let drain_all return before the closure starts).
+        # The real bytes are accounted by the inner _flush_group's
+        # own put_or_drop.
+        ok = worker._writeback_queue.put_or_drop(
+            rid="<finalize>",
+            payload_bytes=1,
+            task_fn=_finalize_task,
+            priority='high',
+        )
+        if not ok:
+            self.finalize_submit_failures_total += 1
+            # Fallback: run inline. Correctness over latency.
+            _finalize_task()
 
     def _flush_group(self, rid: str, group_idx: int,
                      buf: _GroupBuffer,
@@ -439,9 +604,12 @@ class _EvictionExtractor:
         """Enqueue a writeback task for one complete group.
 
         PR7a of ICMS eviction-mode refactor (2026-05-31): dispatches
-        a real `self._worker._client.write_group(...)` RPC via the
-        writeback queue. Replaces the PR5/PR6 stub closure that only
-        logged.
+        a real `self._worker._write_client.write_group(...)` RPC via
+        the writeback queue. Replaces the PR5/PR6 stub closure that
+        only logged. (Landmine #1 fix 2026-06-01: under
+        ICMS_USE_SPLIT_CLIENTS=1, _write_client is a separate
+        IcmsClient instance with its own CallGuard atomic so the
+        daemon RPC cannot abort/stall the forward-thread Score.)
 
         Monotonic-gidx gate: only group_idx == _chain_max_pushed + 1
         is dispatched. Out-of-order groups are dropped + counted (no
@@ -522,8 +690,11 @@ class _EvictionExtractor:
             rpc_ok = True
             if tp_size <= 1 or tp_rank == 0:
                 try:
-                    with worker._rpc_lock:
-                        worker._client.write_group(
+                    # Landmine #1 split: WG goes through _write_client +
+                    # _write_rpc_lock. Default (split OFF) → both alias
+                    # the read client / its lock → byte-identical.
+                    with worker._write_rpc_lock:
+                        worker._write_client.write_group(
                             parent_chain_local, new_tail_local,
                             summary_blob_bytes, kv_blob_bytes,
                             pages_in_group=GROUP_PAGES,
@@ -2079,8 +2250,10 @@ class _WorkerWritePipelineMixin:
         pages_in_group = buf[-1]['pages']
         t_send = time.perf_counter()
         try:
-            with self._rpc_lock:
-                self._client.write_group(
+            # Landmine #1 split: WG uses _write_client + _write_rpc_lock
+            # (alias to _client / _rpc_lock when split mode OFF).
+            with self._write_rpc_lock:
+                self._write_client.write_group(
                     parent_chain, new_tail_groups,
                     summary_blob, kv_blob,
                     pages_in_group=pages_in_group,
@@ -2138,8 +2311,9 @@ class _WorkerWritePipelineMixin:
                 new_tail_groups = [rank_chain[-1]]
             ok_local = True
             try:
-                with self._rpc_lock:
-                    self._client.write_group(
+                # Landmine #1 split: WG → _write_client + _write_rpc_lock.
+                with self._write_rpc_lock:
+                    self._write_client.write_group(
                         parent_chain, new_tail_groups,
                         b['summary_blob'], b['kv_blob'],
                         pages_in_group=b['pages'],
@@ -2346,8 +2520,9 @@ class _WorkerWritePipelineMixin:
                     # handled by `_flush_write_batch_now` (now or later).
                     # Skip the per-group post-RPC tail below.
                     return
-                with self._rpc_lock:  # X1 (race-audit): serialize tx_/rx_
-                    self._client.write_group(
+                # Landmine #1 split: WG → _write_client + _write_rpc_lock.
+                with self._write_rpc_lock:  # X1 (race-audit): serialize tx_/rx_
+                    self._write_client.write_group(
                         parent_chain, new_tail_groups,
                         bytes(buf.summary_blob), bytes(buf.kv_blob),
                         pages_in_group=pages,
@@ -2428,8 +2603,9 @@ class _WorkerWritePipelineMixin:
         # (parent=[], tail=full chain). Used by smoke tests that put
         # a complete chain in one shot.
         rank_chain = self._rank_chain(chain)
-        with self._rpc_lock:  # X1 (race-audit): serialize tx_/rx_
-            return self._client.write_group(
+        # Landmine #1 split: WG → _write_client + _write_rpc_lock.
+        with self._write_rpc_lock:  # X1 (race-audit): serialize tx_/rx_
+            return self._write_client.write_group(
                 [], list(rank_chain),
                 summary_blob, kv_blob,
                 pages_in_group=_GROUP_BLOCKS)

@@ -164,6 +164,17 @@ class _WorkerBase:
             )
 
         self._client: IcmsClient | None = None
+        # ICMS_USE_SPLIT_CLIENTS=1 (landmine #1 fix, 2026-06-01): a
+        # separate IcmsClient for WriteGroup so the eviction-daemon
+        # writeback thread doesn't race the forward-thread Score/Fetch
+        # on a shared `tx_/rx_` buffer (the C++ CallGuard aborts on
+        # overlap). When OFF (default), _write_client is aliased to
+        # _client and behavior is byte-identical. See
+        # tests/test_landmine_1_single_client_race.py for the race
+        # reproduction.
+        self._write_client: IcmsClient | None = None
+        self._use_split_clients = (
+            os.environ.get("ICMS_USE_SPLIT_CLIENTS", "0") == "1")
         self._geom: ModelGeometry | None = None
         self._sink_pool: _SinkSlotPool | None = None
 
@@ -370,6 +381,17 @@ class _WorkerBase:
             self._rpc_lock = threading.Lock()
         else:
             self._rpc_lock = _ctxlib.nullcontext()
+        # Landmine #1 split (2026-06-01): under split-clients mode the
+        # write daemon uses its own IcmsClient + its own lock — so the
+        # WG tx_/rx_ buffer is independent of Score's. Default-OFF →
+        # alias to _rpc_lock so single-client mode is byte-identical.
+        if self._use_split_clients:
+            if os.environ.get("ICMS_WRITE_RPC_MUTEX", "0") == "1":
+                self._write_rpc_lock = threading.Lock()
+            else:
+                self._write_rpc_lock = _ctxlib.nullcontext()
+        else:
+            self._write_rpc_lock = self._rpc_lock
 
         # Path B: GPU KV cache tensors + per-step attn_metadata for
         # selective fetch + block table override.
@@ -590,6 +612,48 @@ class _WorkerBase:
                     self._client = IcmsClient(self._socket_path)
                 # Backoff with jitter on tp_rank so retries don't re-collide.
                 _t.sleep(2.0 + 0.5 * _attempt + 0.3 * self._tp_rank)
+
+        # Landmine #1 split (2026-06-01): build a separate IcmsClient
+        # for the WriteGroup path so the daemon writeback doesn't share
+        # tx_/rx_ buffers with forward-thread Score/Fetch. The write
+        # client sends Hello with deployment_id=0 so the server's
+        # `tp_groups_[deployment_id][tp_rank] = conn_id` clobber
+        # (handlers.cc:983, guarded by `tp_size > 1 && deployment_id != 0`)
+        # is skipped — Score/Fetch fan-out keeps the read client's
+        # conn_id. Default-OFF aliases _write_client = _client.
+        if self._use_split_clients and self._use_rdma:
+            for _wattempt in range(_max_attempts):
+                try:
+                    self._write_client = RdmaIcmsClient(cfg)
+                    self._write_client.connect()
+                    with self._write_rpc_lock:
+                        self._write_client.hello(
+                            self._model_name,
+                            tp_rank=self._tp_rank,
+                            tp_size=self._tp_size,
+                            # deployment_id=0 → skip server's tp_groups_
+                            # fan-out registration; write client doesn't
+                            # need to receive Score/Fetch RDMA writeback.
+                            deployment_id=0,
+                            sink_slot_count=0)
+                    break
+                except Exception as _e:
+                    if _wattempt == _max_attempts - 1:
+                        raise
+                    logger.warning(
+                        "[icms-connect] write-client attempt %d/%d "
+                        "failed: %s (tp_rank=%d)",
+                        _wattempt + 1, _max_attempts, _e, self._tp_rank)
+                    _t.sleep(1.0 + 0.5 * _wattempt)
+            logger.info(
+                "[icms-split] write client connected (tp_rank=%d, "
+                "deployment_id=0); read+write CallGuards independent",
+                self._tp_rank)
+        else:
+            # Single-client mode: writes share the read client → behavior
+            # byte-identical to pre-split code.
+            self._write_client = self._client
+
         self._geom = find_model(self._model_name) or ModelGeometry(
             name=self._model_name,
             num_layers=ack.num_layers,
@@ -1484,6 +1548,17 @@ class _WorkerBase:
                 self._per_head_summary_sink = None
                 self._per_head_summary_sink_capacity = 0
         finally:
+            # Landmine #1 split: close the write client first (no sinks,
+            # cheap) then read client. When unsplit, _write_client IS
+            # _client → skip the redundant close.
+            if (self._use_split_clients
+                    and self._write_client is not None
+                    and self._write_client is not self._client):
+                try:
+                    self._write_client.close()
+                except Exception:
+                    pass
+                self._write_client = None
             self._client.close()
             self._client = None
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
