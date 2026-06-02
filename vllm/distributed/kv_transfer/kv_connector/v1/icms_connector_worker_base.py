@@ -621,9 +621,48 @@ class _WorkerBase:
         # (handlers.cc:983, guarded by `tp_size > 1 && deployment_id != 0`)
         # is skipped — Score/Fetch fan-out keeps the read client's
         # conn_id. Default-OFF aliases _write_client = _client.
+        if self._use_split_clients and not self._use_rdma:
+            # Review finding #1 (2026-06-01): silent fallback on
+            # non-RDMA transports would leave the user thinking they
+            # were protected from the CallGuard race when they're not
+            # (shmem/socket transports still share tx_/rx_ between
+            # threads). Warn loudly so the gap is visible in the boot
+            # log.
+            logger.warning(
+                "[icms-split] ICMS_USE_SPLIT_CLIENTS=1 requested but "
+                "transport is %s, not RDMA — falling back to single "
+                "client. Daemon WriteGroup will share tx_/rx_ with "
+                "forward Score (CallGuard abort or 78ms stall under "
+                "ICMS_WRITE_MODE=eviction).",
+                "shmem" if self._shmem_name else "unix-socket")
         if self._use_split_clients and self._use_rdma:
+            # Review finding #3 (2026-06-01): write client uses
+            # deployment_id=0 to skip the server's tp_groups_
+            # registration. If the read client ALSO uses
+            # deployment_id=0 (the default in some configs), both
+            # clients skip registration and Score writeback fan-out
+            # at handlers.cc:2297 has no conn_id to target → silent
+            # zero-byte writeback. Fail fast at boot rather than at
+            # first Score.
+            if self._tp_size > 1 and self._deployment_id == 0:
+                raise RuntimeError(
+                    "ICMS_USE_SPLIT_CLIENTS=1 + tp_size>1 requires "
+                    "deployment_id != 0 on the read client. Got "
+                    "deployment_id=0 — the write client's Hello "
+                    "uses deployment_id=0 to skip tp_groups_ "
+                    "registration; if the read client also uses 0, "
+                    "Score writeback fan-out has no conn_id to "
+                    "target. Set a non-zero deployment_id in your "
+                    "kv_transfer_config / bring-up env.")
             for _wattempt in range(_max_attempts):
                 try:
+                    # Review finding #10 (2026-06-01): always re-
+                    # instantiate the write client at the top of
+                    # each retry. Pre-fix, a Hello-after-connect
+                    # failure left the same dirty RdmaIcmsClient
+                    # object for the next attempt, possibly with
+                    # stale QP state. Match the read-side recreate
+                    # behavior at lines 604-612.
                     self._write_client = RdmaIcmsClient(cfg)
                     self._write_client.connect()
                     with self._write_rpc_lock:
@@ -639,12 +678,32 @@ class _WorkerBase:
                     break
                 except Exception as _e:
                     if _wattempt == _max_attempts - 1:
+                        # Review finding #10 (2026-06-01): clean up
+                        # the read client before propagating so we
+                        # don't leak its RDMA QP. The read client is
+                        # already live + Hello'd at this point.
+                        try:
+                            self._client.close()
+                        except Exception:
+                            pass
                         raise
                     logger.warning(
                         "[icms-connect] write-client attempt %d/%d "
                         "failed: %s (tp_rank=%d)",
                         _wattempt + 1, _max_attempts, _e, self._tp_rank)
-                    _t.sleep(1.0 + 0.5 * _wattempt)
+                    # Review finding #10: mirror the read-side
+                    # auto-restart helper so a BF2 that crashed
+                    # between read-Hello-success and write-Hello-
+                    # attempt can be recovered.
+                    try:
+                        from lib.bf2_runner import ensure_bf2_running  # type: ignore
+                        ensure_bf2_running(
+                            probe_host=self._rdma_server_host,
+                            probe_port=self._rdma_port,
+                            timeout=30.0)
+                    except Exception:
+                        pass
+                    _t.sleep(1.0 + 0.5 * _wattempt + 0.3 * self._tp_rank)
             logger.info(
                 "[icms-split] write client connected (tp_rank=%d, "
                 "deployment_id=0); read+write CallGuards independent",

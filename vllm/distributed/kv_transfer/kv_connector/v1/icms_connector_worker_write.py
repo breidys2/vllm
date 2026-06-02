@@ -137,20 +137,28 @@ class _EvictionExtractor:
         self.scavenger_calls_total += 1
         flushed = 0
         dropped = 0
-        # Capture keys first; we'll mutate _buffers inside the loop.
-        keys = [k for k in self._buffers.keys() if k[0] == rid]
-        for key in keys:
-            buf = self._buffers.pop(key, None)
-            if buf is None:
-                continue
-            _, group_idx = key
-            if buf.is_complete():
-                self._flush_group(rid, group_idx, buf,
-                                  chain=chain, priority='low')
-                flushed += 1
-            else:
-                dropped += 1
-                self.groups_dropped_partial_on_finish += 1
+        # Landmine #2 review finding #4 (2026-06-01): take
+        # `_buffers_lock` so the scavenger doesn't race the writeback
+        # daemon's `_finalize_cpu_per_layer` under DEFER_CPU mode.
+        # Pre-refactor this was single-threaded so the lock was a
+        # no-op; under DEFER_CPU the daemon writes into
+        # `_buffers[buf_key].kv_blob` concurrently. The atomic
+        # capture-keys + pop-and-flush block must be a critical
+        # section against both finalize and flush-completed.
+        with self._buffers_lock:
+            keys = [k for k in self._buffers.keys() if k[0] == rid]
+            for key in keys:
+                buf = self._buffers.pop(key, None)
+                if buf is None:
+                    continue
+                _, group_idx = key
+                if buf.is_complete():
+                    self._flush_group(rid, group_idx, buf,
+                                      chain=chain, priority='low')
+                    flushed += 1
+                else:
+                    dropped += 1
+                    self.groups_dropped_partial_on_finish += 1
         self.groups_flushed_on_finish += flushed
         return flushed, dropped
 
@@ -520,9 +528,21 @@ class _EvictionExtractor:
 
     def _flush_completed_buffers(self) -> int:
         """Pass 3: flush every buffer that has reached completeness.
-        Caller MUST hold self._buffers_lock."""
+        Caller MUST hold self._buffers_lock.
+
+        Landmine #2 review finding #7 (2026-06-01): iterate in
+        (rid, group_idx) ASCENDING order so the per-chain monotonic
+        gate in `_flush_group` (`_chain_max_pushed` at write.py:99)
+        sees groups in trie-extend order. Pre-refactor, multiple
+        groups completing in a single call were rare (one per call
+        typically) so dict-insertion-order was fine. Under
+        DEFER_CPU's wider race window (multi-step accumulation
+        before daemon drains) several gidx for the same chain can
+        complete together; out-of-order iteration would trip the
+        monotonic-gidx gate → out_of_order_drops_total + lost data.
+        """
         flushed = 0
-        for key in list(self._buffers.keys()):
+        for key in sorted(self._buffers.keys()):
             buf = self._buffers[key]
             if buf.is_complete():
                 rid, group_idx = key
@@ -532,49 +552,76 @@ class _EvictionExtractor:
         return flushed
 
     def _submit_finalize_to_daemon(self, per_layer_state, staged):
-        """DEFER_CPU path: record a CUDA event on the writeback stream,
-        instruct main stream to wait on it (CUDA-side, no CPU sync),
-        and submit a daemon closure that waits + finalizes + flushes.
+        """DEFER_CPU path: synchronize the writeback stream on the
+        FORWARD thread (one sync; Win A), then submit a daemon closure
+        that does the CPU summary + scatter + flush (Win B).
 
-        Falls back to inline execution on submission failure so
-        correctness is preserved even when the writeback queue is
-        full or unavailable.
+        SAFETY rationale (review finding 2026-06-01): the original
+        design used `torch.cuda.current_stream().wait_event(event)` to
+        queue a CUDA-side wait on the model-forward stream so vLLM
+        couldn't reassign freed blocks before our gather landed. That
+        was unsound under vLLM's CUDA-graph mode (and any backend that
+        runs forward kernels on a non-default stream) — `current_stream()`
+        at on_step_start time is NOT guaranteed to be the same stream
+        vLLM later uses for model.forward(). Wrong stream → silent KV
+        corruption.
+
+        Safer design: synchronize the writeback stream on the forward
+        thread BEFORE returning. Adds one ~1ms sync to the forward
+        path (Win A already collapses N→1 — net cost unchanged). The
+        CPU summary + scatter + flush still moves off the forward
+        thread (Win B preserved). The daemon's `event.synchronize()`
+        becomes a no-op when the event has already fired, but we
+        still record + carry it for telemetry/debugging.
+
+        Falls back to inline execution on:
+          • writeback stream sync raise (CUDA failure) → inline
+          • event creation raise → inline (NOT silent skip — review #6)
+          • queue submit fail → inline
         """
         worker = self._worker
         writeback_stream = getattr(worker, "_writeback_stream", None)
-        event = None
+        extractor = self
+
+        # Defensive sync on the FORWARD thread before returning. After
+        # this returns, all gathered K/V is on the CPU and vLLM is free
+        # to reassign blocks. No race with vLLM's main forward stream
+        # regardless of its stream config.
+        sync_failed = False
         if writeback_stream is not None:
             try:
-                event = torch.cuda.Event()
-                with torch.cuda.stream(writeback_stream):
-                    event.record()
-                # Tell the model-forward stream to wait on writeback
-                # before its next kernel runs — prevents vLLM from
-                # reassigning the freed blocks before our gather lands.
-                # No CPU sync.
-                try:
-                    torch.cuda.current_stream().wait_event(event)
-                except Exception:
-                    logger.exception(
-                        "[icms-eviction] landmine #2 main_stream "
-                        "wait_event failed — relying on event.sync "
-                        "in daemon")
+                writeback_stream.synchronize()
             except Exception:
                 logger.exception(
-                    "[icms-eviction] landmine #2 event setup failed "
+                    "[icms-eviction] landmine #2 writeback sync failed "
                     "— defer-cpu degraded to inline")
-                event = None
+                sync_failed = True
 
-        extractor = self
+        if sync_failed:
+            # Inline finalize — bytes are safe (no daemon waiting).
+            with extractor._buffers_lock:
+                extractor._finalize_cpu_per_layer(per_layer_state, staged)
+                extractor._flush_completed_buffers()
+            return
 
         def _finalize_task():
             try:
-                if event is not None:
-                    event.synchronize()
                 with extractor._buffers_lock:
                     extractor._finalize_cpu_per_layer(
                         per_layer_state, staged)
                     extractor._flush_completed_buffers()
+            except KeyError as e:
+                # Review finding #9 (2026-06-01): scavenger
+                # (flush_remaining_for_rid) may have popped the
+                # `buf_key` between submit and daemon run. The pages
+                # for that buffer are lost — count it as an orphan
+                # rather than silently swallowing.
+                self.orphan_locators_total += 1
+                logger.warning(
+                    "[icms-eviction] landmine #2 deferred finalize "
+                    "hit KeyError (scavenger race): %s — bytes for "
+                    "this buffer lost; orphan_locators_total bumped",
+                    e)
             except Exception:
                 logger.exception(
                     "[icms-eviction] landmine #2 deferred finalize "
@@ -582,10 +629,15 @@ class _EvictionExtractor:
                     "may be lost")
 
         # payload_bytes=1 so `_writeback_queue.drain_all()` actually
-        # waits for this closure to run (it's bytes-bounded; a 0-byte
-        # task would let drain_all return before the closure starts).
-        # The real bytes are accounted by the inner _flush_group's
-        # own put_or_drop.
+        # waits for this closure to run (queue is bytes-bounded; a
+        # 0-byte task would let drain_all return before the closure
+        # starts). Real KV bytes are accounted by `_flush_group`'s
+        # own put_or_drop. SHUTDOWN GOTCHA (review #3): drain_all
+        # semantics still work because once the finalize task runs it
+        # synchronously submits the WriteGroup tasks (with real byte
+        # counts) BEFORE its own byte count is released. The queue's
+        # _pending_bytes never reaches 0 until both finalize AND the
+        # WriteGroup tasks it spawned have completed.
         ok = worker._writeback_queue.put_or_drop(
             rid="<finalize>",
             payload_bytes=1,
