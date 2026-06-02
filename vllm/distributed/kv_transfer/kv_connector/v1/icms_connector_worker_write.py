@@ -418,10 +418,29 @@ class _EvictionExtractor:
                 continue
 
             # ── TP>1 AllGather to reconstruct full-head bytes. ──
+            #
+            # all_gather is a COLLECTIVE: every rank must participate for
+            # the SAME layer or the ranks desync (a rank that skips a
+            # layer while peers still wait on that layer's collective
+            # hangs / corrupts the gathered K/V — 2026-05-10 audit #4).
+            # So failures are split into two classes:
+            #   (A) recoverable SETUP failures (buffer-alloc OOM, group
+            #       lookup) — these can be asymmetric, so we vote on them
+            #       via a tiny symmetric all-reduce and skip the layer on
+            #       ALL ranks together (graceful degradation, balanced).
+            #   (C) a failure of the all_gather collective ITSELF — the
+            #       communicator is then in an undefined state with no
+            #       safe per-rank recovery, so it propagates (FATAL), per
+            #       the all_gather-must-be-fatal invariant. NOT swallowed.
             if tp_size > 1:
+                import torch.distributed as dist  # noqa: E402
+                from vllm.distributed.parallel_state import get_tp_group
+                # Phase A: per-rank setup that may fail asymmetrically.
+                # Capture the outcome locally — do NOT `continue` here, or
+                # a one-rank skip would unbalance Phase C's collective.
+                setup_ok = True
+                gk = gv = dev_group = None
                 try:
-                    import torch.distributed as dist  # noqa: E402
-                    from vllm.distributed.parallel_state import get_tp_group
                     tp_group = get_tp_group()
                     dev_group = (_get_icms_nccl_group()
                                   or tp_group.device_group)
@@ -429,25 +448,43 @@ class _EvictionExtractor:
                           for _ in range(tp_size)]
                     gv = [torch.empty_like(v_gathered)
                           for _ in range(tp_size)]
-                    if writeback_stream is not None:
-                        with torch.cuda.stream(writeback_stream):
-                            dist.all_gather(gk, k_gathered,
-                                            group=dev_group)
-                            dist.all_gather(gv, v_gathered,
-                                            group=dev_group)
-                            k_full = torch.cat(gk, dim=2)
-                            v_full = torch.cat(gv, dim=2)
-                    else:
+                except Exception:
+                    logger.exception(
+                        "[icms-eviction] PR7a AllGather setup failed for "
+                        "layer=%s tp_size=%d — voting to skip this layer "
+                        "on all ranks", layer_name, tp_size)
+                    setup_ok = False
+                # Phase B: symmetric barrier. All-reduce-MAX the local
+                # failure bit on a fixed 1-element int — robust (unlike
+                # the variable-shape K/V gather it can't fail from a
+                # per-layer alloc), and EVERY rank reaches it regardless
+                # of its own setup outcome, so the skip decision is
+                # identical on all ranks. (If the group itself is dead,
+                # this degrades to the rank-local value and Phase C's
+                # all_gather then fails fatally — never silent.)
+                any_rank_failed = _tp_allreduce_max_int(
+                    0 if setup_ok else 1, tp_size)
+                if any_rank_failed:
+                    if setup_ok:
+                        logger.warning(
+                            "[icms-eviction] PR7a AllGather: a peer rank "
+                            "failed setup for layer=%s — skipping on all "
+                            "ranks (symmetric)", layer_name)
+                    self.orphan_locators_total += len(block_id_list)
+                    continue
+                # Phase C: every rank prepared OK → the collective is
+                # balanced. A raise here is FATAL by design (no try).
+                if writeback_stream is not None:
+                    with torch.cuda.stream(writeback_stream):
                         dist.all_gather(gk, k_gathered, group=dev_group)
                         dist.all_gather(gv, v_gathered, group=dev_group)
                         k_full = torch.cat(gk, dim=2)
                         v_full = torch.cat(gv, dim=2)
-                except Exception:
-                    logger.exception(
-                        "[icms-eviction] PR7a AllGather failed for "
-                        "layer=%s tp_size=%d — skipping",
-                        layer_name, tp_size)
-                    continue
+                else:
+                    dist.all_gather(gk, k_gathered, group=dev_group)
+                    dist.all_gather(gv, v_gathered, group=dev_group)
+                    k_full = torch.cat(gk, dim=2)
+                    v_full = torch.cat(gv, dim=2)
             else:
                 k_full = k_gathered
                 v_full = v_gathered
