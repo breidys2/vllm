@@ -930,6 +930,45 @@ class _Scheduler:
                 os.environ.get("ICMS_FULL_FETCH", "0") == "1"
                 or os.environ.get(
                     "ICMS_MATCHED_PREFIX_ENABLE", "0") == "1")
+
+            # Phase 1 / Blocker 2 / 2026-06-03 robustness gate:
+            # When vLLM's prefix cache is OFF, vLLM relies entirely on
+            # the connector to populate KV blocks for any tokens it
+            # elides based on this NMT return. If the operator hasn't
+            # opted into Phase 1 (default), there is NO fetch path
+            # → vLLM elides → forward runs on uninitialized KV →
+            # silent garbage. This was the original Blocker 2 / Cell 5
+            # failure mode that motivated Phase 1.
+            #
+            # Returning 0 here makes vLLM cold-prefill — correct (but
+            # slower). The legacy "matched_tokens>0 without a working
+            # fetch path" behavior was a latent silent-wrong path that
+            # any operator running prefill-mode + prefix_caching=False
+            # would hit. Gate it to prevent regression.
+            #
+            # When prefix_caching is ON (the eviction-mode L1+L2 design
+            # default), vLLM's own block cache holds the matched-prefix
+            # KV and this gate is a no-op — vLLM handles the load via
+            # its own machinery.
+            if (not _opted_into_phase1
+                    and not getattr(
+                        self, "_vllm_prefix_cache_enabled", True)):
+                if not getattr(self,
+                               "_matched_prefix_legacy_unsafe_logged",
+                               False):
+                    logger.warning(
+                        "[icms-matched-prefix] legacy unsafe gate "
+                        "FIRED: vLLM prefix_caching is OFF and operator "
+                        "did NOT opt into Phase 1 "
+                        "(ICMS_MATCHED_PREFIX_ENABLE=1 or "
+                        "ICMS_FULL_FETCH=1). Returning 0 matched_tokens "
+                        "so vLLM cold-prefills — without Phase 1, "
+                        "vLLM would elide prefill but the connector "
+                        "has no fetch path → silent garbage. See "
+                        "docs/phase1_matched_prefix_bridge_architecture.md.")
+                    self._matched_prefix_legacy_unsafe_logged = True
+                return 0, False
+
             if _opted_into_phase1:
                 _scored_layers_env = os.environ.get(
                     "ICMS_SCORED_LAYERS", "")
