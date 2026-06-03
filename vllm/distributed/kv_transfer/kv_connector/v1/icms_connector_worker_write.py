@@ -308,8 +308,14 @@ class _EvictionExtractor:
                 ws.synchronize()
 
         # Inline finalize (legacy and SINGLE_SYNC paths).
+        # 2026-06-02 (scavenger thrash fix): _finalize_cpu_per_layer
+        # acquires the lock internally only for the apply phase. Pre-fix
+        # this `with` block also wrapped the call, so the lock was held
+        # for the entire 48-layer compute (2-4 sec stalls). Now compute
+        # runs lockless; we still hold the lock for _flush_completed_buffers
+        # which mutates _buffers structurally.
+        self._finalize_cpu_per_layer(per_layer, staged)
         with self._buffers_lock:
-            self._finalize_cpu_per_layer(per_layer, staged)
             self.finalize_inline_count += 1
             return self._flush_completed_buffers()
 
@@ -510,12 +516,152 @@ class _EvictionExtractor:
 
     def _finalize_cpu_per_layer(self, per_layer_state, staged):
         """Pass 2 CPU: summary computation + scatter into per-(rid,
-        group) buffers. Caller MUST hold self._buffers_lock.
+        group) buffers.
+
+        2026-06-02 (Phase B+C follow-up, scavenger-thrash root cause fix):
+        the original implementation ran ENTIRELY under
+        self._buffers_lock — 48 layers × N pages × byte packing × tensor
+        min/max compute. In production at qwen3-30b-a3b ctx=32K, this
+        held the lock for 2-4 SECONDS per finalize, starving the
+        scavenger's flush_remaining_for_rid (which contends for the
+        same lock at request-finish time). Symptom: TTFT P50 ballooned
+        to 30s+ and ~10/32 requests timed out with "stream produced no
+        tokens" (smoke 2e). Server-side SPDK bounce was already skipped
+        (Phase B+C), so this CPU/lock contention was the *only* remaining
+        32K bottleneck.
+
+        Fix: split into compute + apply.
+          • Phase 1 (compute): NO lock. Per-layer tensor min/max +
+            kv/summary byte packing → list of write descriptors. This is
+            ~90% of total time; running it lockless lets the scavenger
+            grab the lock without waiting.
+          • Phase 2 (apply): take self._buffers_lock briefly to fetch buf
+            from self._buffers and apply the precomputed bytes. ~ms wall.
+
+        KeyError-safe: if scavenger popped buf between compute and apply,
+        the descriptor is dropped + orphan counter bumped, matching the
+        pre-refactor semantics where the same scavenger race would raise
+        from buf = self._buffers[buf_key].
+
+        Caller MUST NOT hold self._buffers_lock when calling this — the
+        whole point of the refactor is to drop the lock during Phase 1.
+
+        Reverting: set ICMS_EVICTION_LOCKLESS_COMPUTE=0 to use the
+        legacy single-phase implementation (kept here as a safety net).
 
         When called from the writeback daemon (DEFER_CPU mode) the
         host memory backing k_cpu / v_cpu becomes valid only after
         the corresponding CUDA event fires — caller must have
-        event.synchronize()'d before invoking this.
+        event.synchronize()'d before invoking this. (Unchanged.)
+        """
+        if os.environ.get("ICMS_EVICTION_LOCKLESS_COMPUTE", "1") != "1":
+            # Legacy single-phase path. Held the lock for the entire
+            # 48-layer compute → 2-4 sec scavenger stalls under load.
+            # Retained behind an env gate so an operator can revert
+            # without rebuilding if the new path regresses.
+            with self._buffers_lock:
+                self._finalize_cpu_per_layer_legacy(
+                    per_layer_state, staged)
+            return
+
+        # Phase 1: compute descriptors WITHOUT acquiring the lock.
+        pending = self._compute_layer_writes(per_layer_state, staged)
+        # Phase 2: apply atomically WITH the lock (acquired internally).
+        self._apply_layer_writes(pending)
+
+    def _compute_layer_writes(self, per_layer_state, staged):
+        """Phase 1 of the two-phase finalize: pure CPU compute, NO lock.
+
+        Iterates per_layer_state (one entry per kv-layer) and produces a
+        flat list of write descriptors that Phase 2 will apply atomically
+        under self._buffers_lock. Touches NOTHING shared with the
+        scavenger (self._buffers is not read here).
+
+        Returns: list of (buf_key, layer_idx, page_in_group, k_off,
+        kv_bytes, s_off_or_None, summary_bytes_or_None) tuples.
+        """
+        worker = self._worker
+        geom = worker._geom
+        spb = geom.summary_page_bytes
+        kpb = geom.kv_page_bytes
+        kv_group_bytes = geom.kv_group_bytes
+        summary_group_bytes = geom.summary_group_bytes
+        kv_layout = geom.kv_layout
+        num_kv_layers_total = geom.num_kv_layers
+        block_id_to_targets = staged["block_id_to_targets"]
+        bid_to_pos = staged["bid_to_pos"]
+
+        pending: list[tuple] = []
+        for (layer_idx, k_cpu, v_cpu, is_scored, kv_rank, scored_rank
+             ) in per_layer_state:
+            kmins = kmaxs = None
+            if is_scored:
+                keys = k_cpu.to(dtype=torch.float32)
+                keys = keys.reshape(keys.shape[0], keys.shape[1], -1)
+                kmins = keys.min(dim=1).values.to(torch.float16)
+                kmaxs = keys.max(dim=1).values.to(torch.float16)
+
+            for block_id, targets in block_id_to_targets.items():
+                pos = bid_to_pos[block_id]
+                k_bytes = (k_cpu[pos].contiguous().view(torch.uint8)
+                           .numpy().tobytes())
+                v_bytes = (v_cpu[pos].contiguous().view(torch.uint8)
+                           .numpy().tobytes())
+                kv_bytes = k_bytes + v_bytes
+                if is_scored:
+                    summary_bytes = (
+                        kmins[pos].numpy().tobytes()
+                        + kmaxs[pos].numpy().tobytes())
+                else:
+                    summary_bytes = None
+                for (buf_key, page_in_group) in targets:
+                    if kv_layout == KvLayout.LAYER_MAJOR:
+                        k_off = (kv_rank * kv_group_bytes
+                                 + page_in_group * kpb)
+                    else:
+                        k_off = (page_in_group * num_kv_layers_total * kpb
+                                 + kv_rank * kpb)
+                    if is_scored:
+                        s_off = (scored_rank * summary_group_bytes
+                                 + page_in_group * spb)
+                    else:
+                        s_off = None
+                    pending.append(
+                        (buf_key, layer_idx, page_in_group,
+                         k_off, kv_bytes, s_off, summary_bytes))
+        return pending
+
+    def _apply_layer_writes(self, pending):
+        """Phase 2 of the two-phase finalize: atomic apply under
+        self._buffers_lock. KeyError-safe (orphan_locators_total bumped
+        if scavenger popped buf between compute and apply).
+        """
+        if not pending:
+            return
+        with self._buffers_lock:
+            for (buf_key, layer_idx, page_in_group, k_off, kv_bytes,
+                 s_off, summary_bytes) in pending:
+                buf = self._buffers.get(buf_key)
+                if buf is None:
+                    # Scavenger popped this buf between compute and
+                    # apply — bytes lost. Pre-refactor this raised
+                    # KeyError from `buf = self._buffers[buf_key]` and
+                    # the daemon caller logged + bumped orphan_locators.
+                    # Surface the same outcome here without the
+                    # exception-stack roundtrip.
+                    self.orphan_locators_total += 1
+                    continue
+                buf.kv_blob[k_off:k_off + len(kv_bytes)] = kv_bytes
+                if s_off is not None and summary_bytes is not None:
+                    buf.summary_blob[
+                        s_off:s_off + len(summary_bytes)] = summary_bytes
+                buf.filled.add((int(layer_idx), int(page_in_group)))
+
+    def _finalize_cpu_per_layer_legacy(self, per_layer_state, staged):
+        """Pre-2026-06-02 single-phase implementation, retained for the
+        ICMS_EVICTION_LOCKLESS_COMPUTE=0 fallback. Caller MUST hold
+        self._buffers_lock. See _finalize_cpu_per_layer docstring for
+        the reason this exists.
         """
         worker = self._worker
         geom = worker._geom
@@ -636,16 +782,23 @@ class _EvictionExtractor:
 
         if sync_failed:
             # Inline finalize — bytes are safe (no daemon waiting).
+            # 2026-06-02: _finalize_cpu_per_layer now acquires the lock
+            # internally only for the apply phase; outer lock here is
+            # only for _flush_completed_buffers's structural mutation.
+            extractor._finalize_cpu_per_layer(per_layer_state, staged)
             with extractor._buffers_lock:
-                extractor._finalize_cpu_per_layer(per_layer_state, staged)
                 extractor._flush_completed_buffers()
             return
 
         def _finalize_task():
             try:
+                # 2026-06-02 (scavenger thrash fix): same split as the
+                # inline path — _finalize_cpu_per_layer's compute phase
+                # runs lockless. This is the change that unblocks the
+                # scavenger under sustained 32K load.
+                extractor._finalize_cpu_per_layer(
+                    per_layer_state, staged)
                 with extractor._buffers_lock:
-                    extractor._finalize_cpu_per_layer(
-                        per_layer_state, staged)
                     extractor._flush_completed_buffers()
             except KeyError as e:
                 # Review finding #9 (2026-06-01): scavenger

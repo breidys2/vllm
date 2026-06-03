@@ -35,6 +35,207 @@ _GROUP_BLOCKS = GROUP_PAGES
 
 
 class _WorkerFetchApplyMixin:
+    def _handle_matched_prefix_fetches(self, meta):
+        """Phase 1 / Blocker 2 (2026-06-02): fire fetch_all for prefill-mode
+        matched-prefix requests at on_step_start time.
+
+        ARCHITECTURE NOTE — 4 fix sites guard correctness:
+        The 2026-06-02 sweep silently produced wrong output because the
+        matched-prefix apply path had FOUR layered gates that each
+        silently dropped non-scored layers' KV apply work. After the
+        landing of `force_apply_all_layers`, all four sites cooperate:
+          1. HERE: pass `force_apply_all_layers=True` so downstream
+             callers know "this is a matched-prefix load; apply ALL
+             layers, not just scored ones".
+          2. `_fetch_all_one_request`'s reuse loop (line ~684+): the
+             `_skip_nonscored` filter now respects
+             `force_apply_all_layers`. Non-scored layers' _pending_reuse
+             entries are populated AND the per-layer delta uses raw
+             abs_layer (not scored_rank).
+          3. `_fetch_all_one_request`'s slow path (line ~709+): when
+             `force_apply_all_layers=True`, ALSO populates _pending_scores
+             for every reuse layer (in addition to _pending_reuse). Needed
+             because the on_layer_reuse promotion is gated on vLLM's
+             quest_hooks behavior, which doesn't reliably fire for
+             arbitrary non-scored layers when neither dense_layers_mask
+             nor contiguous-reuse mode is set.
+          4. `_wait_for_layer_impl` (line ~972+): the non-scored
+             short-circuit now always probes the pending dicts
+             (previously env-gated on `ICMS_FULL_FETCH=1`). Matched-prefix
+             populates pending without setting the global env, so the
+             gate would have re-broken the apply path.
+        All four are interlocking; removing any one re-introduces the
+        silent garbage. See project_phase1_apply_all_layers_2026-06-02.
+
+        TODO(post-Phase-1, paper-headline blocker): selective matched-prefix
+        RPC for B/C/D TTFT differentiation. Today every matched-prefix
+        request fetches ALL pages with force_apply_all_layers=True — the
+        only correctness-safe path under the current server contract,
+        but it makes B/C/D TTFTs indistinguishable. Design options:
+          (A) Per-config TopK matched-prefix RPC: server returns full
+              K/V for non-scored layers + top-budget% K/V for scored.
+              Needs new server-side hybrid Score+Fetch RPC.
+          (B) Two-stage load: eager fetch_all for non-scored layers
+              (always), then scoring drives selective fetch for scored.
+              Client-only but doubles RPC count.
+          (C) Lift the per-layer-skip filter at lines 660+ for the scoring
+              path when matched-prefix is active. Requires the sink to
+              hold all-layer K/V (matches Phase 1's sink semantics).
+        Recommend (C) for first iteration. See
+        project_phase1_apply_all_layers_2026-06-02 for full analysis.
+
+        The scheduler's `get_num_new_matched_tokens` returns matched_groups>0
+        when an incoming request's chain prefix matches the in-scheduler
+        `_stored_chains` index. vLLM trusts that return value: it allocates
+        KV blocks for the full prompt, marks the matched-token range as
+        "already computed", and SKIPS prefill on those tokens. It then
+        expects the worker to populate those blocks via the connector's
+        load path. Before this method existed, the prefill-mode worker
+        never received a "load these blocks" signal — vLLM forward ran on
+        uninitialized KV → silent garbage output (Cell 5 in
+        project_derisk_4config_layered_blockers_2026-06-02 proved this:
+        matched_groups=64 on every request but fetch_all_rpc=0 everywhere).
+
+        The fix is straightforward: at on_step_start (the very start of a
+        forward pass), iterate the scheduler-ferried
+        `matched_prefix_locators`, find each rid's req_idx + rs, and call
+        the existing `_fetch_all_one_request` with budget=1.0 +
+        next_layer_idx=0. That RPC pulls the matched prefix's KV from BF2
+        into the sink, populates `_pending_reuse` per layer, and the
+        existing per-layer `wait_for_layer` apply path scatters the pages
+        into vLLM's allocated KV blocks.
+
+        Idempotent: `_fetch_all_one_request` short-circuits on
+        `rs._fetch_all_complete=True`, so a second invocation (e.g., from
+        FAPS config B's `on_layer_all_pages` dispatch at layer 0) is a
+        no-op once the first fetch has dispatched.
+
+        Returns: count of fetches actually dispatched (for telemetry +
+        unit tests). Skipped entries (no rs / empty chain / already
+        fetched) are NOT counted.
+        """
+        locators = getattr(meta, "matched_prefix_locators", None)
+        if not locators:
+            return 0
+        # Phase 1 / Blocker 2 finish (2026-06-02): sink-size correctness
+        # gate. `force_apply_all_layers=True` requires the sink to be
+        # sized for `num_layers` worth of K/V per allocation slot. The
+        # boot code at icms_connector_worker_base.py sets
+        # `self._matched_prefix_sink_ready = True` when either
+        # ICMS_FULL_FETCH=1 OR ICMS_MATCHED_PREFIX_ENABLE=1 took effect
+        # (both size the sink for num_layers). When False, the sink is
+        # sized only for num_scored_layers — populating _pending_reuse
+        # for layers beyond the scored set would read past the sink end
+        # → silent garbage. Refuse to fire and let vLLM cold-prefill
+        # instead (correctness over speed). Operator fix: set
+        # ICMS_MATCHED_PREFIX_ENABLE=1 (recommended; preserves multi-rid)
+        # OR ICMS_FULL_FETCH=1 (single-rid only) OR clear ICMS_SCORED_LAYERS
+        # (sink auto-sizes for num_layers when no mask).
+        if not getattr(self, "_matched_prefix_sink_ready", False):
+            if not getattr(self,
+                           "_matched_prefix_sink_too_small_logged",
+                           False):
+                logger.warning(
+                    "[matched-prefix] REFUSING to fire: sink is sized "
+                    "for num_scored_layers, not num_layers. "
+                    "force_apply_all_layers=True would read past sink "
+                    "end for non-scored layers → silent garbage. vLLM "
+                    "will cold-prefill instead. Set "
+                    "ICMS_MATCHED_PREFIX_ENABLE=1 (recommended) OR "
+                    "ICMS_FULL_FETCH=1 (single-rid only) OR clear "
+                    "ICMS_SCORED_LAYERS to enable. See "
+                    "project_phase1_apply_all_layers_2026-06-02.")
+                self._matched_prefix_sink_too_small_logged = True
+            return 0
+        # NOTE: server-geometry compatibility check is now performed
+        # ONCE at boot time (see _Worker.__init__ in
+        # icms_connector_worker_base.py — search for
+        # `_matched_prefix_sink_ready`). If the boot validation failed
+        # (e.g., server has scored_layers_mask but operator hasn't set
+        # ICMS_SERVER_HAS_FULL_GEOMETRY=1), `_matched_prefix_sink_ready`
+        # is False and the gate above already returned. Per-request env
+        # checks here would be log spam (worker can't safely change
+        # decision mid-life).
+        # Phase 1 (2026-06-02) NOTE on budget-gating:
+        # An earlier version of this method gated on budget<1.0 → skip
+        # eager fetch_all → delegate to per-layer scoring. That gate was
+        # REMOVED after auditing the scoring path: scoring populates
+        # _pending_reuse / _pending_scores only for SCORED layers, so
+        # the matched range's non-scored layers' KV blocks stay empty
+        # → forward attends to uninitialized memory for ~80% of layers
+        # on qwen3 (40 of 48). The unconditional eager fetch_all with
+        # force_apply_all_layers=True is the only correct path today.
+        #
+        # The downside (over-fetching for C/D's sparse budgets) means
+        # B/C/D TTFT will be similar in the matched-prefix path. The
+        # B → C TTFT-drop story requires future work — a selective
+        # matched-prefix RPC that fetches only top-budget% pages
+        # AND populates ALL layers' KV (or a hybrid path that fills
+        # non-scored layers' KV from a separate eager fetch while
+        # scoring drives the scored layers' selection). See
+        # project_phase1_apply_all_layers_2026-06-02 for the full
+        # analysis.
+        #
+        # ICMS_MATCHED_PREFIX_FETCH_ALL is preserved as a sanity env
+        # — setting it to "0" would re-enable the unsafe skip ONLY for
+        # diagnostic purposes (e.g., comparing against scoring-only
+        # paths on uniform models with no scored mask set, where the
+        # gap doesn't exist). Default behavior is unchanged from the
+        # safe path.
+        # Build a rid → req_idx map from meta.requests so we can label
+        # the fetch with the per-step batch index (mirrors the
+        # `_on_layer_all_pages_impl` pattern). Falls back to 0 when
+        # the rid isn't in meta.requests (shouldn't happen because the
+        # ferry is staged in the same NMT call that triggers the
+        # scheduler to add the rid to scheduled_new_reqs).
+        req_idx_by_rid: dict[str, int] = {}
+        for i, step_req in enumerate(meta.requests):
+            req_idx_by_rid[step_req.request_id] = i
+        n_dispatched = 0
+        for rid, matched_groups in locators:
+            if matched_groups <= 0:
+                continue
+            rs = self._requests.get(rid)
+            if rs is None or not rs.chain:
+                logger.debug(
+                    "[matched-prefix] skip rid=%s matched_groups=%d: "
+                    "no rs / empty chain",
+                    rid, matched_groups)
+                continue
+            if getattr(rs, "_fetch_all_complete", False):
+                # Already fetched (chunked-prefill subsequent chunk, or
+                # FAPS path raced and fired first). Idempotent skip.
+                continue
+            req_idx = req_idx_by_rid.get(rid, 0)
+            try:
+                # force_apply_all_layers=True: the matched-prefix load
+                # MUST populate _pending_reuse for every layer, not just
+                # scored ones, otherwise the 40 non-scored layers (qwen3)
+                # attend to uninitialized KV → silent garbage output.
+                # See _fetch_all_one_request docstring for the gating
+                # rationale.
+                self._fetch_all_one_request(
+                    rid, rs, req_idx,
+                    next_layer_idx=0, budget=1.0, stats=self.stats,
+                    force_apply_all_layers=True)
+                n_dispatched += 1
+            except Exception:
+                logger.exception(
+                    "[matched-prefix] _fetch_all_one_request failed for "
+                    "rid=%s matched_groups=%d req_idx=%d — vLLM will "
+                    "forward on garbage KV for the matched range; output "
+                    "will be wrong",
+                    rid, matched_groups, req_idx)
+        if n_dispatched > 0:
+            self._matched_prefix_fetches_total = (
+                getattr(self, "_matched_prefix_fetches_total", 0)
+                + n_dispatched)
+            logger.debug(
+                "[matched-prefix] dispatched %d fetch_all RPCs "
+                "(cumulative: %d)",
+                n_dispatched, self._matched_prefix_fetches_total)
+        return n_dispatched
+
     def on_layer_all_pages(self, next_layer_idx, budget, stats,
                             connector_meta=None):
         """Budget >= 1.0: fetch every stored page via kFetchAll (no scoring)."""
@@ -83,7 +284,7 @@ class _WorkerFetchApplyMixin:
             self._fetch_all_one_request(
                 rid, rs, req_idx, next_layer_idx, budget, stats)
     def _fetch_all_one_request(self, rid, rs, req_idx, next_layer_idx,
-                                budget, stats):
+                                budget, stats, force_apply_all_layers=False):
         """FetchAll path: one RPC per request that covers ALL layers.
 
         Budget=1.0 means the caller wants every page for every layer. No
@@ -96,6 +297,18 @@ class _WorkerFetchApplyMixin:
         Subsequent scoring-boundary calls for the same request promote
         pre-populated _pending_reuse[layer] entries into _pending_scores
         (same pattern as on_layer_reuse).
+
+        Phase 1 / Blocker 2 finish (2026-06-02): `force_apply_all_layers`
+        bypasses the `_skip_nonscored` filter so the apply path populates
+        _pending_reuse for EVERY layer in [next_layer_idx, num_layers-1],
+        using raw abs_layer delta (not scored_rank delta). Required by
+        the matched-prefix load path (`_handle_matched_prefix_fetches`)
+        to avoid silently leaving non-scored layers' KV blocks empty,
+        which would cause vLLM forward to attend to uninitialized memory
+        for the matched range. Caller must guarantee the sink + server-side
+        trie hold KV for every layer (true for uniform models by default;
+        true for gemma-3 only with ICMS_WRITE_ALL_LAYERS=1 + matching
+        server build).
         """
         # 2026-05-28 INSTR-FA: tag entry with layer + initial path. Path
         # is filled in below as the branch is taken (fast/slow/invalidated/
@@ -529,8 +742,17 @@ class _WorkerFetchApplyMixin:
             # _pending_reuse for every reuse layer, not just scored
             # ones, and use raw abs_layer delta (sink slot index ==
             # layer index when sink is sized for num_layers).
+            # Phase 1 / Blocker 2 finish (2026-06-02):
+            # `force_apply_all_layers=True` (passed by the matched-prefix
+            # load path) has the same semantics as ICMS_FULL_FETCH=1 for
+            # this single call WITHOUT requiring the global FULL_FETCH
+            # mode (which hard-raises in multi-rid + sizes the sink
+            # differently). Safe because (a) sink at multi-rid is already
+            # sized for num_kv_layers = num_layers when sw_mask==0, (b)
+            # uniform-model servers write all layers' KV by default.
             _full_fetch = (
-                os.environ.get("ICMS_FULL_FETCH", "0") == "1")
+                os.environ.get("ICMS_FULL_FETCH", "0") == "1"
+                or force_apply_all_layers)
             _skip_nonscored = _mask_set and not _full_fetch
             if _mask_set and not _full_fetch:
                 _base_scored_rank = self._geom.scored_rank(next_layer_idx)
@@ -553,6 +775,25 @@ class _WorkerFetchApplyMixin:
                     # (multi-rid stride-reuse fix, 2026-05-05).
                     self._pending_reuse.setdefault(reuse_attn, {})[rid] = (
                         reply, reuse_offsets, req_idx)
+                    # Phase 1 / Blocker 2 finish (2026-06-02): when
+                    # force_apply_all_layers=True (matched-prefix path),
+                    # ALSO populate _pending_scores for non-calling
+                    # layers so wait_for_layer's pop+apply path fires
+                    # for them without depending on on_layer_reuse
+                    # being triggered by vLLM's quest_hooks (which may
+                    # not fire for arbitrary non-scored layers when
+                    # neither dense_layers_mask nor contiguous-reuse
+                    # mode is set — e.g., qwen3 with sparse scored
+                    # mask but no contiguous-reuse). Without this,
+                    # _pending_reuse[L] sits unread and wait_for_layer
+                    # finds _pending_scores[L] empty → no apply →
+                    # garbage attention for the matched range.
+                    if force_apply_all_layers:
+                        import copy as _copy
+                        promoted = _copy.copy(reply)
+                        promoted.sink_offsets = reuse_offsets
+                        self._pending_scores.setdefault(
+                            reuse_attn, {})[rid] = (promoted, req_idx)
             # Audit Finding 1 fix: defer the `_fetch_all_complete=True`
             # write until after cross-rank consensus below. Setting it
             # here (inside the try) was the pre-fix bug — if a peer
@@ -807,17 +1048,22 @@ class _WorkerFetchApplyMixin:
         # fall through to pop+apply so attention reads from the sink
         # (where Phase-2 just landed full-page data) rather than from
         # vLLM's natural bt.
-        # CRITICAL gate (2026-05-29 v2): the lift is ONLY safe when this
-        # specific call has data pending for the layer (B fetch_all path
-        # populates _pending_reuse for all 48 layers). For C (Score
-        # path), only the scored layer + its reuse range get data; other
-        # non-scored layers must still short-circuit or wait_for_layer
-        # spins to its 5s flag-timeout. Probe the pending dicts to
-        # distinguish: presence ⇒ B full-fetch, absence ⇒ C/legacy.
-        _full_fetch_wfl = (
-            os.environ.get("ICMS_FULL_FETCH", "0") == "1")
+        # 2026-06-02 Phase 1 / Blocker 2 finish: the env-gated check
+        # was previously skipped when ICMS_FULL_FETCH was unset (the
+        # default for multi-rid). That meant the Phase 1 matched-prefix
+        # path's _pending_reuse population for non-scored layers (via
+        # force_apply_all_layers=True at fetch_all_one_request) was
+        # silently ignored here — non-scored layers short-circuited
+        # and attended to vLLM's empty blocks for the elided matched
+        # range. Dropping the env gate so the pending-dict presence
+        # check ALWAYS runs. Cost: one dict-lookup per non-scored
+        # layer per request (~40×8×1µs = ~320µs per forward at
+        # ctx=32K × 8 sessions). Cheap for the correctness it buys.
+        # The 2-line check below is rate-limiting only when the dicts
+        # are genuinely empty (no pending data); presence falls through
+        # to the existing apply path with no extra work.
         _has_pending_for_layer = False
-        if _full_fetch_wfl and _abs_layer_for_mask is not None:
+        if _abs_layer_for_mask is not None:
             _canonical = (
                 f"model.layers.{_abs_layer_for_mask}.self_attn.attn")
             with self._score_lock:

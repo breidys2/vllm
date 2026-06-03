@@ -160,6 +160,16 @@ class _Scheduler:
         self._new_detached_waiter_rids_this_step: list[str] = []
         self._new_waiters_this_step: list[
             tuple[tuple[int, ...], list[str]]] = []
+        # Phase 1 / Blocker 2 (2026-06-02): scheduler-side accumulator for
+        # prefill-mode matched-prefix locators. Populated in
+        # `get_num_new_matched_tokens` when matched_groups > 0 (synchronous
+        # load path, NOT the PR7b async waiter path) and drained in
+        # `build_meta` into `meta.matched_prefix_locators` for worker
+        # consumption. Without this ferry, vLLM elides prefill on matched
+        # tokens but the worker never fetches → silent garbage output.
+        # Insertion-ordered (rid, matched_groups) tuples; TP ranks see the
+        # same order via pickle round-trip.
+        self._pending_matched_locators: list[tuple[str, int]] = []
         # Telemetry counters (PR12 surface).
         self.pr7b_stats: dict[str, int] = {
             "inflight_chains_added_total": 0,
@@ -410,6 +420,15 @@ class _Scheduler:
             meta.detached_waiter_rids = (
                 self._new_detached_waiter_rids_this_step)
             self._new_detached_waiter_rids_this_step = []
+        # Phase 1 / Blocker 2 (2026-06-02): drain matched-prefix locators
+        # for prefill-mode worker fetch ferry. Worker reads in
+        # `on_step_start` and fires a fetch_all RPC per locator so the
+        # matched range's KV blocks are populated before the first
+        # attention layer runs.
+        _pml = getattr(self, "_pending_matched_locators", None)
+        if _pml:
+            meta.matched_prefix_locators = _pml
+            self._pending_matched_locators = []
 
         # Per-step scheduled token counts (req_id → num_tokens this step).
         # 2026-05-07 BUG FIX: vLLM V2's canonical field is
@@ -888,6 +907,55 @@ class _Scheduler:
         if matched_groups == 0:
             return 0, False
 
+        # Phase 1 / Blocker 2 / 2026-06-03 live-finding:
+        # Scheduler-side mirror of the worker's boot-time gate. ONLY
+        # fires when the operator opted INTO Phase 1
+        # (ICMS_MATCHED_PREFIX_ENABLE=1 or ICMS_FULL_FETCH=1) but the
+        # server's reply geometry would truncate to scored layers
+        # (ICMS_SCORED_LAYERS set + ICMS_SERVER_HAS_FULL_GEOMETRY=0).
+        # In that case, the worker's `_handle_matched_prefix_fetches`
+        # refuses to dispatch → no fetch fires. Without this NMT
+        # mirror, vLLM would still elide the prefill → garbage
+        # attention. Returning 0 here makes vLLM cold-prefill (correct).
+        #
+        # When operator did NOT opt into Phase 1 (default), this gate
+        # is a no-op — the legacy NMT behavior is preserved. Tests
+        # that exercise the scheduler-side contract in isolation
+        # (test_cross_turn_match_cycle) are unaffected.
+        #
+        # See docs/phase1_matched_prefix_bridge_architecture.md for
+        # the env contract.
+        if not is_async:
+            _opted_into_phase1 = (
+                os.environ.get("ICMS_FULL_FETCH", "0") == "1"
+                or os.environ.get(
+                    "ICMS_MATCHED_PREFIX_ENABLE", "0") == "1")
+            if _opted_into_phase1:
+                _scored_layers_env = os.environ.get(
+                    "ICMS_SCORED_LAYERS", "")
+                _server_has_full_geometry = (
+                    os.environ.get(
+                        "ICMS_SERVER_HAS_FULL_GEOMETRY", "0") == "1")
+                _server_geom_clear = (
+                    _scored_layers_env == ""
+                    or _server_has_full_geometry)
+                if not _server_geom_clear:
+                    if not getattr(self,
+                                   "_matched_prefix_disabled_logged",
+                                   False):
+                        logger.warning(
+                            "[icms-matched-prefix] scheduler-side NMT "
+                            "gate FIRED: operator opted into Phase 1 "
+                            "but ICMS_SCORED_LAYERS=%r is set without "
+                            "ICMS_SERVER_HAS_FULL_GEOMETRY=1. Returning "
+                            "0 matched_tokens so vLLM cold-prefills "
+                            "(worker would refuse to dispatch → "
+                            "garbage otherwise). See "
+                            "docs/phase1_matched_prefix_bridge_architecture.md.",
+                            _scored_layers_env)
+                        self._matched_prefix_disabled_logged = True
+                    return 0, False
+
         # Convert groups to tokens. Each group = GROUP_PAGES * PAGE_TOKENS.
         matched_tokens = matched_groups * _GROUP_BLOCKS * PAGE_TOKENS
         # Subtract what's already locally computed.
@@ -921,6 +989,26 @@ class _Scheduler:
                 returned=(int(ext_tokens), False),
                 prompt_len=int(total_prompt),
             )
+        # Phase 1 / Blocker 2 (2026-06-02): stage matched-prefix locator
+        # for the worker so it can fire a fetch_all RPC at on_step_start
+        # time, populating vLLM's allocated KV blocks for the matched
+        # range BEFORE the first attention layer runs. Only the
+        # SYNCHRONOUS load path (is_async=False) needs this — the
+        # PR7b async waiter path (is_async=True) is already handled by
+        # `chain_waiters` + worker `pr7b_ingest_chain_waiters`. Only
+        # fire in prefill-mode; eviction-mode has its own (separate)
+        # cross-iter design that intentionally defers reads to vLLM's
+        # prefix cache (see [icms-stored-chain-wait-skip] log line).
+        if (not is_async
+                and matched_groups > 0
+                and getattr(self, "_write_mode", "prefill") == "prefill"):
+            # Defensive: tests may partially-mock _Scheduler without
+            # calling __init__. Lazy-init the list so the ferry stays
+            # functional in production AND tests that don't exercise it
+            # don't crash. Production __init__ already sets the list.
+            if not hasattr(self, "_pending_matched_locators"):
+                self._pending_matched_locators = []
+            self._pending_matched_locators.append((rid, matched_groups))
         # PR7b: pass through is_async — True only when the request is
         # waiting on an inflight chain that needs to complete. False
         # for the normal synchronous load (worker fills blocks during

@@ -139,6 +139,25 @@ class IcmsConnectorMetadata(KVConnectorMetadata):
     # scheduler.py:2059 assert (rid's status != WAITING_FOR_REMOTE_KVS
     # and != is_finished).
     detached_waiter_rids: list[str] = field(default_factory=list)
+    # Phase 1 / Blocker 2 (2026-06-02): scheduler→worker ferry for the
+    # prefill-mode matched-prefix load path. When `get_num_new_matched_tokens`
+    # returns matched_groups > 0 in prefill-mode (synchronous load,
+    # is_async=False), vLLM elides prefill on the matched token range
+    # and expects the worker to populate those KV blocks via
+    # `start_load_kv`. The eviction-mode `evicted_chain_locators` ferries
+    # WRITE-side data (block_pool evictions → BF2). This field is the
+    # symmetric READ-side ferry: a list of (rid, matched_groups) so the
+    # worker can issue a fetch_all RPC for each matched-prefix request
+    # at on_step_start time, before the first attention layer runs.
+    # Without this bridge, the worker never fetches → vLLM forward runs
+    # on uninitialized KV blocks for the matched range → silent
+    # garbage output (worst-case benchmarking failure).
+    # See project_derisk_4config_layered_blockers_2026-06-02.
+    # Insertion-ordered list of (rid, matched_groups) tuples for pickle
+    # determinism across the TP>1 spawn boundary (same rationale as
+    # evicted_chain_locators).
+    matched_prefix_locators: list[tuple[str, int]] = field(
+        default_factory=list)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -775,6 +775,40 @@ class _WorkerBase:
         _sw_mask = parse_scored_layers(_sw_spec)
         if _sw_mask != 0 and self._geom.num_layers < 64:
             _sw_mask &= ((1 << self._geom.num_layers) - 1)
+        # Phase 1 gemma-3 skeleton (2026-06-02): ICMS_WRITE_ALL_LAYERS=1
+        # forces sw_layers_mask=0 regardless of ICMS_SW_LAYERS so all
+        # 62 layers' K/V get written to BF2 (matching uniform-model
+        # behavior). Required for gemma-3 to participate in the
+        # prefill-mode matched-prefix load path — without this, only
+        # 10 of 62 layers' K/V land in BF2 → forward runs on garbage KV
+        # for the 52 SW layers → silent wrong output.
+        #
+        # NOTE: this gate is the CLIENT-SIDE half of the gemma-3 fix.
+        # The other halves require:
+        #   (1) BF2 server built without --sw-layers (or with matching
+        #       geometry). With production BF2 (current --sw-layers set),
+        #       per-group payload size mismatches → WriteGroup returns
+        #       kError on every write.
+        #   (2) ICMS_HYBRID_COLD_DISABLE=1 to disable the scheduler-side
+        #       hybrid-cold-fallback that forces matched_groups=0 for
+        #       hybrid models (icms_connector_scheduler.py:608-626).
+        #   (3) ICMS_FULL_FETCH=1 in single-rid mode (hard-raises in
+        #       multi-rid) so the apply path uses raw layer index instead
+        #       of scored_rank, populating all 62 layers' _pending_reuse.
+        # See project_phase1_gemma3_skeleton_2026-06-02 for the handoff.
+        if (_sw_mask != 0
+                and os.environ.get("ICMS_WRITE_ALL_LAYERS", "0") == "1"):
+            logger.warning(
+                "[icms-init] ICMS_WRITE_ALL_LAYERS=1: clearing "
+                "ICMS_SW_LAYERS mask (was 0x%x popcount=%d). All %d "
+                "layers will be written to BF2. WARNING: production BF2 "
+                "expects SW-stripped payloads (per_group_bytes sized to "
+                "num_layers - num_sw_layers); without matching server "
+                "geometry, every WriteGroup will fail with kError. "
+                "See project_phase1_gemma3_skeleton_2026-06-02.",
+                _sw_mask, bin(_sw_mask).count("1"),
+                self._geom.num_layers)
+            _sw_mask = 0
         if _sw_mask != 0:
             # SW and scored masks must be disjoint (a layer can't be
             # both scored and SW).
@@ -969,8 +1003,46 @@ class _WorkerBase:
         #   - clamp _sink_slots to 1: at 6× more layers, _sink_slots>1
         #     would 6× the GPU memory pressure (>60 GB/rank, infeasible).
         #     Also disables multi-rid (ICMS_ALLOW_BATCH) safely.
+        # Phase 1 / Blocker 2 (2026-06-02): ICMS_MATCHED_PREFIX_ENABLE=1
+        # makes the matched-prefix bridge correctness-safe in multi-rid
+        # by sizing the sink for num_layers (so force_apply_all_layers'
+        # _pending_reuse offsets land within the sink). Behaves like
+        # ICMS_FULL_FETCH=1 for sink sizing but does NOT trigger the
+        # multi-rid hard-raise (operator opts in knowing the GPU memory
+        # math). At qwen3 ctx=32K with self._k=4096 the sink is ~128 MB
+        # × num_layers × n_slots; at multi-rid (max_num_seqs=8) that's
+        # ~49 GB / rank → won't fit on 80 GB H100 with model weights +
+        # vLLM KV. Operator must reduce one of: max_num_seqs, self._k
+        # (via ICMS_K), gmu (vLLM KV pool), or move to H200. Recipe in
+        # project_phase1_apply_all_layers_2026-06-02.
+        _matched_prefix_enable = (
+            os.environ.get("ICMS_MATCHED_PREFIX_ENABLE", "0") == "1")
+        # Defense 2 (2026-06-03, live-finding): auto-set ICMS_REPLY_EARLY=0
+        # when MATCHED_PREFIX_ENABLE=1, unless the operator explicitly
+        # overrode it. With REPLY_EARLY=1 (default), the server flips
+        # per-layer ready-flags AFTER each layer's KV is written; the
+        # client's wait_for_layer spins on those flags. But the server
+        # only flips flags for SCORED layers (per --scored-layers).
+        # force_apply_all_layers=True wires wait_for_layer to also
+        # check non-scored layers, which never get a flag flip → 5s
+        # timeout per layer × 40 non-scored layers = ~200s stall per
+        # request (verified live 2026-06-03 with 4/49 completion at
+        # qps=0.5 × 90s). REPLY_EARLY=0 makes the server hold the reply
+        # until all writes land — no flag wait. The latency cost
+        # (one extra RDMA round-trip per fetch_all) is dwarfed by the
+        # 200s flag-timeout cost.
+        if (_matched_prefix_enable
+                and os.environ.get("ICMS_REPLY_EARLY") is None):
+            os.environ["ICMS_REPLY_EARLY"] = "0"
+            logger.warning(
+                "[icms-matched-prefix-enable] auto-set "
+                "ICMS_REPLY_EARLY=0 to avoid the 200s per-layer flag-"
+                "timeout trap. Explicitly set ICMS_REPLY_EARLY=1 to "
+                "override (only valid when the server flips flags for "
+                "ALL layers — most operators want the default).")
         _full_fetch_mode = (
-            os.environ.get("ICMS_FULL_FETCH", "0") == "1")
+            os.environ.get("ICMS_FULL_FETCH", "0") == "1"
+            or _matched_prefix_enable)
         if _full_fetch_mode:
             if self._geom.dense_layers_mask != 0:
                 # Mode-aware advice (PR1 eviction-mode refactor): under
@@ -990,7 +1062,15 @@ class _WorkerBase:
                     "models (dense_layers_mask != 0). gemma-3 SW layer "
                     "apply path is undefined under full-fetch. "
                     "Use ICMS_FULL_FETCH=0 for hybrid models.")
-            if self._is_multi_rid_mode() and self._write_mode != "eviction":
+            # Legacy ICMS_FULL_FETCH=1 hard-raises in multi-rid (operator
+            # didn't opt in to the GPU memory math). The new
+            # ICMS_MATCHED_PREFIX_ENABLE=1 path lets operator opt in.
+            _legacy_full_fetch_only = (
+                os.environ.get("ICMS_FULL_FETCH", "0") == "1"
+                and not _matched_prefix_enable)
+            if (_legacy_full_fetch_only
+                    and self._is_multi_rid_mode()
+                    and self._write_mode != "eviction"):
                 # Under WRITE_MODE=eviction the sink sizing semantics are
                 # different (writeback queue, not single in-flight slot)
                 # so the multi-rid prohibition does NOT apply. PR4 lands
@@ -999,7 +1079,11 @@ class _WorkerBase:
                 raise RuntimeError(
                     "ICMS_FULL_FETCH=1 requires single-rid mode "
                     "(max_num_seqs=1 AND ICMS_ALLOW_BATCH unset). "
-                    "Multi-rid at 6× sink size would OOM the GPU.")
+                    "Multi-rid at 6× sink size would OOM the GPU. "
+                    "For Phase 1 matched-prefix multi-rid, use "
+                    "ICMS_MATCHED_PREFIX_ENABLE=1 instead (operator "
+                    "must verify max_num_seqs × num_layers × per_layer "
+                    "fits in GPU memory).")
             # 2026-05-30: use num_kv_layers, NOT num_layers. For uniform
             # models (sw_mask=0) num_kv_layers == num_layers so this is
             # byte-identical. For SW models like gemma-3 (sw_mask!=0),
@@ -1008,21 +1092,91 @@ class _WorkerBase:
             # missed this site, causing 62 GB sink + 25 GB model + 32 GB
             # vLLM KV = 119 GB > 93 GB cap → OOM at first kv_cache alloc.
             _eff_layers = int(self._geom.num_kv_layers)
-            if self._sink_slots != 1:
+            # Only clamp _sink_slots=1 under legacy FULL_FETCH (the
+            # original safety net). Phase 1 matched-prefix opt-in keeps
+            # multi-slot so concurrent rids can each acquire a slot for
+            # their matched-prefix load.
+            if _legacy_full_fetch_only and self._sink_slots != 1:
                 logger.warning(
                     "[icms-full-fetch] clamping _sink_slots %d -> 1 "
                     "to fit %d-layer sink in GPU memory",
                     self._sink_slots, _eff_layers)
                 self._sink_slots = 1
-            logger.info(
-                "[icms-full-fetch] ACTIVE: sink sized for num_layers=%d "
-                "(was num_scored=%d); _sink_slots=1",
-                _eff_layers, int(self._geom.num_scored_layers))
+            if _matched_prefix_enable:
+                _est_total_gb = (
+                    _eff_layers
+                    * (int(self._geom.kv_page_bytes)
+                       * int(getattr(self, "_k", 4096)))
+                    * self._sink_slots
+                    / (1 << 30))
+                logger.info(
+                    "[icms-matched-prefix-enable] ACTIVE: sink sized for "
+                    "num_layers=%d × n_slots=%d → ~%.1f GB / rank. "
+                    "Verify this + model weights + vLLM KV fits in GPU "
+                    "memory; reduce max_num_seqs / ICMS_K / GMU if not.",
+                    _eff_layers, self._sink_slots, _est_total_gb)
+            else:
+                logger.info(
+                    "[icms-full-fetch] ACTIVE: sink sized for num_layers=%d "
+                    "(was num_scored=%d); _sink_slots=%d",
+                    _eff_layers, int(self._geom.num_scored_layers),
+                    self._sink_slots)
         else:
             _eff_layers = (int(self._geom.num_scored_layers)
                            if (self._geom.scored_layers_mask != 0
                                and self._geom.dense_layers_mask == 0)
                            else int(self._geom.num_layers))
+        # Phase 1 matched-prefix correctness gate (boot-time, single
+        # source of truth). True iff ALL of the following hold:
+        #   (a) Sink is sized for num_layers (not just num_scored)
+        #       — set by _full_fetch_mode taking effect above.
+        #   (b) Server's fetch_all reply geometry covers num_layers
+        #       (not just scored). Today this requires the server to
+        #       be rebuilt without --scored-layers; operator asserts
+        #       this via ICMS_SERVER_HAS_FULL_GEOMETRY=1. When the
+        #       client geometry has no scored mask (scored_layers_mask=0),
+        #       there's no server filter to worry about and the
+        #       assertion is implicit.
+        # When False, _handle_matched_prefix_fetches refuses to dispatch
+        # → vLLM cold-prefills (correct but slower). Single boot-time
+        # decision; no per-request env checks (avoids per-request log
+        # spam + makes the disable-reason visible at boot).
+        _server_has_full_geometry_asserted = (
+            os.environ.get("ICMS_SERVER_HAS_FULL_GEOMETRY", "0") == "1")
+        _server_geom_clear = (
+            self._geom.scored_layers_mask == 0
+            or _server_has_full_geometry_asserted)
+        self._matched_prefix_sink_ready = bool(
+            _full_fetch_mode and _server_geom_clear)
+        if _full_fetch_mode and not self._matched_prefix_sink_ready:
+            # Operator opted into Phase 1 (sink-sized for num_layers)
+            # but server's reply geometry would still truncate to
+            # scored layers — Phase 1 stays disabled. Log loud at
+            # boot, not per-request.
+            logger.warning(
+                "[icms-matched-prefix] DISABLED at boot: sink IS sized "
+                "for num_layers (ICMS_FULL_FETCH=1 or "
+                "ICMS_MATCHED_PREFIX_ENABLE=1 took effect), but server "
+                "has scored_layers_mask=0x%x → fetch_all reply only "
+                "ships scored layers' sink_offsets. Without "
+                "ICMS_SERVER_HAS_FULL_GEOMETRY=1 (set after rebuilding "
+                "BF2 server without --scored-layers), Phase 1 would "
+                "extrapolate non-scored layers' offsets to unallocated "
+                "sink regions → non-deterministic garbage outputs "
+                "(verified live 2026-06-03). Phase 1 disabled; vLLM "
+                "will cold-prefill matched-prefix requests. See "
+                "docs/phase1_matched_prefix_bridge_architecture.md.",
+                int(self._geom.scored_layers_mask))
+        elif self._matched_prefix_sink_ready:
+            logger.info(
+                "[icms-matched-prefix] ENABLED at boot: sink sized for "
+                "num_layers=%d, server geometry asserted clear "
+                "(scored_mask=0x%x, has_full_geometry=%s). Phase 1 "
+                "matched-prefix bridge will fire for prefill-mode "
+                "matched requests.",
+                int(self._geom.num_layers),
+                int(self._geom.scored_layers_mask),
+                _server_has_full_geometry_asserted)
         sink_layers = max(self._score_stride, _eff_layers)
         # B1: scale the sink to hold `_sink_slots` concurrent dumps.
         # Default _sink_slots=1 preserves legacy behavior; under

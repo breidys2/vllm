@@ -414,6 +414,26 @@ class _WorkerStateMixin:
             rs = self._requests.setdefault(rid, _RequestState(request_id=rid))
             rs.block_ids = bids
 
+        # Phase 1 / Blocker 2 (2026-06-02): trigger fetch_all for prefill-
+        # mode matched-prefix requests. The scheduler stages locators in
+        # `get_num_new_matched_tokens` when matched_groups>0 (synchronous
+        # load path); this is the worker-side ferry consumer. Must run
+        # AFTER the new_chains loops above so rs.chain and rs.block_ids
+        # are populated for every locator's rid (the fetch_all RPC and
+        # the per-layer apply path both depend on those). Gate on
+        # write_mode=prefill because eviction-mode has its own (separate)
+        # cross-iter design that defers reads to vLLM's prefix cache;
+        # the scheduler-side stage gate matches.
+        if (getattr(self, "_write_mode", "prefill") == "prefill"
+                and getattr(meta, "matched_prefix_locators", None)):
+            try:
+                self._handle_matched_prefix_fetches(meta)
+            except Exception:
+                logger.exception(
+                    "[matched-prefix] _handle_matched_prefix_fetches "
+                    "raised — vLLM forward may run on garbage KV for "
+                    "any matched-prefix requests this step")
+
         # 2026-05-31 prefill-time local_mask seed (ICMS_LOCAL_MASK_FROM_L1=1).
         # vLLM's prefix cache returns block IDs for a contiguous head of the
         # prompt (`prov_local_cached_tokens`). Those head pages already hold
