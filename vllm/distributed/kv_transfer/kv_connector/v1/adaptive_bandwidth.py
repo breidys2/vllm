@@ -207,6 +207,29 @@ class AdaptiveBandwidthAllocator:
                 return 1.0
             return self._compute_budget(demand)
 
+    def compute_budget(self, **kwargs) -> float:
+        """Quest-hook adapter (2026-06-03). The Quest hook calls
+        `budget_computer.compute_budget(approximate_scores=…, layer_idx=…,
+        num_layers=…)` once per (layer, batch). The hook doesn't pass a
+        rid because it fires at batch granularity. We return the MIN
+        budget across all active rids so no rid is allocated more than
+        its proportional share. Returns 1.0 when no rid is registered
+        (idle / before any matched-prefix request entered).
+
+        Pre-2026-06-03 this method was missing, causing AttributeError
+        if the hook tried to call it — but in practice the hook never
+        reached the call because the V2-style allocator pickup chain
+        (`connector_worker.spec.get_adaptive_allocator`) didn't match
+        ICMS, so `budget_computer` stayed as DynamicBudget(1.0). After
+        ICMS-direct allocator pickup landed, this adapter is required.
+        kwargs are ignored — kept for API compat with QuestHookManager.
+        """
+        with self._lock:
+            if not self._active:
+                return 1.0
+            return min(
+                self._compute_budget(d) for d in self._active.values())
+
     def unregister_request(self, request_id: str):
         """Remove a finished request from the demand tracker."""
         with self._lock:

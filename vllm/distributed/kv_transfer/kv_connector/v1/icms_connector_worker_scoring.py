@@ -41,6 +41,66 @@ _GROUP_BLOCKS = GROUP_PAGES
 
 
 class _WorkerScoringMixin:
+    def _maybe_enable_async_score(self) -> bool:
+        """Return True if the client is in async multiplexed scoring mode
+        (so the caller drops the _rpc_lock and scores concurrently).
+
+        Opt-in (ICMS_ASYNC_SCORE=1) and only flipped on when the
+        SKIP_ARCHIVE sentinel is present — i.e. measure-time, when writes
+        are suppressed, so no sync write/evict RPC can race the dispatcher
+        for the CQ. The flip is one-time and done under _rpc_lock so no
+        in-flight sync RPC overlaps it. Idempotent + cheap on the hot path.
+        """
+        cli = getattr(self, "_client", None)
+        # UNCONDITIONAL first-call probe (before ANY early return) — last run the
+        # dbg never logged, meaning we bailed at the hasattr/async_enabled gate.
+        if not getattr(self, "_async_dbg_logged", False):
+            self._async_dbg_logged = True
+            try:
+                _ae = cli.async_enabled() if (cli is not None and hasattr(cli, "async_enabled")) else "NO_METHOD"
+            except Exception as _e:  # noqa: BLE001
+                _ae = "THREW:%s" % _e
+            logger.info("[async-score][dbg] cli_type=%s has_enable_async=%s "
+                        "has_async_enabled=%s async_enabled=%s env=%s file=%s",
+                        type(cli).__name__ if cli is not None else None,
+                        hasattr(cli, "enable_async") if cli is not None else False,
+                        hasattr(cli, "async_enabled") if cli is not None else False,
+                        _ae,
+                        os.environ.get("ICMS_ASYNC_SCORE") == "1",
+                        os.path.exists("/tmp/icms_async_enable"))
+        if cli is None or not hasattr(cli, "async_enabled"):
+            return False
+        try:
+            if cli.async_enabled():
+                return True
+        except Exception:
+            return False
+        # Opt-in gate. ICMS_ASYNC_SCORE env vars do NOT reliably reach the
+        # vLLM worker process (spawned clean; only a subset of os.environ is
+        # injected at runtime), so ALSO honor a file sentinel which provably
+        # does reach the worker (same mechanism SKIP_ARCHIVE uses).
+        _async_env = os.environ.get("ICMS_ASYNC_SCORE") == "1"
+        _async_file = os.path.exists("/tmp/icms_async_enable")
+        sentinel = os.environ.get("ICMS_SKIP_ARCHIVE_SENTINEL", "")
+        _sent_ok = bool(sentinel and os.path.exists(sentinel))
+        if not (_async_env or _async_file):
+            return False
+        if not _sent_ok:
+            return False  # not measure-time → writes may still fire; stay sync
+        with self._rpc_lock:  # ensure no sync RPC is mid-flight during the flip
+            try:
+                if not cli.async_enabled():
+                    _ok = cli.enable_async()
+                    logger.info("[async-score] enable_async()=%s (SKIP_ARCHIVE "
+                                "active): scores now %s", _ok,
+                                "concurrent" if _ok else "STILL SYNC")
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[async-score] enable_async failed: %s", e)
+        try:
+            return cli.async_enabled()
+        except Exception:
+            return False
+
     def on_layer_score(self, next_layer_idx, quest_query, budget, stats,
                         connector_meta=None):
         """CPU-scoring path: Q arrived, fire Score against icms (C9 State 2/3).
@@ -1415,6 +1475,22 @@ class _WorkerScoringMixin:
                     _retry_count, _retry_delay_s = 3, 0.020
 
                 _rk_chain = self._rank_chain(rs.chain)
+                # Phase 1 matched-prefix (2026-06-03): when this rid was
+                # routed through the matched-prefix bridge AND the bridge
+                # deferred to per-layer Score (ICMS_MATCHED_PREFIX_BUDGET_AWARE=1),
+                # set write_all_layers so the server bypasses its
+                # scored_layers_mask filter — Phase-2 writes K/V for every
+                # layer in [layer..reuse_through_layer], not just the scored
+                # one. Required because matched-prefix elision leaves the
+                # 40 non-scored layers (qwen3) with no other K/V source.
+                _wall = bool(getattr(rs, "matched_prefix_request", False))
+                if _wall and os.environ.get("ICMS_DIAG_MATCHED_PREFIX", "0") == "1":
+                    logger.info(
+                        "[diag-mp] score-rpc: rid=%s layer=%d k=%d "
+                        "reuse_through=%d write_all_layers=1 "
+                        "demand_bps=%d compute_supply_bps=%d",
+                        rid[:8], next_layer_idx, k, reuse_through,
+                        ab_demand_bps, ab_compute_supply_bps)
                 _score_kwargs = dict(
                     request_id=icms_rid,
                     chain=_rk_chain,
@@ -1427,6 +1503,7 @@ class _WorkerScoringMixin:
                     fetch_bitmap=fetch_bitmap,
                     demand_bps=ab_demand_bps,
                     compute_supply_bps=ab_compute_supply_bps,
+                    write_all_layers=_wall,
                 )
                 # 2026-05-08 race-audit follow-up: log the chain prefix
                 # actually sent to Score. The pids-hash diag showed
@@ -1477,25 +1554,57 @@ class _WorkerScoringMixin:
                                        == "1")
                         _t_srpc0 = (time.perf_counter()
                                     if _instr_srpc else 0.0)
-                        with self._rpc_lock:  # X1 (race-audit): serialize tx_/rx_
+                        _t_inlock = 0.0
+                        # ASYNC SUBMIT (ICMS_ASYNC_SCORE=1, measure-time): once
+                        # enabled the client multiplexes concurrent scores on
+                        # one connection and demuxes by request_id, so we DROP
+                        # the RTT-long _rpc_lock — the burst-serialization cork.
+                        # Falls back to the locked sync path otherwise.
+                        if self._maybe_enable_async_score():
+                            # reply-early (use_flags) gives the score a two-phase
+                            # completion (early reply + flag-based KV landing)
+                            # that breaks the async mux's one-reply-per-
+                            # request_id demux → score_get hangs the full
+                            # timeout. Async already takes the score off the
+                            # critical path, so the early-reply overlap is
+                            # redundant. Force the single-reply (full-completion)
+                            # path. Verified: REPLY_EARLY=0 async runs clean,
+                            # REPLY_EARLY=1 async hangs 10s/score.
+                            _score_kwargs["use_flags"] = False
+                            _t_inlock = (time.perf_counter()
+                                         if _instr_srpc else 0.0)
                             reply = self._client.score(**_score_kwargs)
+                            _t_done = (time.perf_counter()
+                                       if _instr_srpc else 0.0)
+                        else:
+                            with self._rpc_lock:  # X1 (race-audit): serialize tx_/rx_
+                                # Capture lock-acquire boundary: _t_srpc0→here =
+                                # LOCK-WAIT (serialization); here→after .score() =
+                                # IN-LOCK (RTT + server queue + transport).
+                                _t_inlock = (time.perf_counter()
+                                             if _instr_srpc else 0.0)
+                                reply = self._client.score(**_score_kwargs)
+                                _t_done = (time.perf_counter()
+                                           if _instr_srpc else 0.0)
                         if _instr_srpc:
-                            # [INSTR-SCORE-RPC] wall time around the wire
-                            # round-trip + server-side scoring. Server's
-                            # `reply.score_ns` gives the server-side
-                            # compute time; wire_us - score_ns = wire RTT
-                            # + queue latency on both sides.
-                            _wire_us = (time.perf_counter()
-                                        - _t_srpc0) * 1e6
-                            _srv_score_us = (
-                                int(getattr(reply, "score_ns", 0)) // 1000
-                                if reply is not None else 0)
+                            _wire_us = (time.perf_counter() - _t_srpc0) * 1e6
+                            _lock_wait_us = (_t_inlock - _t_srpc0) * 1e6
+                            _in_lock_us = (_t_done - _t_inlock) * 1e6
+                            _g = lambda f: (int(getattr(reply, f, 0)) // 1000
+                                            if reply is not None else 0)
                             logger.info(
                                 "[INSTR-SCORE-RPC] layer=%d wire_us=%.1f "
-                                "server_score_us=%d wire_minus_server_us=%.1f",
+                                "lock_wait_us=%.1f in_lock_us=%.1f "
+                                "srv_ready_us=%d srv_score_us=%d "
+                                "srv_trie_us=%d srv_summary_us=%d "
+                                "srv_sink_us=%d srv_concurrent=%d",
                                 next_layer_idx, _wire_us,
-                                _srv_score_us,
-                                _wire_us - _srv_score_us)
+                                _lock_wait_us, _in_lock_us,
+                                _g("server_ingest_to_ready_ns"),
+                                _g("score_ns"), _g("trie_walk_ns"),
+                                _g("summary_read_ns"), _g("sink_write_ns"),
+                                int(getattr(reply, "concurrent_requests", 0))
+                                if reply is not None else 0)
                         break
                     except IcmsError as _e:
                         if _e.status != errno.ENOENT:
@@ -2320,6 +2429,18 @@ class _WorkerScoringMixin:
             if not self._fetch_all_post_score:
                 actual_k = len(reply.page_ids)
                 per_layer_bytes = actual_k * self._geom.kv_page_bytes
+                # Phase 1 matched-prefix (2026-06-03): mirror
+                # `force_apply_all_layers` from _fetch_all_one_request.
+                # Server with kScoreFlagWriteAllLayers wrote K/V for
+                # EVERY layer in [layer..reuse_through], not just scored.
+                # The reuse loop must populate _pending_scores too so
+                # wait_for_layer's apply fires for non-scored reuse
+                # layers (otherwise on_layer_reuse → quest_hooks gate
+                # leaves them unread → garbage attention for the matched
+                # range). Safe: sink is sized for num_layers when
+                # matched_prefix is in effect.
+                _matched_prefix = bool(
+                    getattr(rs, "matched_prefix_request", False))
                 for delta in range(1, reuse_through - next_layer_idx + 1):
                     reuse_layer = next_layer_idx + delta
                     reuse_attn = f"model.layers.{reuse_layer}.self_attn.attn"
@@ -2330,6 +2451,24 @@ class _WorkerScoringMixin:
                         # 2026-05-05). See companion site at line ~2569.
                         self._pending_reuse.setdefault(reuse_attn, {})[rid] = (
                             reply, reuse_offsets, req_idx)
+                        if _matched_prefix:
+                            import copy as _copy_mp
+                            _promoted = _copy_mp.copy(reply)
+                            _promoted.sink_offsets = reuse_offsets
+                            self._assert_pending_scores_no_clobber(
+                                reuse_attn, rid,
+                                source="score-reply-matched-prefix-reuse")
+                            self._pending_scores.setdefault(
+                                reuse_attn, {})[rid] = (_promoted, req_idx)
+                if (_matched_prefix
+                        and os.environ.get("ICMS_DIAG_MATCHED_PREFIX", "0") == "1"):
+                    logger.info(
+                        "[diag-mp] score-reuse-populate: rid=%s scored_layer=%d "
+                        "reuse_through=%d n_reuse_layers=%d k=%d "
+                        "(matched-prefix branch: pending_scores+pending_reuse "
+                        "set for all reuse layers)",
+                        rid[:8], next_layer_idx, reuse_through,
+                        reuse_through - next_layer_idx, actual_k)
             elif os.environ.get("ICMS_DIAG_FAPS") == "1":
                 logger.info(
                     "[diag-faps] score-path FAPS-gate skip rid=%s layer=%d "

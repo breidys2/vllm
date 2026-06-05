@@ -483,6 +483,16 @@ class _RequestState:
     # mismatch. Invalidating `_fetch_all_complete` on growth forces a
     # fresh FAPS dispatch covering the new chain.
     _fetch_all_committed_at_dispatch: int = 0
+    # Phase 1 matched-prefix bridge (2026-06-03): True when this rid's
+    # forward pass was elided by the scheduler's matched-prefix path.
+    # Used by the per-layer Score path to set kScoreFlagWriteAllLayers
+    # on the wire (server writes K/V for ALL layers in stride, not just
+    # scored) AND by the Score reuse loop to mirror the
+    # `force_apply_all_layers` behavior — populate _pending_scores for
+    # non-scored layers so wait_for_layer's apply fires for them too.
+    # Set by `_handle_matched_prefix_fetches`; cleared on
+    # `on_request_finished`.
+    matched_prefix_request: bool = False
 
 
 # ═══════════════════════════════════════════════════════════════════════════

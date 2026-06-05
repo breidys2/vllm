@@ -191,6 +191,22 @@ class _WorkerFetchApplyMixin:
         req_idx_by_rid: dict[str, int] = {}
         for i, step_req in enumerate(meta.requests):
             req_idx_by_rid[step_req.request_id] = i
+        # Phase 1 budget-aware routing (2026-06-03). When
+        # ICMS_MATCHED_PREFIX_BUDGET_AWARE=1, the bridge skips the eager
+        # FetchAll and only stamps rs.matched_prefix_request=True. The
+        # per-layer Quest hook (`save_kv_layer(quest_query=…)`) will
+        # then fire Score for every scored layer driven by the suffix's
+        # Q vector (pre-layer-0 hook provides Q_0; post-hooks provide
+        # Q_{L+1}). Each Score sets `kScoreFlagWriteAllLayers` server-side
+        # so the reply writes K/V for [L..next_scored-1], and the Score
+        # reuse loop populates _pending_scores for the non-scored layers
+        # (mirroring force_apply_all_layers). For C/D this honors their
+        # adaptive/fixed budget on matched-prefix loads. For B
+        # (budget=1.0) the hook's all-pages shortcut still kicks in and
+        # FetchAll fires per-layer with its full bandwidth — same effect
+        # as the eager bridge, just shifted into the hook path.
+        _budget_aware = (
+            os.environ.get("ICMS_MATCHED_PREFIX_BUDGET_AWARE", "0") == "1")
         n_dispatched = 0
         for rid, matched_groups in locators:
             if matched_groups <= 0:
@@ -207,6 +223,56 @@ class _WorkerFetchApplyMixin:
                 # FAPS path raced and fired first). Idempotent skip.
                 continue
             req_idx = req_idx_by_rid.get(rid, 0)
+            if _budget_aware:
+                # Defer to per-layer Score. Just stamp the rid so the
+                # Score path knows to set write_all_layers + populate
+                # _pending_scores for non-scored reuse layers.
+                rs.matched_prefix_request = True
+                n_dispatched += 1
+                # 2026-06-03 PM: pre-register with the adaptive allocator
+                # so Quest hooks see budget<1.0 at layer 0 of forward.
+                # Without this, hooks call allocator.compute_budget() with
+                # zero active rids → returns 1.0 → quest_all_pages
+                # shortcut → FetchAll (defeats budget-aware mode). The
+                # _score_one_request site that normally registers fires
+                # only AFTER the hook decides Score vs FetchAll —
+                # chicken-and-egg. Conservative estimates for matched-
+                # prefix elision: cache_tokens = total_pages * page_size,
+                # new_tokens ≈ 1 (suffix near-empty for full elision;
+                # demand_bps is dominated by cache transfer anyway).
+                if (self._adaptive_allocator is not None
+                        and self._geom is not None
+                        and not getattr(rs, "_adaptive_registered", False)):
+                    try:
+                        _total_pages = matched_groups * _GROUP_BLOCKS
+                        _cache_tokens = _total_pages * PAGE_TOKENS
+                        _new_tokens = 1
+                        _init_budget = (
+                            self._adaptive_allocator.register_request(
+                                rid,
+                                new_tokens=_new_tokens,
+                                cache_tokens=_cache_tokens,
+                                total_cache_pages=_total_pages))
+                        rs._adaptive_registered = True
+                        if os.environ.get(
+                                "ICMS_DIAG_MATCHED_PREFIX", "0") == "1":
+                            logger.info(
+                                "[diag-mp] bridge-prereg: rid=%s "
+                                "matched_groups=%d total_pages=%d "
+                                "cache_tokens=%d init_budget=%.3f",
+                                rid[:8], matched_groups, _total_pages,
+                                _cache_tokens, _init_budget)
+                    except Exception:
+                        logger.exception(
+                            "[matched-prefix] adaptive pre-register failed "
+                            "for rid=%s — budget may stay at 1.0", rid[:8])
+                if os.environ.get("ICMS_DIAG_MATCHED_PREFIX", "0") == "1":
+                    logger.info(
+                        "[diag-mp] budget-aware: rid=%s matched_groups=%d "
+                        "stamped rs.matched_prefix_request=True (defer to "
+                        "per-layer Score with write_all_layers=1)",
+                        rid[:8], matched_groups)
+                continue
             try:
                 # force_apply_all_layers=True: the matched-prefix load
                 # MUST populate _pending_reuse for every layer, not just

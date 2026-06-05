@@ -6152,8 +6152,169 @@ class GPUModelRunner(
                 kv_transfer_group.register_kv_caches(kv_caches)
             kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
 
+        # Register Quest hooks if Quest offloading is active.
+        # 2026-06-03: port from v1/worker/gpu/model_runner.py (V2). On V1
+        # the Quest hooks were never wired, so prior B/C/D matched-prefix
+        # sweeps had no per-layer Score driver — only the bridge's eager
+        # FetchAll fired. Without this, ICMS adaptive/sparse paths cannot
+        # differentiate from FetchAll because save_kv_layer is called
+        # without quest_query/quest_all_pages kwargs and the facade
+        # falls through.
+        self._maybe_register_quest_hooks()
+
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
+
+    def _maybe_register_quest_hooks(self) -> None:
+        """Register Quest forward hooks if Quest offloading is active.
+
+        Ported from V2's gpu/model_runner.py (2026-06-03). Wires the
+        QuestHookManager to the loaded model so after each decoder layer's
+        forward pass, Q_{L+1} is computed and sent to the KV connector for
+        page scoring + selective prefetch.
+        """
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        if kv_transfer_config is None:
+            logger.info("Quest hooks: skipped (no kv_transfer_config)")
+            return
+        extra = kv_transfer_config.kv_connector_extra_config or {}
+        if "quest_budget" not in extra and "quest_page_size" not in extra:
+            logger.info(
+                "Quest hooks: skipped (no quest_budget/quest_page_size in "
+                "kv_connector_extra_config)")
+            return
+
+        try:
+            from vllm.v1.attention.ops.quest_hooks import QuestHookManager
+
+            quest_budget = float(extra.get("quest_budget", 0.2))
+
+            _hf = self.vllm_config.model_config.hf_config
+            if hasattr(_hf, "num_hidden_layers"):
+                num_layers = _hf.num_hidden_layers
+            elif hasattr(_hf, "text_config") and hasattr(
+                    _hf.text_config, "num_hidden_layers"):
+                num_layers = _hf.text_config.num_hidden_layers
+            else:
+                raise AttributeError(
+                    "hf_config has no num_hidden_layers (and no "
+                    "text_config.num_hidden_layers fallback) — model "
+                    f"{self.vllm_config.model_config.model_id!r} unsupported "
+                    "by Quest hooks")
+
+            # V2's `self.kv_connector` is the facade; V1 doesn't keep a
+            # direct attribute, so fetch via get_kv_transfer_group(). Mirror
+            # V2's pattern of unwrapping a `.kv_connector` attribute when
+            # present (facade-vs-connector defensive).
+            kv_connector_ref = None
+            if has_kv_transfer_group():
+                _tg = get_kv_transfer_group()
+                kv_connector_ref = getattr(_tg, "kv_connector", _tg)
+
+            class DynamicBudget:
+                def __init__(self, default_budget, connector_ref):
+                    self._default = default_budget
+                    self._connector = connector_ref
+
+                def compute_budget(self, **kwargs):
+                    if self._connector is not None:
+                        override = getattr(
+                            self._connector, "_budget_override", None)
+                        if override is not None:
+                            return float(override)
+                    return self._default
+
+            single_layer_scoring = bool(
+                extra.get("quest_single_layer_scoring", False))
+
+            budget_computer = DynamicBudget(quest_budget, kv_connector_ref)
+            if extra.get("adaptive_bandwidth", False):
+                try:
+                    # ICMS-native allocator pickup. V2's chain
+                    # (`connector_worker.spec.get_adaptive_allocator()`)
+                    # was written for a different connector and silently
+                    # returns None for ICMS — leaving budget_computer as
+                    # DynamicBudget(1.0) forever, which is why every prior
+                    # adaptive_bandwidth=True C/D config was cosmetic. The
+                    # ICMS facade exposes the allocator at
+                    # `_worker._adaptive_allocator`. Falls through to V2's
+                    # chain when the ICMS path isn't present (so other
+                    # connectors that DID rely on the V2 chain still work).
+                    allocator = None
+                    _icms_worker = getattr(kv_connector_ref, "_worker", None)
+                    if _icms_worker is not None:
+                        allocator = getattr(
+                            _icms_worker, "_adaptive_allocator", None)
+                    if allocator is None:
+                        connector_worker = getattr(
+                            kv_connector_ref, "connector_worker", None)
+                        spec = getattr(connector_worker, "spec", None)
+                        get_alloc = getattr(
+                            spec, "get_adaptive_allocator", None)
+                        allocator = (get_alloc()
+                                     if callable(get_alloc) else None)
+                    if allocator is not None:
+                        budget_computer = allocator
+                        logger.info(
+                            "Quest hooks: using AdaptiveBandwidthAllocator")
+                    else:
+                        logger.warning(
+                            "adaptive_bandwidth=True but no allocator "
+                            "available on connector spec; falling back to "
+                            "ConstantBudget(%.2f)", quest_budget)
+                except Exception:
+                    logger.warning(
+                        "Failed to retrieve AdaptiveBandwidthAllocator; "
+                        "falling back to ConstantBudget(%.2f)",
+                        quest_budget, exc_info=True)
+
+            hook_manager = QuestHookManager(
+                page_selector=None,
+                budget_computer=budget_computer,
+                num_layers=num_layers,
+                kv_connector=kv_connector_ref,
+                cpu_scoring=True,
+            )
+            hook_manager.single_layer_scoring = single_layer_scoring
+            hook_manager.allow_all_pages_shortcut = True
+            hook_manager.score_stride = max(
+                1, int(extra.get("icms_score_stride", 1)))
+            import os as _os_scored
+            _scored_env = _os_scored.environ.get("ICMS_SCORED_LAYERS", "")
+            if _scored_env:
+                try:
+                    hook_manager.scored_layers_set = frozenset(
+                        int(x) for x in _scored_env.split(",") if x.strip())
+                except ValueError:
+                    pass
+
+            import os as _os
+            use_registry = (
+                _os.environ.get("ICMS_LEGACY_FORWARD_HOOKS", "0") != "1")
+            if use_registry:
+                num_registered = hook_manager.register_callbacks(self.model)
+                hook_path = "registry"
+            else:
+                num_registered = hook_manager.register_hooks(self.model)
+                hook_path = "forward_hook"
+            if num_registered > 0:
+                self._quest_hook_manager = hook_manager
+                logger.info(
+                    "Quest hooks registered on %d decoder layers via %s "
+                    "(cpu_scoring=True, budget=%.2f, single_layer_scoring=%s, "
+                    "adaptive=%s)",
+                    num_registered, hook_path, quest_budget,
+                    single_layer_scoring,
+                    extra.get("adaptive_bandwidth", False))
+            else:
+                logger.warning(
+                    "Quest hooks: register_%s returned 0 — ICMS Score will "
+                    "NOT fire and the bench will fall through to dense "
+                    "attention. Check decoder-layer detection.",
+                    "callbacks" if use_registry else "hooks")
+        except Exception:
+            logger.warning(
+                "Failed to register Quest hooks", exc_info=True)
 
     def init_routed_experts_capturer(self):
         logger.info(

@@ -1222,6 +1222,25 @@ class _WorkerWritePipelineMixin:
         if _instr_on:
             logger.info("[INSTR] drain_pending_flush_queue: %.2fms",
                         (time.perf_counter() - _t_drain0) * 1000.0)
+        # ICMS_SKIP_ARCHIVE (sentinel-gated runtime toggle): when the named
+        # sentinel file exists, skip the prefill-KV archival extract+flush
+        # entirely. Reads/fetches are unaffected (they fire on the apply
+        # path, not here). Used to measure the read/reuse benefit without
+        # the redundant write-back when L2 is already preloaded — the driver
+        # touches the sentinel AFTER preload, so preload still archives.
+        # Page-safe: no extract means nothing reads the GPU KV pages before
+        # vLLM frees them, so the cross-rid memcpy race can't occur and the
+        # memcpy gate is moot. No overhead when the env var is unset.
+        _skip_arch = os.environ.get("ICMS_SKIP_ARCHIVE_SENTINEL", "")
+        if _skip_arch and os.path.exists(_skip_arch):
+            if not self._prefill_done:
+                self._reset_apply_caches_for_prefill_done()
+                self._prefill_done = True
+                logger.info("Prefill done (ICMS_SKIP_ARCHIVE: archival off).")
+            if _instr_on:
+                logger.info("[INSTR] wait_for_save SKIP_ARCHIVE: %.2fms",
+                            (time.perf_counter() - t_save_enter) * 1000.0)
+            return
         if not (self._gpu_kv_caches and self._attn_metadata is not None
                 and self._requests and not self._skip_extract):
             # Nothing to extract — still flip the prefill_done flag.
