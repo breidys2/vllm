@@ -49,6 +49,7 @@ API
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Callable
 
 import torch
@@ -56,6 +57,28 @@ import torch
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = logging.getLogger(__name__)
+
+
+# ── Attribution probe / Lever-B amortization gate ──────────────────────
+# When ON, the three per-layer custom ops (_quest_fire_pre/post_layer_impl,
+# _quest_capture_q_impl) return at their FIRST line — skipping the
+# _CURRENT_REGISTRY lookup + fire_* callback dispatch entirely. The graph
+# breaks (these ops are in compilation_config.splitting_ops) REMAIN: they
+# are baked into the compiled forward at capture time and cannot be removed
+# at runtime. So measuring decode-step time with this ON vs OFF isolates
+# the *reducible* Python-callback tax (registry dispatch + callback bodies)
+# from the *irreducible* graph-break/op-dispatch floor (fragmented cudagraph
+# replay + 3×N torch custom-op dispatches per step).
+#   ICMS_QUEST_OPS_NOOP=1  → static gate, used by the attribution probe.
+# The mutable global + setter let the connector flip this at runtime once
+# every active request has flipped to dense_mode (Lever B); not wired yet.
+_OPS_NOOP: bool = os.environ.get("ICMS_QUEST_OPS_NOOP", "0") == "1"
+
+
+def set_ops_noop(value: bool) -> None:
+    """Runtime toggle for the per-layer op no-op gate (Lever B)."""
+    global _OPS_NOOP
+    _OPS_NOOP = bool(value)
 
 
 # ─── Registry ───────────────────────────────────────────────────────────
@@ -225,6 +248,8 @@ def _quest_fire_pre_layer_impl(
     # stability); the registry is looked up via the process-global
     # _CURRENT_REGISTRY because Dynamo constant-folded the per-model
     # marker at trace time.
+    if _OPS_NOOP:
+        return
     _debug_log_first_call("pre", marker, layer_idx)
     reg = _CURRENT_REGISTRY
     if reg is not None:
@@ -251,6 +276,8 @@ def _quest_fire_post_layer_impl(
     residual: torch.Tensor,
     has_residual: bool,
 ) -> None:
+    if _OPS_NOOP:
+        return
     _debug_log_first_call("post", marker, layer_idx)
     reg = _CURRENT_REGISTRY
     if reg is not None:
@@ -277,6 +304,8 @@ def _quest_capture_q_impl(
     # Side-effecting op (mutates_args=["q"] anti-DCE; we don't modify q).
     # Hands the model's REAL post-q_norm/post-RoPE query to the registry so
     # Quest scores with it instead of the reconstructed _compute_exact_q Q.
+    if _OPS_NOOP:
+        return
     reg = _CURRENT_REGISTRY
     if reg is not None:
         reg.fire_capture_q(layer_idx, q)

@@ -136,6 +136,11 @@ class KVConnectorOutput:
     # It captures a static setup info and should almost always remain constant
     # for a given connector after discovery. Default value entails no change.
     expected_finished_count: int = 0
+    # ICMS sparse-offload (Phase 1): per-request set of LOGICAL block indices
+    # whose KV lives only in L2 and should be freed from the GPU pool (the
+    # un-selected context blocks for config D). Consumed by the scheduler →
+    # KVCacheManager.free_blocks_at. None/empty = no change.
+    icms_free_blocks: dict[str, set[int]] | None = None
 
     def is_empty(self):
         return (
@@ -144,6 +149,7 @@ class KVConnectorOutput:
             and not self.kv_connector_stats
             and not self.kv_cache_events
             and not self.invalid_block_ids
+            and not self.icms_free_blocks
         )
 
 

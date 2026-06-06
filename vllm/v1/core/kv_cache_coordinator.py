@@ -230,6 +230,41 @@ class KVCacheCoordinator(ABC):
         for manager in self.single_type_managers:
             manager.remove_skipped_blocks(request_id, total_computed_tokens)
 
+    def free_unpopulated_blocks(
+        self,
+        request_id: str,
+        keep_block_indices,
+    ) -> int:
+        """ICMS sparse-offload (Phase 1): forward to per-group managers.
+
+        `keep_block_indices` is either a single set[int] (applied to every
+        group — correct for uniform single-group models like qwen3, D's case)
+        or a sequence of sets aligned with `single_type_managers` (one per
+        group, for differing block sizes). Returns total blocks freed.
+        """
+        total = 0
+        is_per_group = isinstance(keep_block_indices, (list, tuple))
+        for i, manager in enumerate(self.single_type_managers):
+            ks = keep_block_indices[i] if is_per_group else keep_block_indices
+            total += manager.free_unpopulated_blocks(request_id, ks)
+        return total
+
+    def free_blocks_at(
+        self,
+        request_id: str,
+        free_block_indices,
+    ) -> int:
+        """ICMS sparse-offload (Phase 1): forward an explicit free-set to
+        per-group managers. `free_block_indices` is a single set[int] (uniform
+        single-group, D's case) or a per-group sequence of sets. Returns total
+        blocks freed."""
+        total = 0
+        is_per_group = isinstance(free_block_indices, (list, tuple))
+        for i, manager in enumerate(self.single_type_managers):
+            fs = free_block_indices[i] if is_per_group else free_block_indices
+            total += manager.free_blocks_at(request_id, fs)
+        return total
+
     def get_blocks(self, request_id: str) -> tuple[list[KVCacheBlock], ...]:
         """
         Get the blocks for the request.

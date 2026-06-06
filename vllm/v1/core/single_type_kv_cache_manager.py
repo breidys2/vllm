@@ -387,6 +387,98 @@ class SingleTypeKVCacheManager(ABC):
             blocks[i] = self._null_block
         self.block_pool.free_blocks(removed_blocks)
 
+    def free_unpopulated_blocks(
+        self,
+        request_id: str,
+        keep_block_indices: set[int],
+        protect_tail_blocks: int = 1,
+    ) -> int:
+        """ICMS sparse-offload (Phase 1): free blocks whose KV lives only in L2.
+
+        The sparse-set analogue of `remove_skipped_blocks` (which only frees a
+        contiguous prefix outside the attention window). Frees every allocated
+        block of `request_id` whose logical index is NOT in `keep_block_indices`,
+        replaces it with the null block, and returns it to the pool. This is how
+        config D reserves only its working set (the union of per-layer selected
+        pages) instead of the full prompt: vLLM allocated full-context blocks but
+        only the selected ~20% are populated; the rest are reserved-but-unpopulated
+        and freed here.
+
+        `keep_block_indices` MUST be the union of every layer's selection (a block
+        holds all layers' KV, so a block read by any layer must be kept). The last
+        `protect_tail_blocks` blocks are never freed — decode appends there.
+        Idempotent: already-null blocks are skipped.
+
+        Racy-OK by design (per project decision 2026-06-05): if a freed block is
+        later attended — it should not be, since the keep-set is the cross-layer
+        union and mode-D freezes the selection post-flip — attention reads the
+        null block and the output-correctness harness catches it. No re-fetch/pin
+        guard here.
+
+        Assumes vLLM prefix-caching is OFF for this request (D's mode); with
+        caching on, freeing hashed/shared blocks could corrupt other requests.
+
+        Returns the number of blocks freed.
+        """
+        blocks = self.req_to_blocks.get(request_id)
+        if not blocks:
+            return 0
+        n = len(blocks)
+        if n <= protect_tail_blocks:
+            return 0
+        removed: list[KVCacheBlock] = []
+        for i in range(n - protect_tail_blocks):
+            if i in keep_block_indices:
+                continue
+            blk = blocks[i]
+            if blk is self._null_block:
+                continue
+            removed.append(blk)
+            blocks[i] = self._null_block
+        if removed:
+            self.block_pool.free_blocks(removed)
+        return len(removed)
+
+    def free_blocks_at(
+        self,
+        request_id: str,
+        free_block_indices: set[int],
+        protect_tail_blocks: int = 1,
+    ) -> int:
+        """ICMS sparse-offload (Phase 1): free an EXPLICIT set of logical blocks.
+
+        The wired variant of `free_unpopulated_blocks`. The connector worker
+        computes, per request, the set of un-selected context blocks
+        (`{0..total_pages-1} − union_over_layers(fetched_pages)`) — blocks whose
+        KV lives only in L2 — and passes them here. We free exactly those
+        (skipping already-null blocks and the protected decode tail), return them
+        to the pool, and replace with the null block.
+
+        Free-set (not keep-set) is deliberate: the worker cannot know the live
+        block count `n` (decode keeps growing it), so it cannot safely express
+        "keep everything except X" — it would wrongly free the suffix/decode
+        blocks at indices ≥ total_pages. It CAN exactly name the un-selected
+        context blocks. Same racy-OK / caching-off assumptions as
+        `free_unpopulated_blocks`. Returns the number of blocks freed.
+        """
+        blocks = self.req_to_blocks.get(request_id)
+        if not blocks:
+            return 0
+        n = len(blocks)
+        tail_start = n - protect_tail_blocks
+        removed: list[KVCacheBlock] = []
+        for i in free_block_indices:
+            if i < 0 or i >= tail_start:
+                continue
+            blk = blocks[i]
+            if blk is self._null_block:
+                continue
+            removed.append(blk)
+            blocks[i] = self._null_block
+        if removed:
+            self.block_pool.free_blocks(removed)
+        return len(removed)
+
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """
         Get the number of tokens that will be skipped for attention computation.

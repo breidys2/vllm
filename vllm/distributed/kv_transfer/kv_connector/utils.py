@@ -84,11 +84,21 @@ class KVOutputAggregator:
         aggregated_kv_connector_stats = None
         combined_kv_cache_events = None
         invalid_block_ids = set[int]()
+        # ICMS sparse-offload (Phase 1): aggregate per-rid free-sets across TP
+        # ranks by INTERSECTION — a context block is safe to free only if EVERY
+        # rank agrees it is un-selected (a per-rank selection may keep a block
+        # another rank dropped). `_icms_free_seen_ranks` counts how many ranks
+        # reported each rid so a rid reported by only some ranks intersects to
+        # nothing (conservative). None until the first rank reports any.
+        icms_free_blocks: dict[str, set[int]] | None = None
+        _icms_free_seen_ranks: dict[str, int] = {}
+        _icms_total_ranks = 0
         for model_runner_output in outputs:
             assert model_runner_output is not None
             kv_output = model_runner_output.kv_connector_output
             if not kv_output:
                 continue
+            _icms_total_ranks += 1
             # Allow the worker to dynamically update the expected number of
             # finished sending/recving for new requests.
             if (
@@ -139,6 +149,30 @@ class KVOutputAggregator:
 
             invalid_block_ids |= kv_output.invalid_block_ids
 
+            # ICMS sparse-offload: intersect per-rid free-sets across ranks.
+            rank_free = kv_output.icms_free_blocks
+            if rank_free:
+                if icms_free_blocks is None:
+                    icms_free_blocks = {r: set(s) for r, s in rank_free.items()}
+                else:
+                    for r, s in rank_free.items():
+                        if r in icms_free_blocks:
+                            icms_free_blocks[r] &= s
+                        else:
+                            icms_free_blocks[r] = set(s)
+                for r in rank_free:
+                    _icms_free_seen_ranks[r] = _icms_free_seen_ranks.get(r, 0) + 1
+
+        # Keep only rids reported by ALL ranks (conservative: a rid not reported
+        # by some rank — e.g. flip-step skew — intersects to nothing → free
+        # nothing for it). Drop empties.
+        if icms_free_blocks is not None:
+            icms_free_blocks = {
+                r: s
+                for r, s in icms_free_blocks.items()
+                if s and _icms_free_seen_ranks.get(r, 0) == _icms_total_ranks
+            } or None
+
         # select output of the worker specified by output_rank
         output = outputs[output_rank]
 
@@ -149,6 +183,7 @@ class KVOutputAggregator:
             kv_connector_stats=aggregated_kv_connector_stats or None,
             kv_cache_events=combined_kv_cache_events or None,
             invalid_block_ids=invalid_block_ids,
+            icms_free_blocks=icms_free_blocks,
             expected_finished_count=self._expected_finished_count,
         )
 

@@ -429,3 +429,107 @@ def test_chunked_local_attention_get_num_blocks_to_allocate():
         )
         == 15
     )
+
+
+def test_free_unpopulated_blocks():
+    """ICMS sparse-offload (Phase 1): free reserved-but-unpopulated blocks.
+
+    Config D allocates full-context blocks but only populates the selected
+    working set; `free_unpopulated_blocks` returns the rest to the pool so D's
+    HBM reservation drops to the working set. Asserts: non-kept/non-tail blocks
+    become null, kept blocks survive, the tail is protected, the call is
+    idempotent, and an unknown request is a no-op.
+    """
+    sliding_window_spec = SlidingWindowSpec(
+        block_size=2,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        sliding_window=4,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=2000, enable_caching=False, hash_block_size=2
+    )
+    manager = get_sliding_window_manager(
+        sliding_window_spec, block_pool, enable_caching=False
+    )
+    null_block = block_pool.null_block
+    null_block_id = null_block.block_id
+
+    def id_to_block_table(ids):
+        return [
+            KVCacheBlock(i) if i != null_block_id else null_block for i in ids
+        ]
+
+    original = [1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009]
+    manager.req_to_blocks["r"] = id_to_block_table(original)
+
+    # Keep logical blocks {2, 5, 9}; protect the tail (index 9). Expect freed =
+    # {0,1,3,4,6,7,8} = 7. (9 is both kept and the tail.)
+    freed = manager.free_unpopulated_blocks("r", {2, 5, 9}, protect_tail_blocks=1)
+    assert freed == 7
+
+    bt = manager.req_to_blocks["r"]
+    for i in range(10):
+        if i in (2, 5, 9):
+            assert bt[i] is not null_block, f"kept block {i} was freed"
+            assert bt[i].block_id == original[i]
+        else:
+            assert bt[i] is null_block, f"block {i} should be freed"
+
+    # Idempotent: re-running with the same keep-set frees nothing.
+    assert manager.free_unpopulated_blocks("r", {2, 5, 9}) == 0
+
+    # Tail protection: with an empty keep-set, indices 2 and 5 free (2 blocks),
+    # but the tail (index 9) is protected and survives.
+    freed2 = manager.free_unpopulated_blocks("r", set(), protect_tail_blocks=1)
+    assert freed2 == 2
+    assert bt[9] is not null_block
+    assert bt[9].block_id == original[9]
+
+    # Unknown request is a no-op.
+    assert manager.free_unpopulated_blocks("missing", {0}) == 0
+
+
+def test_free_blocks_at():
+    """ICMS sparse-offload (Phase 1): free an explicit free-set of blocks."""
+    sliding_window_spec = SlidingWindowSpec(
+        block_size=2, num_kv_heads=1, head_size=1,
+        dtype=torch.float32, sliding_window=4,
+    )
+    block_pool = BlockPool(
+        num_gpu_blocks=2000, enable_caching=False, hash_block_size=2
+    )
+    manager = get_sliding_window_manager(
+        sliding_window_spec, block_pool, enable_caching=False
+    )
+    null_block = block_pool.null_block
+    null_block_id = null_block.block_id
+
+    def id_to_block_table(ids):
+        return [
+            KVCacheBlock(i) if i != null_block_id else null_block for i in ids
+        ]
+
+    original = [1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009]
+    manager.req_to_blocks["r"] = id_to_block_table(original)
+
+    # Free the un-selected context blocks {0,1,3,6,7}; also pass index 9 (the
+    # tail) and 100 (out of range) which must be ignored.
+    freed = manager.free_blocks_at(
+        "r", {0, 1, 3, 6, 7, 9, 100}, protect_tail_blocks=1
+    )
+    assert freed == 5  # 9 (tail) and 100 (oob) ignored
+
+    bt = manager.req_to_blocks["r"]
+    for i in range(10):
+        if i in (0, 1, 3, 6, 7):
+            assert bt[i] is null_block, f"block {i} should be freed"
+        else:
+            assert bt[i] is not null_block, f"block {i} wrongly freed"
+            assert bt[i].block_id == original[i]
+
+    # Idempotent.
+    assert manager.free_blocks_at("r", {0, 1, 3, 6, 7}) == 0
+    # Unknown request is a no-op.
+    assert manager.free_blocks_at("missing", {0}) == 0

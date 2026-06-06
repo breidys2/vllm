@@ -410,6 +410,15 @@ class KVConnectorBase_V1(ABC):
         """
         return set()
 
+    def get_icms_free_blocks(self) -> dict[str, set[int]] | None:
+        """ICMS sparse-offload (Phase 1): per-request LOGICAL block indices
+        whose KV lives only in L2 and should be freed from the GPU pool (config
+        D's un-selected context blocks). Reported once, in the forward pass
+        after the request flips to dense. The scheduler frees them via
+        KVCacheManager.free_blocks_at. Default None = no offload (every other
+        connector is unaffected)."""
+        return None
+
     def shutdown(self):
         """
         Shutdown the connector. This is called when the worker process

@@ -878,7 +878,32 @@ class _WorkerScoringMixin:
                 _cond_decode, _cond_threshold, _cond_safe, _already_flipped,
                 (_cond_decode and _cond_threshold and _cond_safe
                  and not _already_flipped))
-        if is_decode and len(already_fetched) >= _flip_threshold and _flip_safe:
+        # R1 (2026-06-05 TP=2 robustness): rank-synchronize the dense_mode
+        # flip so all ranks take the SAME branch — flip-and-return (skip the
+        # per-layer Score NCCL AllGather) vs fall-through-to-Score (issue it).
+        # The flip is decided PER RANK on `already_fetched` (per-rank); if
+        # ranks flip on different steps, one returns here while the other
+        # falls through and issues the AllGather → divergent collective
+        # participation → CUDA hang (same class as the ceiling_snap broadcast
+        # ~line 1130; a likely cause of the MNS=12 shm/NCCL wedge 2026-06-05).
+        # Broadcast rank 0's decision. Gated default-off → byte-identical
+        # until validated. The broadcast fires UNCONDITIONALLY (not gated on
+        # is_decode) — matching the proven-safe ceiling_snap broadcast at
+        # ~line 1130, which also lives in this per-request function and fires
+        # for every scored request. Rationale: _prefill_done (→ is_decode) is
+        # set per-rank at end-of-prefill (worker_write.py:1238) and can flip a
+        # step apart across ranks; gating the COLLECTIVE on is_decode would
+        # deadlock if it momentarily diverges. Both ranks reach this point
+        # symmetrically regardless (the only early-returns before it —
+        # total_pages==0 and is_decode&&dense_mode — are rank-symmetric), and
+        # _want_flip already includes is_decode so a prefill request just
+        # broadcasts False→False (no flip). TP=1 _tp_broadcast_bool is a no-op.
+        _want_flip = (is_decode and len(already_fetched) >= _flip_threshold
+                      and _flip_safe and not rs.dense_mode)
+        if os.environ.get("ICMS_SYNC_FLIP") == "1":
+            _want_flip = _tp_broadcast_bool(
+                _want_flip, self._tp_rank, self._tp_size)
+        if _want_flip:
             # Threshold reached (default = full saturation). Once dense_mode
             # flips, the Quest hook short-circuits at quest_hooks.py:458 and
             # wait_for_layer takes the cheaper early-return path
@@ -901,6 +926,48 @@ class _WorkerScoringMixin:
                     "(fetched=%d total=%d threshold=%d frac=%.3f)",
                     rid, next_layer_idx, len(already_fetched),
                     total_pages, _flip_threshold, _flip_frac)
+                # ICMS sparse-offload (Phase 1B): at the flip, publish the
+                # un-selected context blocks for this rid so the scheduler frees
+                # them from the GPU pool (D's HBM drops to its working set).
+                # free-set = {0..total_pages-1} − union_over_layers(fetched_pages).
+                # PAGE→BLOCK assumption: ICMS page_size == vLLM block_size (both
+                # 16 for qwen3) → page id == logical block index. UNVALIDATED
+                # until the 1C boot test (verify page/block sizes match, that the
+                # union is complete at flip, and output correctness via harness).
+                # Racy-OK: an over-broad free-set frees a needed block → null →
+                # caught by the correctness harness, not guarded here.
+                if os.environ.get("ICMS_SPARSE_OFFLOAD") == "1":
+                    try:
+                        # Performance-first free-set (2026-06-05): keep only the
+                        # FROZEN DECODE SELECTION (what decode actually attends
+                        # post-flip via the persisted trimmed bt — one selection
+                        # for all layers in mode D), NOT the union of every
+                        # layer's prefill fetches. The union ≈94% (1−0.8^48) →
+                        # only ~6% freeable; one selection ≈budget → ~80%
+                        # freeable. Proxy = the flipping layer's selection
+                        # (next_layer_idx). ICMS_SPARSE_OFFLOAD=union restores
+                        # the conservative union (frees only blocks NO layer
+                        # fetched). Accuracy is gated separately by the harness;
+                        # if decode needs more than one selection this garbages
+                        # output (still completes — null blocks read as zeros).
+                        if os.environ.get("ICMS_SPARSE_OFFLOAD_MODE") == "union":
+                            _keep: set[int] = set()
+                            for _pgset in rs.fetched_pages.values():
+                                _keep |= _pgset
+                        else:
+                            _keep = set(rs.fetched_pages.get(next_layer_idx, set()))
+                        _free = set(range(int(total_pages))) - _keep
+                        if _free:
+                            if not hasattr(self, "_icms_pending_free_blocks"):
+                                self._icms_pending_free_blocks = {}
+                            # Accumulate (union) in case multiple flips touch
+                            # the same rid before the scheduler drains it.
+                            _prev = self._icms_pending_free_blocks.get(rid)
+                            self._icms_pending_free_blocks[rid] = (
+                                _free if _prev is None else (_prev | _free))
+                    except Exception:
+                        # Never let the offload bookkeeping break the flip path.
+                        pass
                 if os.environ.get("ICMS_DIAG_FULL") == "1":
                     self._diag_full_dense_flip_snapshot(rs, next_layer_idx)
             return
@@ -2354,8 +2421,22 @@ class _WorkerScoringMixin:
                     rid, next_layer_idx,
                     len(page_set), total_pages,
                     _m4_flip_enabled, rs.dense_mode)
-            if (is_decode and not rs.dense_mode and len(page_set) == prev_size
-                    and _m4_flip_enabled):
+            # R1 (TP=2 robustness): rank-synchronize the M4 saturation flip too
+            # (same ICMS_SYNC_FLIP gate). This flip fires AFTER the current
+            # layer's Score, so divergence here doesn't hang the current step —
+            # but it sets dense_mode, and if ranks flip on different steps the
+            # NEXT step diverges (one early-returns at the is_decode+dense_mode
+            # gate, the other issues the Score AllGather) → hang. Broadcast rank
+            # 0's decision. Both ranks reach here symmetrically (post-Score, same
+            # per-request path; reaching it is also symmetric given the 881 flip
+            # is synced). page_set/prev_size are per-rank; _m4_flip_enabled is
+            # env-derived (symmetric). TP=1 _tp_broadcast_bool is a no-op.
+            _want_m4_flip = (is_decode and not rs.dense_mode
+                             and len(page_set) == prev_size and _m4_flip_enabled)
+            if os.environ.get("ICMS_SYNC_FLIP") == "1":
+                _want_m4_flip = _tp_broadcast_bool(
+                    _want_m4_flip, self._tp_rank, self._tp_size)
+            if _want_m4_flip:
                 rs.dense_mode = True
                 # Mark the request as just-flipped so the next forward
                 # pass logs full metadata (gated by ICMS_DIAG_FULL=1).

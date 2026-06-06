@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -1319,6 +1320,35 @@ class Scheduler(SchedulerInterface):
             failed_kv_load_req_ids = self._handle_invalid_blocks(
                 kv_connector_output.invalid_block_ids
             )
+
+        # ICMS sparse-offload (Phase 1): the connector worker reports, per
+        # request, the LOGICAL blocks whose KV lives only in L2 (config D's
+        # un-selected context blocks). Free them from the GPU pool so D's HBM
+        # reservation drops to its working set. Gated (default off) so all
+        # other connectors/configs are byte-identical. Racy-OK: if a freed
+        # block is later attended, attention reads the null block and the
+        # correctness harness catches it (no re-fetch guard here).
+        if (
+            kv_connector_output
+            and kv_connector_output.icms_free_blocks
+            and os.environ.get("ICMS_SPARSE_OFFLOAD") == "1"
+        ):
+            _icms_total_freed = 0
+            for _rid, _free_idx in kv_connector_output.icms_free_blocks.items():
+                if not _free_idx:
+                    continue
+                _req = self.requests.get(_rid)
+                if _req is None or _req.is_finished():
+                    continue
+                _icms_total_freed += self.kv_cache_manager.free_blocks_at(
+                    _rid, _free_idx
+                )
+            if _icms_total_freed and os.environ.get("ICMS_INSTR") == "1":
+                logger.info(
+                    "[icms-sparse-offload] freed %d blocks across %d reqs",
+                    _icms_total_freed,
+                    len(kv_connector_output.icms_free_blocks),
+                )
 
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best

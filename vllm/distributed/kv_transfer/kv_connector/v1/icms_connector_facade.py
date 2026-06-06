@@ -657,6 +657,26 @@ class IcmsConnector(KVConnectorBase_V1):
             self._worker.wait_for_pending_writes()
 
     @_instr_timing("get_finished")
+    def get_icms_free_blocks(self) -> dict[str, set[int]] | None:
+        """ICMS sparse-offload (Phase 1B): drain the worker's pending free-sets
+        (per-rid un-selected context blocks, computed at the dense flip) so the
+        scheduler frees them from the GPU pool. Returns None when nothing
+        pending (the default / offload-disabled case → byte-identical behavior).
+
+        TP>1 NOTE (validate in 1C): each rank reports its own free-set; if
+        per-rank selections diverge, the scheduler should free only the
+        intersection. Until verified, run with TP=1 or confirm selections are
+        rank-consistent in mode D.
+        """
+        if self._worker is None:
+            return None
+        pending = getattr(self._worker, "_icms_pending_free_blocks", None)
+        if not pending:
+            return None
+        # Hand off and clear (report-once semantics, like invalid_block_ids).
+        self._worker._icms_pending_free_blocks = {}
+        return pending
+
     def get_finished(
         self, finished_req_ids: set[str],
     ) -> tuple[set[str] | None, set[str] | None]:

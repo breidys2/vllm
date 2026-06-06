@@ -398,6 +398,32 @@ class KVCacheManager:
         """
         self.coordinator.remove_skipped_blocks(request_id, total_computed_tokens)
 
+    def free_unpopulated_blocks(
+        self,
+        request_id: str,
+        keep_block_indices,
+    ) -> int:
+        """ICMS sparse-offload (Phase 1): free this request's allocated blocks
+        whose logical index is NOT in `keep_block_indices` (their KV lives only
+        in L2), returning them to the pool. This is what lets config D reserve
+        only its working set instead of the full prompt. See
+        `SingleTypeKVCacheManager.free_unpopulated_blocks`. Returns blocks freed.
+        """
+        return self.coordinator.free_unpopulated_blocks(
+            request_id, keep_block_indices
+        )
+
+    def free_blocks_at(
+        self,
+        request_id: str,
+        free_block_indices,
+    ) -> int:
+        """ICMS sparse-offload (Phase 1): free an explicit set of this request's
+        logical blocks (the un-selected context blocks, whose KV lives only in
+        L2). See `SingleTypeKVCacheManager.free_blocks_at`. Returns blocks freed.
+        """
+        return self.coordinator.free_blocks_at(request_id, free_block_indices)
+
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
 
