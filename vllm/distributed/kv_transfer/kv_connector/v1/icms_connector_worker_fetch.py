@@ -2087,6 +2087,17 @@ class _WorkerFetchApplyMixin:
                     )
                     if _capture is not None:
                         _capture.append((req_idx, _state_fast))
+                    elif os.environ.get("ICMS_INSTR", "0") == "1":
+                        # [INSTR-SET-ACTIVE] 2026-06-08: isolate the block-table
+                        # install cost (set_active) from the surrounding
+                        # apply_us. Fast (stride-reuse) path: cached bt/sl.
+                        _t_sa = time.perf_counter()
+                        icms_fetch_state.set_active(_state_fast)
+                        logger.info(
+                            "[INSTR-SET-ACTIVE] rid=%s layer=%s path=fast "
+                            "set_active_us=%.1f",
+                            rid[:8], layer_name,
+                            (time.perf_counter() - _t_sa) * 1e6)
                     else:
                         icms_fetch_state.set_active(_state_fast)
                 return True
@@ -3234,6 +3245,18 @@ class _WorkerFetchApplyMixin:
             )
             if _capture is not None:
                 _capture.append((req_idx, _state_slow))
+            elif os.environ.get("ICMS_INSTR", "0") == "1":
+                # [INSTR-SET-ACTIVE] 2026-06-08: isolate the block-table
+                # install cost (set_active) from the surrounding apply_us.
+                # Slow (full-build) path: freshly-built bt/sl/head_mask.
+                _t_sa = time.perf_counter()
+                icms_fetch_state.set_active(_state_slow)
+                logger.info(
+                    "[INSTR-SET-ACTIVE] rid=%s layer=%s path=slow "
+                    "set_active_us=%.1f new_bt_shape=%s",
+                    rid[:8], layer_name,
+                    (time.perf_counter() - _t_sa) * 1e6,
+                    tuple(new_bt.shape))
             else:
                 icms_fetch_state.set_active(_state_slow)
         _lt("after_set_active")

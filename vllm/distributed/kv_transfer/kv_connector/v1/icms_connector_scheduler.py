@@ -558,6 +558,16 @@ class _Scheduler:
 
     def _lookup_stored_prefix(self, chain: list[int]) -> int:
         """Find longest stored chain prefix. Returns matched group count."""
+        # [INSTR-LOOKUP] 2026-06-08: confirm the schedule-time "is the context
+        # cached and where" lookup is purely LOCAL (in-process list scan, no
+        # RPC to BF2). Timed here (not at the call site) so it can be driven
+        # standalone without a Request. Cost is O(n_stored * chain_len) int
+        # compares; expected sub-100us. In a distributed deployment this would
+        # become a remote index lookup — estimate that separately.
+        _instr = os.environ.get("ICMS_INSTR", "0") == "1"
+        if _instr:
+            import time as _t
+            _t0 = _t.perf_counter()
         best = 0
         for stored_chain, n_groups in self._stored_chains:
             match_len = 0
@@ -568,6 +578,12 @@ class _Scheduler:
                     break
             if match_len > 0:
                 best = max(best, min(n_groups, match_len))
+        if _instr:
+            logger.info(
+                "[INSTR-LOOKUP] lookup_us=%.1f chain_len=%d stored_chains=%d "
+                "matched_groups=%d",
+                (_t.perf_counter() - _t0) * 1e6, len(chain),
+                len(self._stored_chains), best)
         return best
 
     def get_num_new_matched_tokens(

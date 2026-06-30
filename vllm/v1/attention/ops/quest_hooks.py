@@ -1096,6 +1096,16 @@ class QuestHookManager:
         Returns:
             Q tensor of shape [B, num_heads, head_dim], or None on error.
         """
+        # [INSTR-Q-COMPUTE] 2026-06-08: time the Q "strip-out + recompute"
+        # (RMSNorm + q_proj + q_norm + RoPE) that the Quest scoring path runs
+        # per scored layer. Replaces the dead self.stats.begin/end_q_compute
+        # hooks (those methods were never defined). Gated by ICMS_INSTR=1.
+        import os as _os_qc
+        _instr_qc = _os_qc.environ.get("ICMS_INSTR", "0") == "1"
+        if _instr_qc:
+            import time as _t_qc
+            _t0_qc = _t_qc.perf_counter()
+
         ln_weight, eps = self._layernorm_weights[next_layer_idx]
         q_weight = self._q_proj_weights[next_layer_idx]
 
@@ -1176,6 +1186,15 @@ class QuestHookManager:
         if self._num_heads is not None and self._head_dim is not None:
             q = q.view(-1, self._num_heads, self._head_dim)
 
+        if _instr_qc:
+            if q is not None and q.is_cuda:
+                torch.cuda.synchronize(q.device)
+            logger.info(
+                "[INSTR-Q-COMPUTE] layer=%d q_recompute_us=%.1f n_tok=%d "
+                "q_norm=%s rope=%s",
+                next_layer_idx, (_t_qc.perf_counter() - _t0_qc) * 1e6,
+                int(residual.shape[0]) if hasattr(residual, "shape") else -1,
+                qn is not None, rotary_emb is not None)
         return q
 
     # -- Static helpers ------------------------------------------------------

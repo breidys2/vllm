@@ -534,7 +534,20 @@ class _WorkerBase:
             n = 1
         return n > 1
     def _connect(self):
-        if self._use_rdma:
+        # ShadowServe (default-off): swap the ICMS client for a ShadowServeClient that delivers KV from
+        # the BF2 data plane into the connector's own GpuDirectRdmaSink. ICMS path untouched when unset.
+        if os.environ.get("SHADOWSERVE_ENABLE") == "1":
+            import sys as _sys
+            _ssdir = os.environ.get(
+                "SHADOWSERVE_CLIENT_DIR",
+                "/home/breidys2/prefill_benchmarking/shadowserve/server")
+            if _ssdir not in _sys.path:
+                _sys.path.insert(0, _ssdir)
+            from ss_shadowclient import ShadowServeClient
+            self._client = ShadowServeClient.from_env()
+            transport_desc = "shadowserve"
+            logger.info("[shadowserve] ShadowServeClient active (ICMS path bypassed)")
+        elif self._use_rdma:
             if not _HAVE_RDMA:
                 raise ImportError(
                     "icms_rdma=True but pyverbs is not installed. "
